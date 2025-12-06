@@ -2323,7 +2323,7 @@ fn print_csv(
     });
 
     // Sort if needed
-    if let Some(sort) = &render_opts.sort_by
+    if let Some(sort) = render_opts.sort_by.as_ref()
         && let Some(idx) = csv_columns.iter().position(|c| c == sort)
     {
         filtered_rows.sort_by(|a, b| {
@@ -2531,7 +2531,7 @@ fn print_table(
         return true;
     }
 
-    if let Some(sort) = &render_opts.sort_by
+    if let Some(sort) = render_opts.sort_by.as_ref()
         && let Some(idx) = columns.iter().position(|c| c == sort)
     {
         table.sort_by(|a, b| a[idx].cmp(&b[idx]));
