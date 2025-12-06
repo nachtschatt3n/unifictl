@@ -49,6 +49,7 @@ pub enum Scope {
 }
 
 #[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
 pub enum ConfigError {
     #[error("could not locate a writable config directory for the current user")]
     MissingConfigDir,
