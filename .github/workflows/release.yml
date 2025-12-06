@@ -38,16 +38,6 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: unifictl-macos-aarch64
             asset_name: unifictl-aarch64-apple-darwin.tar.gz
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            build_arch_package: true
-            artifact_name: unifictl-arch-x86_64
-            asset_name: unifictl-x86_64.pkg.tar.zst
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            build_arch_package: true
-            artifact_name: unifictl-arch-aarch64
-            asset_name: unifictl-aarch64.pkg.tar.zst
 
     steps:
       - name: Checkout code
@@ -73,78 +63,11 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build release binary
-        if: matrix.build_arch_package != true
         run: |
           cargo build --release --target ${{ matrix.target }}
           strip target/${{ matrix.target }}/release/unifictl || true
 
-      - name: Build Arch Linux package
-        if: matrix.build_arch_package == true
-        run: |
-          # Install makepkg dependencies
-          sudo apt-get update
-          sudo apt-get install -y fakeroot binutils
-          
-          # Build Rust binary
-          cargo build --release --target ${{ matrix.target }}
-          
-          # Determine version from tag
-          VERSION=${GITHUB_REF#refs/tags/v}
-          if [ -z "$VERSION" ]; then
-            VERSION=${{ github.event.inputs.version }}
-            VERSION=${VERSION#v}
-          fi
-          
-          # Update PKGBUILD version
-          sed -i "s/^pkgver=.*/pkgver=$VERSION/" packaging/arch/PKGBUILD
-          
-          # Create package directory structure
-          mkdir -p pkg/usr/bin pkg/usr/share/doc/unifictl pkg/usr/share/licenses/unifictl
-          
-          # Copy files
-          cp target/${{ matrix.target }}/release/unifictl pkg/usr/bin/
-          cp README.md pkg/usr/share/doc/unifictl/
-          cp LICENSE pkg/usr/share/licenses/unifictl/
-          
-          # Create .PKGINFO
-          ARCH=${{ matrix.target == 'x86_64-unknown-linux-gnu' && 'x86_64' || 'aarch64' }}
-          cat > pkg/.PKGINFO <<EOF
-          pkgname = unifictl
-          pkgver = $VERSION-1
-          pkgdesc = CLI for UniFi Site Manager (API v1/EA)
-          url = https://github.com/nachtschatt3n/unifictl
-          builddate = $(date +%s)
-          packager = GitHub Actions
-          size = $(du -sb pkg | cut -f1)
-          arch = $ARCH
-          license = GPL-3.0
-          depend = openssl
-          depend = glibc
-          EOF
-          
-          # Create .MTREE
-          cd pkg
-          find . -type f -o -type d | sort | sed 's|^\./||' | while read line; do
-            if [ -d "$line" ]; then
-              echo "/$line type=dir"
-            else
-              echo "/$line type=file mode=$(stat -c %a "$line" 2>/dev/null || stat -f %A "$line" 2>/dev/null || echo 644) size=$(stat -c %s "$line" 2>/dev/null || stat -f %z "$line" 2>/dev/null || echo 0)"
-            fi
-          done > .MTREE
-          cd ..
-          
-          # Create package archive
-          cd pkg
-          tar czf ../${{ matrix.asset_name }} .PKGINFO .MTREE usr/
-          cd ..
-          
-          # Rename to proper Arch package name
-          ARCH=${{ matrix.target == 'x86_64-unknown-linux-gnu' && 'x86_64' || 'aarch64' }}
-          mv ${{ matrix.asset_name }} unifictl-$VERSION-1-$ARCH.pkg.tar.zst
-          mv unifictl-$VERSION-1-$ARCH.pkg.tar.zst ${{ matrix.asset_name }}
-
       - name: Create release archive
-        if: matrix.build_arch_package != true
         shell: bash
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
@@ -165,9 +88,115 @@ jobs:
           path: ${{ matrix.asset_name }}
           retention-days: 30
 
+  build-arch-packages:
+    name: Build Arch Linux Packages
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install makepkg dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot binutils
+
+      - name: Build release binary
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          strip target/${{ matrix.target }}/release/unifictl || true
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          VERSION=${VERSION#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Update PKGBUILD
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.version.outputs.version }}/" packaging/arch/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/arch/PKGBUILD
+
+      - name: Create package directory
+        run: |
+          mkdir -p pkg/usr/bin
+          mkdir -p pkg/usr/share/doc/unifictl
+          mkdir -p pkg/usr/share/licenses/unifictl
+
+      - name: Install files
+        run: |
+          install -Dm755 target/${{ matrix.target }}/release/unifictl pkg/usr/bin/unifictl
+          install -Dm644 README.md pkg/usr/share/doc/unifictl/README.md
+          install -Dm644 LICENSE pkg/usr/share/licenses/unifictl/LICENSE
+
+      - name: Create .PKGINFO
+        run: |
+          cat > pkg/.PKGINFO <<EOF
+          pkgname = unifictl
+          pkgver = ${{ steps.version.outputs.version }}-1
+          pkgdesc = CLI for UniFi Site Manager (API v1/EA)
+          url = https://github.com/nachtschatt3n/unifictl
+          builddate = $(date +%s)
+          packager = GitHub Actions <actions@github.com>
+          size = $(du -sb pkg | cut -f1)
+          arch = ${{ matrix.arch }}
+          license = GPL-3.0
+          depend = openssl
+          depend = glibc
+          EOF
+
+      - name: Create .MTREE
+        run: |
+          cd pkg
+          find . -type f -o -type d | sort | sed 's|^\./||' | while read line; do
+            if [ -d "$line" ]; then
+              echo "/$line type=dir"
+            else
+              MODE=$(stat -c %a "$line" 2>/dev/null || echo 644)
+              SIZE=$(stat -c %s "$line" 2>/dev/null || echo 0)
+              echo "/$line type=file mode=$MODE size=$SIZE"
+            fi
+          done > .MTREE
+          cd ..
+
+      - name: Create package archive
+        run: |
+          cd pkg
+          tar czf ../unifictl-${{ steps.version.outputs.version }}-1-${{ matrix.arch }}.pkg.tar.zst .PKGINFO .MTREE usr/
+          cd ..
+          mv unifictl-${{ steps.version.outputs.version }}-1-${{ matrix.arch }}.pkg.tar.zst unifictl-${{ matrix.arch }}.pkg.tar.zst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unifictl-arch-${{ matrix.arch }}
+          path: unifictl-${{ matrix.arch }}.pkg.tar.zst
+          retention-days: 30
+
   create-release:
     name: Create Release
-    needs: build-release
+    needs: [build-release, build-arch-packages]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     
@@ -195,7 +224,7 @@ jobs:
         shell: bash
         run: |
           cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec sha256sum {} \; > checksums.txt
+          find . -type f \( -name "*.tar.gz" -o -name "*.pkg.tar.zst" \) -exec sha256sum {} \; > checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -230,7 +259,13 @@ jobs:
             ```
 
             **Arch Linux:**
-            See the `packaging/arch/` directory for PKGBUILD, or install from AUR (if available).
+            - [x86_64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl-x86_64.pkg.tar.zst)
+            - [aarch64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl-aarch64.pkg.tar.zst)
+            
+            Install with:
+            ```bash
+            sudo pacman -U unifictl-*.pkg.tar.zst
+            ```
 
             ### Checksums
             ```
