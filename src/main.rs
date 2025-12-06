@@ -859,10 +859,10 @@ fn main() -> Result<()> {
         Commands::ConfigShow => {
             let merged = config::load(&cwd)?;
             let mut masked = merged.clone();
-            if let Some(local) = masked.local.as_mut() {
-                if local.password.is_some() {
-                    local.password = Some("*****".into());
-                }
+            if let Some(local) = masked.local.as_mut()
+                && local.password.is_some()
+            {
+                local.password = Some("*****".into());
             }
             if masked.api_key.is_some() {
                 masked.api_key = Some("*****".into());
@@ -2323,9 +2323,10 @@ fn print_csv(
     });
 
     // Sort if needed
-    if let Some(sort) = &render_opts.sort_by {
-        if let Some(idx) = csv_columns.iter().position(|c| c == sort) {
-            filtered_rows.sort_by(|a, b| {
+    if let Some(sort) = &render_opts.sort_by
+        && let Some(idx) = csv_columns.iter().position(|c| c == sort)
+    {
+        filtered_rows.sort_by(|a, b| {
                 if let (serde_json::Value::Object(a_map), serde_json::Value::Object(b_map)) = (a, b)
                 {
                     let a_val = a_map
@@ -2532,10 +2533,10 @@ fn print_table(
         return true;
     }
 
-    if let Some(sort) = &render_opts.sort_by {
-        if let Some(idx) = columns.iter().position(|c| c == sort) {
-            table.sort_by(|a, b| a[idx].cmp(&b[idx]));
-        }
+    if let Some(sort) = &render_opts.sort_by
+        && let Some(idx) = columns.iter().position(|c| c == sort)
+    {
+        table.sort_by(|a, b| a[idx].cmp(&b[idx]));
     }
 
     for (i, col) in columns.iter().enumerate() {

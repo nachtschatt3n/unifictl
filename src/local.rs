@@ -78,12 +78,12 @@ impl LocalClient {
 
     pub fn device_stats(&mut self, mac: &str) -> Result<ResponseData> {
         let mut resp = self.list_devices()?;
-        if let Some(mut json) = resp.json.clone() {
-            if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                arr.retain(|item| item.get("mac").and_then(|m| m.as_str()) == Some(mac));
-                resp.body = serde_json::to_string(&json).unwrap_or(resp.body);
-                resp.json = Some(json);
-            }
+        if let Some(mut json) = resp.json.clone()
+            && let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+        {
+            arr.retain(|item| item.get("mac").and_then(|m| m.as_str()) == Some(mac));
+            resp.body = serde_json::to_string(&json).unwrap_or(resp.body);
+            resp.json = Some(json);
         }
         Ok(resp)
     }
@@ -329,7 +329,7 @@ impl LocalClient {
                             path,
                             status,
                             &body,
-                            url.as_ref(),
+                            url.as_str(),
                         );
                         last_err = Some(anyhow!(msg));
                         continue;
@@ -448,14 +448,15 @@ impl LocalClient {
         path: &str,
         status: StatusCode,
         body: &str,
-        url: &str,
+        url: impl AsRef<str>,
     ) -> String {
         let operation = Self::infer_operation(method, path);
+        let url_str = url.as_ref();
 
         if status == StatusCode::UNAUTHORIZED {
             return format!(
                 "Authentication failed (401) at {}\n\nPossible causes:\n  • Session expired - credentials may need to be refreshed\n  • Invalid username or password\n  • Controller requires re-authentication\n\nTry:\n  unifictl validate --local-only",
-                url
+                url_str
             );
         }
 
@@ -484,7 +485,7 @@ impl LocalClient {
         if status == StatusCode::NOT_FOUND {
             return format!(
                 "Resource not found (404) at {}\n\nPossible causes:\n  • The {} does not exist\n  • Invalid ID or identifier\n  • Resource was deleted\n\nTry:\n  unifictl local {} -o json",
-                url,
+                url_str,
                 operation
                     .replace("create", "resource")
                     .replace("update", "resource")
@@ -496,7 +497,7 @@ impl LocalClient {
         if status == StatusCode::CONFLICT {
             return format!(
                 "Conflict (409) at {}\n\nPossible causes:\n  • Resource already exists\n  • Conflicting configuration\n  • Duplicate name or identifier\n\nTry:\n  unifictl local {} -o json",
-                url,
+                url_str,
                 Self::get_list_command(path)
             );
         }
@@ -505,7 +506,7 @@ impl LocalClient {
         format!(
             "HTTP {} at {}\n\nResponse: {}",
             status,
-            url,
+            url_str,
             if body.len() > 200 {
                 format!("{}...", &body[..200])
             } else {
@@ -574,8 +575,7 @@ impl LocalClient {
             } else {
                 urls.push(self.base_url.join(&format!("api/{}", cleaned))?);
             }
-        } else {
-            if site_scoped {
+        } else if site_scoped {
                 urls.push(
                     self.base_url
                         .join(&format!("proxy/network/api/s/{}/{}", self.site, cleaned))?,

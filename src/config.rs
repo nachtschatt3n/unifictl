@@ -211,28 +211,30 @@ mod tests {
         fs::create_dir_all(cwd.path().join("config")).unwrap();
         fs::create_dir_all(cwd.path().join("xdg")).unwrap();
 
-        let mut user_cfg = Config::default();
-        user_cfg.api_key = Some("user-key".into());
-        user_cfg.base_url = Some("https://example.test".into());
-        user_cfg.local = Some(LocalConfig {
-            url: Some("https://controller.local".into()),
-            username: Some("user".into()),
-            password: Some("pass-user".into()),
-            site: Some("site1".into()),
-            verify_tls: false,
-        });
+        let user_cfg = Config {
+            api_key: Some("user-key".into()),
+            base_url: Some("https://example.test".into()),
+            local: Some(LocalConfig {
+                url: Some("https://controller.local".into()),
+                username: Some("user".into()),
+                password: Some("pass-user".into()),
+                site: Some("site1".into()),
+                verify_tls: false,
+            }),
+        };
         save(Scope::User, &user_cfg, cwd.path()).unwrap();
 
-        let mut local_cfg = Config::default();
-        local_cfg.api_key = Some("local-key".into());
-        local_cfg.base_url = Some("https://example.test".into());
-        local_cfg.local = Some(LocalConfig {
-            url: Some("https://override.local".into()),
-            username: Some("localuser".into()),
-            password: Some("localpass".into()),
-            site: Some("localsite".into()),
-            verify_tls: true,
-        });
+        let local_cfg = Config {
+            api_key: Some("local-key".into()),
+            base_url: Some("https://example.test".into()),
+            local: Some(LocalConfig {
+                url: Some("https://override.local".into()),
+                username: Some("localuser".into()),
+                password: Some("localpass".into()),
+                site: Some("localsite".into()),
+                verify_tls: true,
+            }),
+        };
         save(Scope::Local, &local_cfg, cwd.path()).unwrap();
 
         let effective = resolve(cwd.path(), None, None).unwrap();
