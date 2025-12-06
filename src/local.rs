@@ -51,8 +51,8 @@ impl LocalClient {
             .cookie_store(true)
             .danger_accept_invalid_certs(!verify_tls)
             .user_agent(user_agent.clone())
-            .timeout(Duration::from_secs(10))         // Total request timeout
-            .connect_timeout(Duration::from_secs(5))  // Connection timeout
+            .timeout(Duration::from_secs(10)) // Total request timeout
+            .connect_timeout(Duration::from_secs(5)) // Connection timeout
             .build()
             .context("building local HTTP client")?;
 
@@ -297,26 +297,26 @@ impl LocalClient {
             let mut resp = send_once(req.try_clone().unwrap_or(req), &self.csrf);
 
             // If 401, relogin and retry once on same URL
-            if let Ok(r) = &resp {
-                if r.status() == StatusCode::UNAUTHORIZED {
-                    self.force_relogin()?;
-                    let mut retry = self
-                        .http
-                        .request(method.clone(), url.clone())
-                        .header(ACCEPT, HeaderValue::from_static("application/json"))
-                        .header(
-                            USER_AGENT,
-                            UA.get_or_init(|| HeaderValue::from_static("unifictl-local/0.1"))
-                                .clone(),
-                        );
-                    if let Some(q) = query {
-                        retry = retry.query(q);
-                    }
-                    if let Some(b) = body {
-                        retry = retry.json(b);
-                    }
-                    resp = send_once(retry, &self.csrf);
+            if let Ok(r) = &resp
+                && r.status() == StatusCode::UNAUTHORIZED
+            {
+                self.force_relogin()?;
+                let mut retry = self
+                    .http
+                    .request(method.clone(), url.clone())
+                    .header(ACCEPT, HeaderValue::from_static("application/json"))
+                    .header(
+                        USER_AGENT,
+                        UA.get_or_init(|| HeaderValue::from_static("unifictl-local/0.1"))
+                            .clone(),
+                    );
+                if let Some(q) = query {
+                    retry = retry.query(q);
                 }
+                if let Some(b) = body {
+                    retry = retry.json(b);
+                }
+                resp = send_once(retry, &self.csrf);
             }
 
             match resp {
@@ -329,7 +329,7 @@ impl LocalClient {
                             path,
                             status,
                             &body,
-                            &url.to_string(),
+                            url.as_ref(),
                         );
                         last_err = Some(anyhow!(msg));
                         continue;
@@ -377,13 +377,13 @@ impl LocalClient {
         // Preserve the original port explicitly
         let original_port = self.base_url.port();
         let mut bases = vec![self.base_url.clone()];
-        
+
         // Only try port 443 alternative if we're using 8443
-        if original_port == Some(8443) {
-            if let Ok(mut alt) = Url::parse(&self.base_url.to_string()) {
-                let _ = alt.set_port(Some(443));
-                bases.push(alt);
-            }
+        if original_port == Some(8443)
+            && let Ok(mut alt) = Url::parse(self.base_url.as_str())
+        {
+            let _ = alt.set_port(Some(443));
+            bases.push(alt);
         }
 
         let auth_paths = [
@@ -451,7 +451,7 @@ impl LocalClient {
         url: &str,
     ) -> String {
         let operation = Self::infer_operation(method, path);
-        
+
         if status == StatusCode::UNAUTHORIZED {
             return format!(
                 "Authentication failed (401) at {}\n\nPossible causes:\n  • Session expired - credentials may need to be refreshed\n  • Invalid username or password\n  • Controller requires re-authentication\n\nTry:\n  unifictl validate --local-only",
@@ -461,19 +461,23 @@ impl LocalClient {
 
         if status == StatusCode::BAD_REQUEST {
             let mut msg = format!("Failed to {}: HTTP 400", operation);
-            
+
             // Try to parse error message from JSON response
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-                if let Some(err_msg) = json.get("meta").and_then(|m| m.get("msg")).and_then(|m| m.as_str()) {
+                if let Some(err_msg) = json
+                    .get("meta")
+                    .and_then(|m| m.get("msg"))
+                    .and_then(|m| m.as_str())
+                {
                     msg.push_str(&format!("\n\nError: {}", err_msg));
                 } else if let Some(err_msg) = json.get("error").and_then(|e| e.as_str()) {
                     msg.push_str(&format!("\n\nError: {}", err_msg));
                 }
             }
-            
+
             // Add context-specific guidance
             msg.push_str(&Self::get_operation_guidance(path, operation));
-            
+
             return msg;
         }
 
@@ -481,7 +485,10 @@ impl LocalClient {
             return format!(
                 "Resource not found (404) at {}\n\nPossible causes:\n  • The {} does not exist\n  • Invalid ID or identifier\n  • Resource was deleted\n\nTry:\n  unifictl local {} -o json",
                 url,
-                operation.replace("create", "resource").replace("update", "resource").replace("delete", "resource"),
+                operation
+                    .replace("create", "resource")
+                    .replace("update", "resource")
+                    .replace("delete", "resource"),
                 Self::get_list_command(path)
             );
         }
@@ -495,8 +502,16 @@ impl LocalClient {
         }
 
         // Generic error with body
-        format!("HTTP {} at {}\n\nResponse: {}", status, url, 
-            if body.len() > 200 { format!("{}...", &body[..200]) } else { body.to_string() })
+        format!(
+            "HTTP {} at {}\n\nResponse: {}",
+            status,
+            url,
+            if body.len() > 200 {
+                format!("{}...", &body[..200])
+            } else {
+                body.to_string()
+            }
+        )
     }
 
     fn infer_operation(method: &Method, _path: &str) -> &'static str {
@@ -731,7 +746,7 @@ mod tests {
         // Verify port is preserved when parsing URL
         assert_eq!(client.base_url.port(), Some(8443));
         assert_eq!(client.base_url.host_str(), Some("192.168.55.1"));
-        
+
         // Test URL join preserves port
         let joined = client.base_url.join("api/login").unwrap();
         assert_eq!(joined.port(), Some(8443));
@@ -741,7 +756,7 @@ mod tests {
     #[test]
     fn format_error_message_provides_actionable_guidance() {
         use reqwest::{Method, StatusCode};
-        
+
         // Test 401 error
         let msg = LocalClient::format_error_message(
             &Method::GET,

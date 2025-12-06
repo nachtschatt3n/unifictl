@@ -23,10 +23,14 @@ use crate::config::{LocalConfig, Scope, resolve, resolve_local, save};
 use crate::local::LocalClient;
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use regex::RegexBuilder;
 use serde_json::json;
 use std::sync::OnceLock;
-use std::{fs, path::PathBuf, io::{self, Write}};
-use regex::RegexBuilder;
+use std::{
+    fs,
+    io::{self, Write},
+    path::PathBuf,
+};
 
 static FULL_IDS: OnceLock<bool> = OnceLock::new();
 
@@ -935,7 +939,11 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Devices { site, unadopted, adopt_all } => {
+        LocalCommands::Devices {
+            site,
+            unadopted,
+            adopt_all,
+        } => {
             let effective = resolve_local(cwd, site_override(site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -944,7 +952,7 @@ fn handle_local(
                 &effective.site,
                 effective.verify_tls,
             )?;
-            
+
             if adopt_all {
                 // Get all devices and adopt unadopted ones
                 let devices = client.list_devices()?;
@@ -952,18 +960,20 @@ fn handle_local(
                     if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
                         let mut adopted_count = 0;
                         let mut failed_count = 0;
-                        
+
                         for device in data {
                             let state = device.get("state").and_then(|s| s.as_str());
                             let adopted = device.get("adopted").and_then(|a| a.as_bool());
                             let is_unadopted = state == Some("pending") || adopted == Some(false);
-                            
+
                             if is_unadopted {
                                 if let Some(mac) = device.get("mac").and_then(|m| m.as_str()) {
                                     match client.device_action(mac, "adopt") {
                                         Ok(_) => {
                                             adopted_count += 1;
-                                            if let Some(name) = device.get("name").and_then(|n| n.as_str()) {
+                                            if let Some(name) =
+                                                device.get("name").and_then(|n| n.as_str())
+                                            {
                                                 println!("Adopted: {} ({})", name, mac);
                                             } else {
                                                 println!("Adopted device: {}", mac);
@@ -971,8 +981,13 @@ fn handle_local(
                                         }
                                         Err(e) => {
                                             failed_count += 1;
-                                            if let Some(name) = device.get("name").and_then(|n| n.as_str()) {
-                                                eprintln!("Failed to adopt {} ({}): {}", name, mac, e);
+                                            if let Some(name) =
+                                                device.get("name").and_then(|n| n.as_str())
+                                            {
+                                                eprintln!(
+                                                    "Failed to adopt {} ({}): {}",
+                                                    name, mac, e
+                                                );
                                             } else {
                                                 eprintln!("Failed to adopt device {}: {}", mac, e);
                                             }
@@ -981,15 +996,18 @@ fn handle_local(
                                 }
                             }
                         }
-                        
-                        println!("\nAdoption complete: {} adopted, {} failed", adopted_count, failed_count);
+
+                        println!(
+                            "\nAdoption complete: {} adopted, {} failed",
+                            adopted_count, failed_count
+                        );
                         return Ok(());
                     }
                 }
                 println!("No unadopted devices found.");
                 return Ok(());
             }
-            
+
             render_local(
                 || {
                     let mut resp = client.list_devices()?;
@@ -1002,7 +1020,8 @@ fn handle_local(
                                     let adopted = item.get("adopted").and_then(|a| a.as_bool());
                                     state == Some("pending") || adopted == Some(false)
                                 });
-                                resp.body = serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                                resp.body = serde_json::to_string(&json)
+                                    .unwrap_or_else(|_| resp.body.clone());
                                 resp.json = Some(json);
                             }
                         }
@@ -1011,7 +1030,9 @@ fn handle_local(
                 },
                 output,
                 render_opts,
-                Some(&["name", "model", "type", "ip", "mac", "version", "state", "adopted"]),
+                Some(&[
+                    "name", "model", "type", "ip", "mac", "version", "state", "adopted",
+                ]),
                 watch,
             )
         }
@@ -1433,7 +1454,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::NetworkDelete { id, site, dry_run, yes } => {
+        LocalCommands::NetworkDelete {
+            id,
+            site,
+            dry_run,
+            yes,
+        } => {
             let effective = resolve_local(cwd, site_override(site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1466,16 +1492,18 @@ fn handle_local(
                 let network_name: Option<String> = if let Some(ref json) = networks.json {
                     json.get("data")
                         .and_then(|d| d.as_array())
-                        .and_then(|arr| arr.iter().find(|n| {
-                            n.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || n.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }))
+                        .and_then(|arr| {
+                            arr.iter().find(|n| {
+                                n.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                    || n.get("id").and_then(|id| id.as_str()) == Some(&id)
+                            })
+                        })
                         .and_then(|n| n.get("name").and_then(|n| n.as_str()))
                         .map(|s| s.to_string())
                 } else {
                     None
                 };
-                
+
                 if !confirm_deletion("network", &id, network_name.as_deref(), yes)? {
                     println!("Deletion cancelled.");
                     return Ok(());
@@ -1552,7 +1580,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::WlanDelete { id, site, dry_run, yes } => {
+        LocalCommands::WlanDelete {
+            id,
+            site,
+            dry_run,
+            yes,
+        } => {
             let effective = resolve_local(cwd, site_override(site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1585,16 +1618,22 @@ fn handle_local(
                 let wlan_name: Option<String> = if let Some(ref json) = wlans.json {
                     json.get("data")
                         .and_then(|d| d.as_array())
-                        .and_then(|arr| arr.iter().find(|w| {
-                            w.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || w.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }))
-                        .and_then(|w| w.get("name").or_else(|| w.get("essid")).and_then(|n| n.as_str()))
+                        .and_then(|arr| {
+                            arr.iter().find(|w| {
+                                w.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                    || w.get("id").and_then(|id| id.as_str()) == Some(&id)
+                            })
+                        })
+                        .and_then(|w| {
+                            w.get("name")
+                                .or_else(|| w.get("essid"))
+                                .and_then(|n| n.as_str())
+                        })
                         .map(|s| s.to_string())
                 } else {
                     None
                 };
-                
+
                 if !confirm_deletion("WLAN", &id, wlan_name.as_deref(), yes)? {
                     println!("Deletion cancelled.");
                     return Ok(());
@@ -1675,7 +1714,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallRuleDelete { id, site, dry_run, yes } => {
+        LocalCommands::FirewallRuleDelete {
+            id,
+            site,
+            dry_run,
+            yes,
+        } => {
             let effective = resolve_local(cwd, site_override(site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1708,16 +1752,18 @@ fn handle_local(
                 let rule_name: Option<String> = if let Some(ref json) = rules.json {
                     json.get("data")
                         .and_then(|d| d.as_array())
-                        .and_then(|arr| arr.iter().find(|r| {
-                            r.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || r.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }))
+                        .and_then(|arr| {
+                            arr.iter().find(|r| {
+                                r.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                    || r.get("id").and_then(|id| id.as_str()) == Some(&id)
+                            })
+                        })
                         .and_then(|r| r.get("name").and_then(|n| n.as_str()))
                         .map(|s| s.to_string())
                 } else {
                     None
                 };
-                
+
                 if !confirm_deletion("firewall rule", &id, rule_name.as_deref(), yes)? {
                     println!("Deletion cancelled.");
                     return Ok(());
@@ -1781,7 +1827,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallGroupDelete { id, site, dry_run, yes } => {
+        LocalCommands::FirewallGroupDelete {
+            id,
+            site,
+            dry_run,
+            yes,
+        } => {
             let effective = resolve_local(cwd, site_override(site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1814,16 +1865,18 @@ fn handle_local(
                 let group_name: Option<String> = if let Some(ref json) = groups.json {
                     json.get("data")
                         .and_then(|d| d.as_array())
-                        .and_then(|arr| arr.iter().find(|g| {
-                            g.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || g.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }))
+                        .and_then(|arr| {
+                            arr.iter().find(|g| {
+                                g.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                    || g.get("id").and_then(|id| id.as_str()) == Some(&id)
+                            })
+                        })
                         .and_then(|g| g.get("name").and_then(|n| n.as_str()))
                         .map(|s| s.to_string())
                 } else {
                     None
                 };
-                
+
                 if !confirm_deletion("firewall group", &id, group_name.as_deref(), yes)? {
                     println!("Deletion cancelled.");
                     return Ok(());
@@ -1969,21 +2022,21 @@ where
                 print!("\x1b[2J\x1b[H");
             }
             first_run = false;
-            
+
             // Print timestamp for watch mode
             if output == OutputFormat::Pretty {
                 let now = chrono::Local::now();
                 println!("Updated: {}\n", now.format("%Y-%m-%d %H:%M:%S"));
             }
-            
+
             let resp = fetch()?;
             render_response(resp, output, render_opts, columns)?;
-            
+
             // Print instructions for exiting
             if output == OutputFormat::Pretty {
                 println!("\n(Press Ctrl+C to stop watching)");
             }
-            
+
             std::thread::sleep(std::time::Duration::from_secs(interval));
         }
     } else {
@@ -1991,23 +2044,31 @@ where
     }
 }
 
-fn confirm_deletion(resource_type: &str, resource_id: &str, resource_name: Option<&str>, yes: bool) -> Result<bool> {
+fn confirm_deletion(
+    resource_type: &str,
+    resource_id: &str,
+    resource_name: Option<&str>,
+    yes: bool,
+) -> Result<bool> {
     if yes {
         return Ok(true);
     }
-    
+
     let name_part = if let Some(name) = resource_name {
         format!(" \"{}\"", name)
     } else {
         String::new()
     };
-    
-    print!("Are you sure you want to delete {}{} (ID: {})? [y/N]: ", resource_type, name_part, resource_id);
+
+    print!(
+        "Are you sure you want to delete {}{} (ID: {})? [y/N]: ",
+        resource_type, name_part, resource_id
+    );
     io::stdout().flush()?;
-    
+
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    
+
     Ok(input.trim().to_lowercase() == "y" || input.trim().to_lowercase() == "yes")
 }
 
@@ -2039,21 +2100,21 @@ fn run_get(
                 print!("\x1b[2J\x1b[H");
             }
             first_run = false;
-            
+
             // Print timestamp for watch mode
             if output == OutputFormat::Pretty {
                 let now = chrono::Local::now();
                 println!("Updated: {}\n", now.format("%Y-%m-%d %H:%M:%S"));
             }
-            
+
             let response = client.get(path, &query)?;
             render_response(response.clone(), output, render_opts, columns)?;
-            
+
             // Print instructions for exiting
             if output == OutputFormat::Pretty {
                 println!("\n(Press Ctrl+C to stop watching)");
             }
-            
+
             std::thread::sleep(std::time::Duration::from_secs(interval));
         }
     } else {
@@ -2121,7 +2182,7 @@ fn print_csv(
 ) -> Result<()> {
     use csv::Writer;
     use std::io;
-    
+
     let rows = match json {
         serde_json::Value::Array(arr) => arr,
         serde_json::Value::Object(map) => match map.get("data") {
@@ -2154,7 +2215,10 @@ fn print_csv(
 
     if let Some(override_cols) = &render_opts.columns_override {
         for key in override_cols {
-            if rows.iter().any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false)) {
+            if rows
+                .iter()
+                .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
+            {
                 csv_columns.push(key.to_string());
             }
         }
@@ -2163,7 +2227,10 @@ fn print_csv(
     if csv_columns.is_empty() {
         if let Some(hint) = columns_hint {
             for key in hint {
-                if rows.iter().any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false)) {
+                if rows
+                    .iter()
+                    .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
+                {
                     csv_columns.push((*key).to_string());
                 }
             }
@@ -2173,7 +2240,10 @@ fn print_csv(
     if csv_columns.is_empty() {
         // Auto-select up to 8 non-empty fields
         for key in first_obj.keys() {
-            if rows.iter().any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false)) {
+            if rows
+                .iter()
+                .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
+            {
                 csv_columns.push(key.to_string());
             }
             if csv_columns.len() >= 8 {
@@ -2184,7 +2254,10 @@ fn print_csv(
 
     // Always include id if present
     if !csv_columns.contains(&"id".to_string()) {
-        if rows.iter().any(|row| row.get("id").map(|v| is_non_empty(v)).unwrap_or(false)) {
+        if rows
+            .iter()
+            .any(|row| row.get("id").map(|v| is_non_empty(v)).unwrap_or(false))
+        {
             csv_columns.push("id".to_string());
         }
     }
@@ -2195,19 +2268,16 @@ fn print_csv(
     }
 
     let mut wtr = Writer::from_writer(io::stdout());
-    
+
     // Write header
     wtr.write_record(&csv_columns)?;
 
     // Filter rows if needed
     let needle = render_opts.filter.as_ref().map(|f| f.to_ascii_lowercase());
-    
+
     // Compile regex if provided
     let regex_pattern = if let Some(pattern) = &render_opts.filter_regex {
-        match RegexBuilder::new(pattern)
-            .case_insensitive(true)
-            .build()
-        {
+        match RegexBuilder::new(pattern).case_insensitive(true).build() {
             Ok(re) => Some(re),
             Err(e) => {
                 eprintln!("Warning: Invalid regex pattern '{}': {}", pattern, e);
@@ -2217,13 +2287,13 @@ fn print_csv(
     } else {
         None
     };
-    
+
     let mut filtered_rows: Vec<&serde_json::Value> = rows.iter().collect();
-    
+
     filtered_rows.retain(|row| {
         if let serde_json::Value::Object(map) = row {
             let mut matches = true;
-            
+
             // Apply text filter
             if let Some(needle) = &needle {
                 if !csv_columns.iter().any(|col| {
@@ -2234,7 +2304,7 @@ fn print_csv(
                     matches = false;
                 }
             }
-            
+
             // Apply regex filter
             if let Some(ref re) = regex_pattern {
                 if !csv_columns.iter().any(|col| {
@@ -2245,7 +2315,7 @@ fn print_csv(
                     matches = false;
                 }
             }
-            
+
             matches
         } else {
             false
@@ -2256,9 +2326,16 @@ fn print_csv(
     if let Some(sort) = &render_opts.sort_by {
         if let Some(idx) = csv_columns.iter().position(|c| c == sort) {
             filtered_rows.sort_by(|a, b| {
-                if let (serde_json::Value::Object(a_map), serde_json::Value::Object(b_map)) = (a, b) {
-                    let a_val = a_map.get(&csv_columns[idx]).map(value_to_str).unwrap_or_default();
-                    let b_val = b_map.get(&csv_columns[idx]).map(value_to_str).unwrap_or_default();
+                if let (serde_json::Value::Object(a_map), serde_json::Value::Object(b_map)) = (a, b)
+                {
+                    let a_val = a_map
+                        .get(&csv_columns[idx])
+                        .map(value_to_str)
+                        .unwrap_or_default();
+                    let b_val = b_map
+                        .get(&csv_columns[idx])
+                        .map(value_to_str)
+                        .unwrap_or_default();
                     a_val.cmp(&b_val)
                 } else {
                     std::cmp::Ordering::Equal
@@ -2379,7 +2456,7 @@ fn print_table(
     let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
     let mut table: Vec<Vec<String>> = Vec::new();
     let needle = render_opts.filter.as_ref().map(|f| f.to_ascii_lowercase());
-    
+
     // Compile regex if provided
     let regex_pattern = if let Some(pattern) = &render_opts.filter_regex {
         match regex::RegexBuilder::new(pattern)
@@ -2407,10 +2484,10 @@ fn print_table(
                 }
                 out_row.push(rendered);
             }
-            
+
             // Apply filters
             let mut matches = true;
-            
+
             if let Some(needle) = &needle {
                 if !out_row
                     .iter()
@@ -2419,13 +2496,13 @@ fn print_table(
                     matches = false;
                 }
             }
-            
+
             if let Some(ref re) = regex_pattern {
                 if !out_row.iter().any(|cell| re.is_match(cell)) {
                     matches = false;
                 }
             }
-            
+
             if !matches {
                 continue;
             }
