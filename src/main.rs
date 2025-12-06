@@ -2327,20 +2327,19 @@ fn print_csv(
         && let Some(idx) = csv_columns.iter().position(|c| c == sort)
     {
         filtered_rows.sort_by(|a, b| {
-                if let (serde_json::Value::Object(a_map), serde_json::Value::Object(b_map)) = (a, b)
-                {
-                    let a_val = a_map
-                        .get(&csv_columns[idx])
-                        .map(value_to_str)
-                        .unwrap_or_default();
-                    let b_val = b_map
-                        .get(&csv_columns[idx])
-                        .map(value_to_str)
-                        .unwrap_or_default();
-                    a_val.cmp(&b_val)
-                } else {
-                    std::cmp::Ordering::Equal
-                }
+            if let (serde_json::Value::Object(a_map), serde_json::Value::Object(b_map)) = (a, b) {
+                let a_val = a_map
+                    .get(&csv_columns[idx])
+                    .map(value_to_str)
+                    .unwrap_or_default();
+                let b_val = b_map
+                    .get(&csv_columns[idx])
+                    .map(value_to_str)
+                    .unwrap_or_default();
+                a_val.cmp(&b_val)
+            } else {
+                std::cmp::Ordering::Equal
+            }
         });
     }
 

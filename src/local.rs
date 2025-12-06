@@ -324,13 +324,8 @@ impl LocalClient {
                     let status = res.status();
                     if !status.is_success() {
                         let body = res.text().unwrap_or_default();
-                        let msg = Self::format_error_message(
-                            &method,
-                            path,
-                            status,
-                            &body,
-                            url.as_str(),
-                        );
+                        let msg =
+                            Self::format_error_message(&method, path, status, &body, url.as_str());
                         last_err = Some(anyhow!(msg));
                         continue;
                     }
@@ -576,34 +571,19 @@ impl LocalClient {
                 urls.push(self.base_url.join(&format!("api/{}", cleaned))?);
             }
         } else if site_scoped {
-                urls.push(
-                    self.base_url
-                        .join(&format!("proxy/network/api/s/{}/{}", self.site, cleaned))?,
-                );
-                urls.push(self.base_url.join(&format!(
-                    "proxy/network/v2/api/site/{}/{}",
-                    self.site, cleaned
-                ))?);
-                urls.push(
-                    self.base_url
-                        .join(&format!("proxy/network/v2/api/s/{}/{}", self.site, cleaned))?,
-                );
-                if fallback_global {
-                    urls.push(
-                        self.base_url
-                            .join(&format!("proxy/network/api/{}", cleaned))?,
-                    );
-                    urls.push(
-                        self.base_url
-                            .join(&format!("proxy/network/v2/api/{}", cleaned))?,
-                    );
-                }
-                // Legacy path as last resort
-                urls.push(
-                    self.base_url
-                        .join(&format!("api/s/{}/{}", self.site, cleaned))?,
-                );
-            } else {
+            urls.push(
+                self.base_url
+                    .join(&format!("proxy/network/api/s/{}/{}", self.site, cleaned))?,
+            );
+            urls.push(self.base_url.join(&format!(
+                "proxy/network/v2/api/site/{}/{}",
+                self.site, cleaned
+            ))?);
+            urls.push(
+                self.base_url
+                    .join(&format!("proxy/network/v2/api/s/{}/{}", self.site, cleaned))?,
+            );
+            if fallback_global {
                 urls.push(
                     self.base_url
                         .join(&format!("proxy/network/api/{}", cleaned))?,
@@ -612,8 +592,22 @@ impl LocalClient {
                     self.base_url
                         .join(&format!("proxy/network/v2/api/{}", cleaned))?,
                 );
-                urls.push(self.base_url.join(&format!("api/{}", cleaned))?);
             }
+            // Legacy path as last resort
+            urls.push(
+                self.base_url
+                    .join(&format!("api/s/{}/{}", self.site, cleaned))?,
+            );
+        } else {
+            urls.push(
+                self.base_url
+                    .join(&format!("proxy/network/api/{}", cleaned))?,
+            );
+            urls.push(
+                self.base_url
+                    .join(&format!("proxy/network/v2/api/{}", cleaned))?,
+            );
+            urls.push(self.base_url.join(&format!("api/{}", cleaned))?);
         }
         Ok(urls)
     }
