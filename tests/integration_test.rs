@@ -1,6 +1,5 @@
 // Integration tests for unifictl improvements
 
-use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin_cmd;
 
 #[test]
