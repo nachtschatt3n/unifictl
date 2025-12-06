@@ -1,3 +1,19 @@
+// unifictl - CLI for UniFi Site Manager API
+// Copyright (C) 2024 Mathias Uhl <mathiasuhl@gmx.de>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 use crate::client::ResponseData;
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
@@ -5,6 +21,7 @@ use reqwest::header::{ACCEPT, HeaderValue, USER_AGENT};
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct LocalClient {
@@ -34,6 +51,8 @@ impl LocalClient {
             .cookie_store(true)
             .danger_accept_invalid_certs(!verify_tls)
             .user_agent(user_agent.clone())
+            .timeout(Duration::from_secs(10))         // Total request timeout
+            .connect_timeout(Duration::from_secs(5))  // Connection timeout
             .build()
             .context("building local HTTP client")?;
 
@@ -375,22 +394,10 @@ impl LocalClient {
         ];
 
         let mut last_err: Option<anyhow::Error> = None;
-        for mut base in bases {
-            // Ensure port is preserved when joining paths
-            // If base doesn't have a port but original did, restore it
-            if base.port().is_none() && original_port.is_some() {
-                let _ = base.set_port(original_port);
-            }
-            
+        for base in bases {
             for path in auth_paths.iter() {
                 let url = match base.join(path) {
-                    Ok(mut u) => {
-                        // Explicitly ensure port is preserved after join
-                        if u.port().is_none() && original_port.is_some() {
-                            let _ = u.set_port(original_port);
-                        }
-                        u
-                    }
+                    Ok(u) => u,
                     Err(e) => {
                         last_err = Some(e.into());
                         continue;
@@ -399,12 +406,7 @@ impl LocalClient {
                 let os_resp = self.request_login(&url, &creds);
                 match os_resp {
                     Ok(resp) => {
-                        // Ensure the base_url we store has the port
-                        let mut stored_base = base.clone();
-                        if stored_base.port().is_none() && original_port.is_some() {
-                            let _ = stored_base.set_port(original_port);
-                        }
-                        self.base_url = stored_base;
+                        self.base_url = base.clone();
                         self.is_legacy = path.contains("api/login");
                         self.logged_in = true;
                         if let Some(token) = extract_csrf(&resp) {

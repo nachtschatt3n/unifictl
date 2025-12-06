@@ -1,3 +1,4 @@
 /target
 *.pkg.tar.zst
 *.deb
+.unifictl.yaml
