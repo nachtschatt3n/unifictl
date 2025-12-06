@@ -1,10 +1,10 @@
 pkgname=unifictl
-pkgver=0.1.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="CLI for UniFi Site Manager (API v1/EA)"
 arch=('x86_64' 'aarch64')
-url="https://example.com/unifictl"
-license=('MIT')
+url="https://github.com/nachtschatt3n/unifictl"
+license=('GPL-3.0')
 depends=('openssl' 'glibc')
 makedepends=()
 source=()
