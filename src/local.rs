@@ -305,11 +305,13 @@ impl LocalClient {
                     let status = res.status();
                     if !status.is_success() {
                         let body = res.text().unwrap_or_default();
-                        let msg = if status == StatusCode::UNAUTHORIZED {
-                            format!("Authentication failed (401) at {}", url)
-                        } else {
-                            format!("HTTP {} at {} body: {}", status, url, body)
-                        };
+                        let msg = Self::format_error_message(
+                            &method,
+                            path,
+                            status,
+                            &body,
+                            &url.to_string(),
+                        );
                         last_err = Some(anyhow!(msg));
                         continue;
                     }
@@ -353,8 +355,12 @@ impl LocalClient {
             "strict": true,
         });
 
+        // Preserve the original port explicitly
+        let original_port = self.base_url.port();
         let mut bases = vec![self.base_url.clone()];
-        if self.base_url.port() == Some(8443) {
+        
+        // Only try port 443 alternative if we're using 8443
+        if original_port == Some(8443) {
             if let Ok(mut alt) = Url::parse(&self.base_url.to_string()) {
                 let _ = alt.set_port(Some(443));
                 bases.push(alt);
@@ -369,10 +375,22 @@ impl LocalClient {
         ];
 
         let mut last_err: Option<anyhow::Error> = None;
-        for base in bases {
+        for mut base in bases {
+            // Ensure port is preserved when joining paths
+            // If base doesn't have a port but original did, restore it
+            if base.port().is_none() && original_port.is_some() {
+                let _ = base.set_port(original_port);
+            }
+            
             for path in auth_paths.iter() {
                 let url = match base.join(path) {
-                    Ok(u) => u,
+                    Ok(mut u) => {
+                        // Explicitly ensure port is preserved after join
+                        if u.port().is_none() && original_port.is_some() {
+                            let _ = u.set_port(original_port);
+                        }
+                        u
+                    }
                     Err(e) => {
                         last_err = Some(e.into());
                         continue;
@@ -381,7 +399,12 @@ impl LocalClient {
                 let os_resp = self.request_login(&url, &creds);
                 match os_resp {
                     Ok(resp) => {
-                        self.base_url = base;
+                        // Ensure the base_url we store has the port
+                        let mut stored_base = base.clone();
+                        if stored_base.port().is_none() && original_port.is_some() {
+                            let _ = stored_base.set_port(original_port);
+                        }
+                        self.base_url = stored_base;
                         self.is_legacy = path.contains("api/login");
                         self.logged_in = true;
                         if let Some(token) = extract_csrf(&resp) {
@@ -416,6 +439,106 @@ impl LocalClient {
             .send()
             .and_then(|r| r.error_for_status())
             .context("sending login request")
+    }
+
+    fn format_error_message(
+        method: &Method,
+        path: &str,
+        status: StatusCode,
+        body: &str,
+        url: &str,
+    ) -> String {
+        let operation = Self::infer_operation(method, path);
+        
+        if status == StatusCode::UNAUTHORIZED {
+            return format!(
+                "Authentication failed (401) at {}\n\nPossible causes:\n  • Session expired - credentials may need to be refreshed\n  • Invalid username or password\n  • Controller requires re-authentication\n\nTry:\n  unifictl validate --local-only",
+                url
+            );
+        }
+
+        if status == StatusCode::BAD_REQUEST {
+            let mut msg = format!("Failed to {}: HTTP 400", operation);
+            
+            // Try to parse error message from JSON response
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                if let Some(err_msg) = json.get("meta").and_then(|m| m.get("msg")).and_then(|m| m.as_str()) {
+                    msg.push_str(&format!("\n\nError: {}", err_msg));
+                } else if let Some(err_msg) = json.get("error").and_then(|e| e.as_str()) {
+                    msg.push_str(&format!("\n\nError: {}", err_msg));
+                }
+            }
+            
+            // Add context-specific guidance
+            msg.push_str(&Self::get_operation_guidance(path, operation));
+            
+            return msg;
+        }
+
+        if status == StatusCode::NOT_FOUND {
+            return format!(
+                "Resource not found (404) at {}\n\nPossible causes:\n  • The {} does not exist\n  • Invalid ID or identifier\n  • Resource was deleted\n\nTry:\n  unifictl local {} -o json",
+                url,
+                operation.replace("create", "resource").replace("update", "resource").replace("delete", "resource"),
+                Self::get_list_command(path)
+            );
+        }
+
+        if status == StatusCode::CONFLICT {
+            return format!(
+                "Conflict (409) at {}\n\nPossible causes:\n  • Resource already exists\n  • Conflicting configuration\n  • Duplicate name or identifier\n\nTry:\n  unifictl local {} -o json",
+                url,
+                Self::get_list_command(path)
+            );
+        }
+
+        // Generic error with body
+        format!("HTTP {} at {}\n\nResponse: {}", status, url, 
+            if body.len() > 200 { format!("{}...", &body[..200]) } else { body.to_string() })
+    }
+
+    fn infer_operation(method: &Method, _path: &str) -> &'static str {
+        match *method {
+            Method::POST => "create",
+            Method::PUT => "update",
+            Method::DELETE => "delete",
+            Method::GET => "fetch",
+            _ => "operate on",
+        }
+    }
+
+    fn get_operation_guidance(path: &str, _operation: &str) -> &'static str {
+        if path.contains("networkconf") {
+            return "\n\nPossible causes for network operations:\n  • VLAN ID already in use\n  • Invalid subnet format (expected: 192.168.1.0/24)\n  • Conflicting DHCP range\n  • Invalid network name\n\nCheck existing networks:\n  unifictl local networks -o json";
+        }
+        if path.contains("wlanconf") {
+            return "\n\nPossible causes for WLAN operations:\n  • SSID already exists\n  • Invalid password (must be 8+ characters for WPA2)\n  • Invalid security settings\n\nCheck existing WLANs:\n  unifictl local wlans -o json";
+        }
+        if path.contains("firewallrule") {
+            return "\n\nPossible causes for firewall rule operations:\n  • Invalid action (must be: accept, drop, reject)\n  • Invalid firewall group IDs\n  • Rule index conflict\n\nCheck existing rules:\n  unifictl local firewall-rules -o json";
+        }
+        if path.contains("firewallgroup") {
+            return "\n\nPossible causes for firewall group operations:\n  • Invalid group type\n  • Invalid member addresses\n  • Duplicate group name\n\nCheck existing groups:\n  unifictl local firewall-groups -o json";
+        }
+        ""
+    }
+
+    fn get_list_command(path: &str) -> &'static str {
+        if path.contains("networkconf") {
+            "networks"
+        } else if path.contains("wlanconf") {
+            "wlans"
+        } else if path.contains("firewallrule") {
+            "firewall-rules"
+        } else if path.contains("firewallgroup") {
+            "firewall-groups"
+        } else if path.contains("device") {
+            "devices"
+        } else if path.contains("sta") {
+            "clients"
+        } else {
+            "sites"
+        }
     }
 
     fn build_urls(&self, site_scoped: bool, fallback_global: bool, path: &str) -> Result<Vec<Url>> {
@@ -594,5 +717,74 @@ mod tests {
         let data = resp.json.unwrap()["data"].as_array().unwrap().clone();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["mac"], "aa:bb");
+    }
+
+    #[test]
+    fn login_preserves_port_8443() {
+        // Test that URLs with port 8443 preserve the port through login
+        let url_with_port = "https://192.168.55.1:8443";
+        let client = LocalClient::new(url_with_port, "u", "p", "default", false);
+        assert!(client.is_ok());
+        let client = client.unwrap();
+        // Verify port is preserved when parsing URL
+        assert_eq!(client.base_url.port(), Some(8443));
+        assert_eq!(client.base_url.host_str(), Some("192.168.55.1"));
+        
+        // Test URL join preserves port
+        let joined = client.base_url.join("api/login").unwrap();
+        assert_eq!(joined.port(), Some(8443));
+        assert!(joined.to_string().contains(":8443"));
+    }
+
+    #[test]
+    fn format_error_message_provides_actionable_guidance() {
+        use reqwest::{Method, StatusCode};
+        
+        // Test 401 error
+        let msg = LocalClient::format_error_message(
+            &Method::GET,
+            "rest/networkconf",
+            StatusCode::UNAUTHORIZED,
+            "",
+            "https://example.com/api",
+        );
+        assert!(msg.contains("Authentication failed"));
+        assert!(msg.contains("Possible causes"));
+        assert!(msg.contains("unifictl validate"));
+
+        // Test 400 error with network path
+        let msg = LocalClient::format_error_message(
+            &Method::POST,
+            "rest/networkconf",
+            StatusCode::BAD_REQUEST,
+            r#"{"meta":{"msg":"VLAN already in use"}}"#,
+            "https://example.com/api",
+        );
+        assert!(msg.contains("Failed to create"));
+        assert!(msg.contains("VLAN already in use"));
+        assert!(msg.contains("unifictl local networks"));
+
+        // Test 404 error
+        let msg = LocalClient::format_error_message(
+            &Method::DELETE,
+            "rest/networkconf",
+            StatusCode::NOT_FOUND,
+            "",
+            "https://example.com/api",
+        );
+        assert!(msg.contains("Resource not found"));
+        assert!(msg.contains("Possible causes"));
+        assert!(msg.contains("unifictl local networks"));
+
+        // Test 409 error
+        let msg = LocalClient::format_error_message(
+            &Method::POST,
+            "rest/wlanconf",
+            StatusCode::CONFLICT,
+            "",
+            "https://example.com/api",
+        );
+        assert!(msg.contains("Conflict"));
+        assert!(msg.contains("Resource already exists"));
     }
 }

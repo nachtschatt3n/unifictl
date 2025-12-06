@@ -50,38 +50,77 @@ unifictl sdwan status <CONFIG_ID>
 
 # Local controller (username/password)
 unifictl local sites
-unifictl local devices [--site <SITE>]
+unifictl local devices [--site <SITE>] [--unadopted] [--adopt-all]
 unifictl local device <MAC> --ports|--config|--restart|--adopt|--upgrade
 unifictl local clients [--site <SITE>] [--wired|--wireless|--blocked]
 unifictl local client <MAC> --block|--unblock|--reconnect
 unifictl local health [--site <SITE>]
 unifictl local events [--site <SITE>]
 unifictl local networks|wlans|port-profiles|firewall-rules|firewall-groups
-unifictl local network create|update|delete ...
-unifictl local wlan create|update|delete ...
-unifictl local firewall-rule create|update|delete ...
-unifictl local firewall-group create|update|delete ...
+unifictl local network create|update|delete [--dry-run] [--yes]
+unifictl local wlan create|update|delete [--dry-run] [--yes]
+unifictl local firewall-rule create|update|delete [--dry-run] [--yes]
+unifictl local firewall-group create|update|delete [--dry-run] [--yes]
 unifictl local top-clients [--limit N]
 unifictl local top-devices [--limit N]
 unifictl local dpi
 unifictl local traffic
 
 # Output and table controls
-unifictl hosts list -o json                    # json/raw/pretty (pretty is default)
+unifictl hosts list -o json                    # json/csv/raw/pretty (pretty is default)
+unifictl devices list -o csv > devices.csv     # CSV export for reporting
 unifictl devices list --columns name,ip,model --sort-by name --filter "ap"
-unifictl local clients --watch 5               # refresh every 5s
+unifictl devices list --filter-regex "^SW.*"   # Regex filtering (case-insensitive)
+unifictl local clients --watch 5               # refresh every 5s (clears screen, shows timestamp)
 unifictl hosts list --full-ids                 # do not truncate IDs
+
+# Safety features
+unifictl local network delete <ID> --dry-run   # Preview what would be deleted
+unifictl local network delete <ID>             # Prompts for confirmation
+unifictl local network delete <ID> --yes      # Skip confirmation (for scripts)
+
+# Device management
+unifictl local devices --unadopted             # List pending/unadopted devices
+unifictl local devices --adopt-all             # Adopt all unadopted devices
+
+# Filtering and export
+unifictl local devices --filter "SW"           # Text filter (case-insensitive)
+unifictl local devices --filter-regex "^SW.*"  # Regex filter (case-insensitive)
+unifictl local clients -o csv > clients.csv    # Export to CSV
 
 # Config helpers
 unifictl configure --key "<KEY>" --scope local
 unifictl config-show
+unifictl validate                              # Test cloud and local credentials
 unifictl completion bash|zsh|fish|powershell > /path/to/completion
 ```
+
+## Error Messages
+
+The tool provides context-aware error messages with actionable guidance:
+
+- **401 (Unauthorized)**: Authentication failure with credential validation suggestions
+- **400 (Bad Request)**: Parsed error details with operation-specific troubleshooting
+- **404 (Not Found)**: Resource identification help and list command suggestions
+- **409 (Conflict)**: Conflict resolution guidance
+
+All error messages include:
+- Specific error codes and descriptions
+- Possible causes
+- Troubleshooting steps
+- Recommended commands to investigate
 
 ## Testing
 
 ```bash
 cargo test
+```
+
+Run specific test suites:
+```bash
+cargo test login_preserves_port          # Test port preservation
+cargo test format_error_message          # Test error message formatting
+cargo test --test integration_test       # Integration tests
 ```
 
 ## Packaging
@@ -102,7 +141,39 @@ cargo test
 
 Both packaging flows expect the release binary at `target/release/unifictl`.
 
+## Features
+
+### Output Formats
+- **Pretty** (default): Human-readable tables with automatic column selection
+- **JSON**: Structured JSON output for programmatic use
+- **CSV**: Comma-separated values for spreadsheet import and reporting
+- **Raw**: Exact API response body
+
+### Filtering & Sorting
+- **`--filter <TEXT>`**: Simple text filter (case-insensitive substring match)
+- **`--filter-regex <PATTERN>`**: Advanced regex filtering (case-insensitive)
+- **`--sort-by <COLUMN>`**: Sort results by any column
+- **`--columns <COL1,COL2>`**: Custom column selection
+- **`--full-ids`**: Show complete IDs without truncation
+
+### Safety Features
+- **`--dry-run`**: Preview deletions without actually deleting (all delete commands)
+- **Interactive confirmations**: Prompts before destructive operations (can skip with `--yes`)
+- **Better error messages**: Context-aware error messages with troubleshooting guidance
+
+### Watch Mode
+- **`--watch <SECONDS>`**: Live refresh mode with automatic screen clearing
+- Shows timestamps for each refresh
+- Press Ctrl+C to exit
+
+### Device Management
+- **`--unadopted`**: Filter to show only pending/unadopted devices
+- **`--adopt-all`**: Bulk adopt all unadopted devices
+- Individual device actions: `--restart`, `--adopt`, `--upgrade`
+
 ## Notes
 
 - The ISP metrics and SD-WAN endpoints are under `/ea/...` as per the official Site Manager API docs.
 - All requests set `Accept: application/json` and `X-API-Key` automatically; use `--base-url` to point at a different API host if needed.
+- Port `:8443` is automatically preserved for local controller connections.
+- Error messages provide actionable guidance and troubleshooting steps.
