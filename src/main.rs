@@ -2341,8 +2341,7 @@ fn print_csv(
                 } else {
                     std::cmp::Ordering::Equal
                 }
-            });
-        }
+        });
     }
 
     // Write rows
