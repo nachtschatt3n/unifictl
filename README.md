@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.3.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
+[![Version](https://img.shields.io/badge/version-0.4.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
 
 CLI for the UniFi Site Manager API (v1/EA). It wraps the documented endpoints (`/v1/hosts`, `/v1/sites`, `/v1/devices`, `/ea/isp-metrics/:type`, `/ea/sd-wan-configs`, etc.), handles the `X-API-Key` header, and stores your key either in the project directory or in the user config directory.
 
