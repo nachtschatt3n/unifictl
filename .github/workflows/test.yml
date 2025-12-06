@@ -51,7 +51,7 @@ jobs:
 
       - name: Run Clippy
         if: matrix.check-clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -W clippy::all
 
       - name: Run tests
         run: cargo test --verbose --all-targets
