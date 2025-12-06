@@ -1,0 +1,20 @@
+pkgname=unifictl
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="CLI for UniFi Site Manager (API v1/EA)"
+arch=('x86_64' 'aarch64')
+url="https://example.com/unifictl"
+license=('MIT')
+depends=('openssl' 'glibc')
+makedepends=()
+source=()
+sha256sums=()
+
+package() {
+  # Expect a release binary built in the repo root: cargo build --release
+  local repo_root="$(realpath "$(dirname "${BASH_SOURCE[0]}")/../..")"
+
+  install -Dm755 "$repo_root/target/release/unifictl" "$pkgdir/usr/bin/unifictl"
+  install -Dm644 "$repo_root/README.md" "$pkgdir/usr/share/doc/unifictl/README.md"
+  install -Dm644 "$repo_root/LICENSE" "$pkgdir/usr/share/licenses/unifictl/LICENSE"
+}
