@@ -424,10 +424,26 @@ jobs:
           if [ -d artifacts ] && [ "$(ls -A artifacts 2>/dev/null)" ]; then
             cd artifacts
             find . -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.pkg.tar.zst" \) -exec sha256sum {} \; > checksums.txt || touch checksums.txt
+            cd ..
           else
             echo "No artifacts found, creating empty checksums file"
             mkdir -p artifacts
             touch artifacts/checksums.txt
+          fi
+
+      - name: Read checksums
+        id: checksums
+        shell: bash
+        run: |
+          if [ -f artifacts/checksums.txt ] && [ -s artifacts/checksums.txt ]; then
+            # Use multiline output delimiter
+            {
+              echo 'content<<CHECKSUMS_EOF'
+              cat artifacts/checksums.txt
+              echo 'CHECKSUMS_EOF'
+            } >> $GITHUB_OUTPUT
+          else
+            echo "content=No checksums available" >> $GITHUB_OUTPUT
           fi
 
       - name: Create Release
@@ -492,7 +508,7 @@ jobs:
 
             ### Checksums
             ```
-            ${{ github.workspace }}/artifacts/checksums.txt
+            ${{ steps.checksums.outputs.content }}
             ```
 
             ### Install from crates.io
