@@ -149,8 +149,12 @@ enum Commands {
     #[command(subcommand)]
     Sdwan(SdwanCommand),
     /// Operate against a local UniFi controller using username/password
-    #[command(subcommand)]
-    Local(LocalCommands),
+    Local {
+        #[arg(long, global = true)]
+        site: Option<String>,
+        #[command(subcommand)]
+        command: LocalCommands,
+    },
     /// Validate stored credentials (cloud/local)
     Validate {
         #[arg(long, help = "Validate only cloud (Site Manager) credentials")]
@@ -298,8 +302,6 @@ enum WlanCommand {
         name: String,
         #[arg(long)]
         password: Option<String>,
-        #[arg(long, default_value = "wpa2")]
-        security: String,
         #[arg(long, default_value_t = true)]
         enabled: bool,
     },
@@ -333,10 +335,12 @@ enum FirewallRuleCommand {
     Create {
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        #[arg(long, default_value = "accept")]
         action: String,
-        #[arg(long, default_value_t = true)]
-        enabled: bool,
+        #[arg(long, value_name = "SRC_GROUP")]
+        src_group: Option<String>,
+        #[arg(long, value_name = "DST_GROUP")]
+        dst_group: Option<String>,
     },
     /// Update a firewall rule by ID
     Update {
@@ -346,8 +350,10 @@ enum FirewallRuleCommand {
         name: Option<String>,
         #[arg(long)]
         action: Option<String>,
-        #[arg(long)]
-        enabled: Option<bool>,
+        #[arg(long, value_name = "SRC_GROUP")]
+        src_group: Option<String>,
+        #[arg(long, value_name = "DST_GROUP")]
+        dst_group: Option<String>,
     },
     /// Delete a firewall rule by ID
     Delete {
@@ -368,8 +374,15 @@ enum FirewallGroupCommand {
     Create {
         #[arg(long)]
         name: String,
-        #[arg(long, default_value = "address-group")]
+        #[arg(long, value_name = "TYPE", default_value = "address-group")]
         group_type: String,
+        #[arg(
+            long,
+            value_name = "MEMBERS",
+            use_value_delimiter = true,
+            value_delimiter = ','
+        )]
+        members: Option<Vec<String>>,
     },
     /// Update a firewall group by ID
     Update {
@@ -377,6 +390,13 @@ enum FirewallGroupCommand {
         id: String,
         #[arg(long)]
         name: Option<String>,
+        #[arg(
+            long,
+            value_name = "MEMBERS",
+            use_value_delimiter = true,
+            value_delimiter = ','
+        )]
+        members: Option<Vec<String>>,
     },
     /// Delete a firewall group by ID
     Delete {
@@ -397,7 +417,7 @@ enum PolicyTableCommand {
     Create {
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        #[arg(long, value_name = "DESCRIPTION")]
         description: Option<String>,
     },
     /// Update a policy table by ID
@@ -406,7 +426,7 @@ enum PolicyTableCommand {
         id: String,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_name = "DESCRIPTION")]
         description: Option<String>,
     },
     /// Delete a policy table by ID
@@ -428,7 +448,7 @@ enum ZoneCommand {
     Create {
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        #[arg(long, value_name = "DESCRIPTION")]
         description: Option<String>,
     },
     /// Update a zone by ID
@@ -437,7 +457,7 @@ enum ZoneCommand {
         id: String,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_name = "DESCRIPTION")]
         description: Option<String>,
     },
     /// Delete a zone by ID
@@ -459,9 +479,9 @@ enum ObjectCommand {
     Create {
         #[arg(long)]
         name: String,
-        #[arg(long, default_value = "address")]
+        #[arg(long, value_name = "TYPE", default_value = "address")]
         object_type: String,
-        #[arg(long)]
+        #[arg(long, value_name = "VALUE")]
         value: Option<String>,
     },
     /// Update an object by ID
@@ -470,7 +490,7 @@ enum ObjectCommand {
         id: String,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_name = "VALUE")]
         value: Option<String>,
     },
     /// Delete an object by ID
@@ -589,187 +609,21 @@ enum LocalCommands {
         #[arg(long)]
         site: Option<String>,
     },
-    /// List networks (VLANs) configuration
-    Networks {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Create a network
-    NetworkCreate {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        vlan: Option<u16>,
-        #[arg(long, value_name = "CIDR")]
-        subnet: Option<String>,
-        #[arg(long, default_value_t = false)]
-        dhcp: bool,
-    },
-    /// Update a network by ID
-    NetworkUpdate {
-        #[arg(value_name = "NETWORK_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        vlan: Option<u16>,
-        #[arg(long, value_name = "CIDR")]
-        subnet: Option<String>,
-        #[arg(long)]
-        dhcp: Option<bool>,
-    },
-    /// Delete a network by ID
-    NetworkDelete {
-        #[arg(value_name = "NETWORK_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show what would be deleted without actually deleting")]
-        dry_run: bool,
-        #[arg(long, help = "Skip confirmation prompt")]
-        yes: bool,
-    },
-    /// List WLAN (SSID) configuration
-    Wlans {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Create a WLAN
-    WlanCreate {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        password: Option<String>,
-        #[arg(long, default_value_t = true)]
-        enabled: bool,
-    },
-    /// Update a WLAN
-    WlanUpdate {
-        #[arg(value_name = "WLAN_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        password: Option<String>,
-        #[arg(long)]
-        enabled: Option<bool>,
-    },
-    /// Delete a WLAN
-    WlanDelete {
-        #[arg(value_name = "WLAN_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show what would be deleted without actually deleting")]
-        dry_run: bool,
-        #[arg(long, help = "Skip confirmation prompt")]
-        yes: bool,
-    },
-    /// List port profiles
-    PortProfiles {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// List firewall rules
-    FirewallRules {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Create a firewall rule
-    FirewallRuleCreate {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: String,
-        #[arg(long, default_value = "accept")]
-        action: String,
-        #[arg(long, value_name = "SRC_GROUP")]
-        src_group: Option<String>,
-        #[arg(long, value_name = "DST_GROUP")]
-        dst_group: Option<String>,
-    },
-    /// Update a firewall rule
-    FirewallRuleUpdate {
-        #[arg(value_name = "RULE_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        action: Option<String>,
-        #[arg(long, value_name = "SRC_GROUP")]
-        src_group: Option<String>,
-        #[arg(long, value_name = "DST_GROUP")]
-        dst_group: Option<String>,
-    },
-    /// Delete a firewall rule
-    FirewallRuleDelete {
-        #[arg(value_name = "RULE_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show what would be deleted without actually deleting")]
-        dry_run: bool,
-        #[arg(long, help = "Skip confirmation prompt")]
-        yes: bool,
-    },
-    /// List firewall groups
-    FirewallGroups {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Create a firewall group
-    FirewallGroupCreate {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: String,
-        #[arg(long, value_name = "TYPE", default_value = "address-group")]
-        group_type: String,
-        #[arg(
-            long,
-            value_name = "MEMBERS",
-            use_value_delimiter = true,
-            value_delimiter = ','
-        )]
-        members: Option<Vec<String>>,
-    },
-    /// Update a firewall group
-    FirewallGroupUpdate {
-        #[arg(value_name = "GROUP_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(
-            long,
-            value_name = "MEMBERS",
-            use_value_delimiter = true,
-            value_delimiter = ','
-        )]
-        members: Option<Vec<String>>,
-    },
-    /// Delete a firewall group
-    FirewallGroupDelete {
-        #[arg(value_name = "GROUP_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show what would be deleted without actually deleting")]
-        dry_run: bool,
-        #[arg(long, help = "Skip confirmation prompt")]
-        yes: bool,
-    },
+    /// Network (VLAN) operations
+    #[command(subcommand)]
+    Network(NetworkCommand),
+    /// WLAN (SSID) operations
+    #[command(subcommand)]
+    Wlan(WlanCommand),
+    /// Port profile operations
+    #[command(subcommand)]
+    PortProfile(PortProfileCommand),
+    /// Firewall rule operations
+    #[command(subcommand)]
+    FirewallRule(FirewallRuleCommand),
+    /// Firewall group operations
+    #[command(subcommand)]
+    FirewallGroup(FirewallGroupCommand),
     /// Show top clients by bandwidth
     TopClients {
         #[arg(long)]
@@ -794,116 +648,15 @@ enum LocalCommands {
         #[arg(long)]
         site: Option<String>,
     },
-    /// List policy tables (routing policies)
-    PolicyTables {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Create a policy table
-    PolicyTableCreate {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: String,
-        #[arg(long, value_name = "DESCRIPTION")]
-        description: Option<String>,
-    },
-    /// Update a policy table by ID
-    PolicyTableUpdate {
-        #[arg(value_name = "TABLE_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long, value_name = "DESCRIPTION")]
-        description: Option<String>,
-    },
-    /// Delete a policy table by ID
-    PolicyTableDelete {
-        #[arg(value_name = "TABLE_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show what would be deleted without actually deleting")]
-        dry_run: bool,
-        #[arg(long, help = "Skip confirmation prompt")]
-        yes: bool,
-    },
-    /// List zones
-    Zones {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Create a zone
-    ZoneCreate {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: String,
-        #[arg(long, value_name = "DESCRIPTION")]
-        description: Option<String>,
-    },
-    /// Update a zone by ID
-    ZoneUpdate {
-        #[arg(value_name = "ZONE_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long, value_name = "DESCRIPTION")]
-        description: Option<String>,
-    },
-    /// Delete a zone by ID
-    ZoneDelete {
-        #[arg(value_name = "ZONE_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show what would be deleted without actually deleting")]
-        dry_run: bool,
-        #[arg(long, help = "Skip confirmation prompt")]
-        yes: bool,
-    },
-    /// List objects (address/service objects)
-    Objects {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Create an object
-    ObjectCreate {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: String,
-        #[arg(long, value_name = "TYPE", default_value = "address")]
-        object_type: String,
-        #[arg(long, value_name = "VALUE")]
-        value: Option<String>,
-    },
-    /// Update an object by ID
-    ObjectUpdate {
-        #[arg(value_name = "OBJECT_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long, value_name = "VALUE")]
-        value: Option<String>,
-    },
-    /// Delete an object by ID
-    ObjectDelete {
-        #[arg(value_name = "OBJECT_ID")]
-        id: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show what would be deleted without actually deleting")]
-        dry_run: bool,
-        #[arg(long, help = "Skip confirmation prompt")]
-        yes: bool,
-    },
+    /// Policy table (routing policy) operations
+    #[command(subcommand)]
+    PolicyTable(PolicyTableCommand),
+    /// Zone operations
+    #[command(subcommand)]
+    Zone(ZoneCommand),
+    /// Object (address/service object) operations
+    #[command(subcommand)]
+    Object(ObjectCommand),
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -1171,8 +924,8 @@ fn main() -> Result<()> {
                 cli.watch,
             )?,
         },
-        Commands::Local(local_cmd) => {
-            handle_local(local_cmd, &cwd, cli.output, &render_opts, cli.watch)?;
+        Commands::Local { site, command } => {
+            handle_local(command, site, &cwd, cli.output, &render_opts, cli.watch)?;
         }
         Commands::Validate {
             cloud_only,
@@ -1247,6 +1000,7 @@ fn main() -> Result<()> {
 
 fn handle_local(
     cmd: LocalCommands,
+    global_site: Option<String>,
     cwd: &std::path::Path,
     output: OutputFormat,
     render_opts: &RenderOpts,
@@ -1291,11 +1045,11 @@ fn handle_local(
             )
         }
         LocalCommands::Devices {
-            site,
+            site: _,
             unadopted,
             adopt_all,
         } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1387,8 +1141,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Health { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::Health { site: _ } => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1471,8 +1225,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Networks { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::Network(NetworkCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1496,8 +1250,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Wlans { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::Wlan(WlanCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1520,8 +1274,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::PortProfiles { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::PortProfile(PortProfileCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1537,8 +1291,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::FirewallRules { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::FirewallRule(FirewallRuleCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1562,8 +1316,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::FirewallGroups { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::FirewallGroup(FirewallGroupCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1732,14 +1486,13 @@ fn handle_local(
             };
             render_response(client.client_action(&mac, cmd)?, output, render_opts, None)
         }
-        LocalCommands::NetworkCreate {
-            site,
+        LocalCommands::Network(NetworkCommand::Create {
             name,
             vlan,
             subnet,
             dhcp,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1765,15 +1518,14 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::NetworkUpdate {
+        LocalCommands::Network(NetworkCommand::Update {
             id,
-            site,
             name,
             vlan,
             subnet,
             dhcp,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1805,13 +1557,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::NetworkDelete {
+        LocalCommands::Network(NetworkCommand::Delete {
             id,
-            site,
             dry_run,
             yes,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1862,13 +1613,12 @@ fn handle_local(
                 render_response(client.delete_network(&id)?, output, render_opts, None)
             }
         }
-        LocalCommands::WlanCreate {
-            site,
+        LocalCommands::Wlan(WlanCommand::Create {
             name,
             password,
             enabled,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1895,14 +1645,13 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::WlanUpdate {
+        LocalCommands::Wlan(WlanCommand::Update {
             id,
-            site,
             name,
             password,
             enabled,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1931,13 +1680,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::WlanDelete {
+        LocalCommands::Wlan(WlanCommand::Delete {
             id,
-            site,
             dry_run,
             yes,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1992,14 +1740,13 @@ fn handle_local(
                 render_response(client.delete_wlan(&id)?, output, render_opts, None)
             }
         }
-        LocalCommands::FirewallRuleCreate {
-            site,
+        LocalCommands::FirewallRule(FirewallRuleCommand::Create {
             name,
             action,
             src_group,
             dst_group,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2025,15 +1772,14 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallRuleUpdate {
+        LocalCommands::FirewallRule(FirewallRuleCommand::Update {
             id,
-            site,
             name,
             action,
             src_group,
             dst_group,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2065,13 +1811,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallRuleDelete {
+        LocalCommands::FirewallRule(FirewallRuleCommand::Delete {
             id,
-            site,
             dry_run,
             yes,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2122,13 +1867,12 @@ fn handle_local(
                 render_response(client.delete_firewall_rule(&id)?, output, render_opts, None)
             }
         }
-        LocalCommands::FirewallGroupCreate {
-            site,
+        LocalCommands::FirewallGroup(FirewallGroupCommand::Create {
             name,
             group_type,
             members,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2147,13 +1891,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallGroupUpdate {
+        LocalCommands::FirewallGroup(FirewallGroupCommand::Update {
             id,
-            site,
             name,
             members,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2178,13 +1921,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallGroupDelete {
+        LocalCommands::FirewallGroup(FirewallGroupCommand::Delete {
             id,
-            site,
             dry_run,
             yes,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2351,8 +2093,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::PolicyTables { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::PolicyTable(PolicyTableCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2368,12 +2110,11 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::PolicyTableCreate {
-            site,
+        LocalCommands::PolicyTable(PolicyTableCommand::Create {
             name,
             description,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2394,13 +2135,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::PolicyTableUpdate {
+        LocalCommands::PolicyTable(PolicyTableCommand::Update {
             id,
-            site,
             name,
             description,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2425,13 +2165,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::PolicyTableDelete {
+        LocalCommands::PolicyTable(PolicyTableCommand::Delete {
             id,
-            site,
             dry_run,
             yes,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2480,8 +2219,8 @@ fn handle_local(
                 render_response(client.delete_policy_table(&id)?, output, render_opts, None)
             }
         }
-        LocalCommands::Zones { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::Zone(ZoneCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2497,12 +2236,11 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::ZoneCreate {
-            site,
+        LocalCommands::Zone(ZoneCommand::Create {
             name,
             description,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2523,13 +2261,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::ZoneUpdate {
+        LocalCommands::Zone(ZoneCommand::Update {
             id,
-            site,
             name,
             description,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2554,13 +2291,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::ZoneDelete {
+        LocalCommands::Zone(ZoneCommand::Delete {
             id,
-            site,
             dry_run,
             yes,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2609,8 +2345,8 @@ fn handle_local(
                 render_response(client.delete_zone(&id)?, output, render_opts, None)
             }
         }
-        LocalCommands::Objects { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::Object(ObjectCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2626,13 +2362,12 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::ObjectCreate {
-            site,
+        LocalCommands::Object(ObjectCommand::Create {
             name,
             object_type,
             value,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2653,13 +2388,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::ObjectUpdate {
+        LocalCommands::Object(ObjectCommand::Update {
             id,
-            site,
             name,
             value,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2684,13 +2418,12 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::ObjectDelete {
+        LocalCommands::Object(ObjectCommand::Delete {
             id,
-            site,
             dry_run,
             yes,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,

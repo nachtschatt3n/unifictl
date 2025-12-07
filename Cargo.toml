@@ -1,6 +1,6 @@
 [package]
 name = "unifictl"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 description = "CLI for UniFi Site Manager (API v1/EA)"
 license = "GPL-3.0"
