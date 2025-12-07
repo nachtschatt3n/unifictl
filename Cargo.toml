@@ -7,7 +7,7 @@ license = "GPL-3.0"
 repository = "https://github.com/nachtschatt3n/unifictl"
 homepage = "https://github.com/nachtschatt3n/unifictl"
 authors = ["Mathias Uhl <mathiasuhl@gmx.de>"]
-keywords = ["unifi", "ubiquiti", "cli", "network", "api", "site-manager"]
+keywords = ["unifi", "ubiquiti", "cli", "network", "api"]
 categories = ["command-line-utilities", "network-programming"]
 readme = "README.md"
 
