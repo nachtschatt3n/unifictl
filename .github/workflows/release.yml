@@ -251,7 +251,7 @@ jobs:
             echo "   To enable automated publishing, add CRATES_IO_TOKEN to repository secrets."
             exit 0
           fi
-          cargo publish
+          cargo publish --allow-dirty
 
   create-release:
     name: Create Release
