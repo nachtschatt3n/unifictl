@@ -80,11 +80,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run tests
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
         run: cargo test --verbose --all-targets
         env:
           # Reduce parallelism on Windows to avoid stack overflow
-          RUST_TEST_THREADS: ${{ runner.os == 'Windows' && '1' || '' }}
+          RUST_TEST_THREADS: 1
+
+      - name: Run tests (Other platforms)
+        if: runner.os != 'Windows'
+        run: cargo test --verbose --all-targets
 
       - name: Build
         run: cargo build --verbose --release
