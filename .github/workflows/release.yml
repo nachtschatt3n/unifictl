@@ -297,6 +297,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.run_id }}
         continue-on-error: true
+        if: always()
 
       - name: Determine version
         id: version
@@ -326,6 +327,8 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: Release ${{ steps.version.outputs.version }}
+          generate_release_notes: false
+          make_latest: true
           body: |
             ## Release ${{ steps.version.outputs.version }}
 
