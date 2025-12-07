@@ -1,0 +1,16 @@
+pkgbase = unifictl
+	pkgdesc = CLI for UniFi Site Manager (API v1/EA)
+	pkgver = 0.4.0
+	pkgrel = 1
+	url = https://github.com/nachtschatt3n/unifictl
+	arch = x86_64
+	arch = aarch64
+	license = GPL-3.0
+	makedepends = rust
+	makedepends = cargo
+	depends = openssl
+	depends = glibc
+	source = unifictl-0.4.0.tar.gz::https://github.com/nachtschatt3n/unifictl/archive/v0.4.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = unifictl
