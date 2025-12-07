@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.4.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
+[![Version](https://img.shields.io/badge/version-0.4.6-green.svg)](https://github.com/nachtschatt3n/unifictl)
 
 CLI for the UniFi Site Manager API (v1/EA). It wraps the documented endpoints (`/v1/hosts`, `/v1/sites`, `/v1/devices`, `/ea/isp-metrics/:type`, `/ea/sd-wan-configs`, etc.), handles the `X-API-Key` header, and stores your key either in the project directory or in the user config directory.
 
@@ -13,7 +13,7 @@ It also supports local UniFi controller access (username/password) for on-prem c
 ```bash
 cargo build --release
 ./target/release/unifictl configure --key "<YOUR_API_KEY>"
-./target/release/unifictl hosts list
+./target/release/unifictl host list
 ```
 
 ### Configuration
@@ -35,13 +35,13 @@ cargo build --release
 
 ```bash
 # Hosts
-unifictl hosts list
-unifictl hosts get <HOST_ID>
+unifictl host list
+unifictl host get <HOST_ID>
 
 # Sites and devices
-unifictl sites list [--host-id <HOST_ID>]
-unifictl devices list [--host-id <HOST_ID>] [--site-id <SITE_ID>]
-unifictl devices get <DEVICE_ID> [--host-id <HOST_ID>] [--site-id <SITE_ID>]
+unifictl site list [--host-id <HOST_ID>]
+unifictl device list [--host-id <HOST_ID>] [--site-id <SITE_ID>]
+unifictl device get <DEVICE_ID> [--host-id <HOST_ID>] [--site-id <SITE_ID>]
 
 # ISP metrics (EA)
 unifictl isp get --type 5m --site-id <SITE_ID> --start <RFC3339> --end <RFC3339>
@@ -53,47 +53,54 @@ unifictl sdwan get <CONFIG_ID>
 unifictl sdwan status <CONFIG_ID>
 
 # Local controller (username/password)
-unifictl local sites
-unifictl local devices [--site <SITE>] [--unadopted] [--adopt-all]
-unifictl local device <MAC> --ports|--config|--restart|--adopt|--upgrade
-unifictl local clients [--site <SITE>] [--wired|--wireless|--blocked]
-unifictl local client <MAC> --block|--unblock|--reconnect
-unifictl local health [--site <SITE>]
-unifictl local events [--site <SITE>]
-unifictl local networks|wlans|port-profiles|firewall-rules|firewall-groups|policy-tables|zones|objects
-unifictl local network-create|network-update|network-delete [--dry-run] [--yes]
-unifictl local wlan-create|wlan-update|wlan-delete [--dry-run] [--yes]
-unifictl local firewall-rule-create|firewall-rule-update|firewall-rule-delete [--dry-run] [--yes]
-unifictl local firewall-group-create|firewall-group-update|firewall-group-delete [--dry-run] [--yes]
-unifictl local policy-table-create|policy-table-update|policy-table-delete [--dry-run] [--yes]
-unifictl local zone-create|zone-update|zone-delete [--dry-run] [--yes]
-unifictl local object-create|object-update|object-delete [--dry-run] [--yes]
-unifictl local top-clients [--limit N]
-unifictl local top-devices [--limit N]
-unifictl local dpi
-unifictl local traffic
+unifictl local site list
+unifictl local device list [--site <SITE>] [--unadopted]
+unifictl local device get <MAC> [--ports] [--config]
+unifictl local device restart <MAC>
+unifictl local device adopt <MAC>
+unifictl local device adopt-all
+unifictl local device upgrade <MAC>
+unifictl local client list [--site <SITE>] [--wired|--wireless|--blocked]
+unifictl local client block <MAC>
+unifictl local client unblock <MAC>
+unifictl local client reconnect <MAC>
+unifictl local event list [--site <SITE>]
+unifictl local health get [--site <SITE>]
+unifictl local security get [--site <SITE>]
+unifictl local wan get [--site <SITE>]
+unifictl local dpi get [--site <SITE>]
+unifictl local top-client list [--limit N] [--site <SITE>]
+unifictl local top-device list [--limit N] [--site <SITE>]
+unifictl local network list|create|update|delete
+unifictl local wlan list|create|update|delete
+unifictl local port-profile list
+unifictl local firewall-rule list|create|update|delete
+unifictl local firewall-group list|create|update|delete
+unifictl local policy-table list|create|update|delete
+unifictl local zone list|create|update|delete
+unifictl local object list|create|update|delete
 
 # Output and table controls
-unifictl hosts list -o json                    # json/csv/raw/pretty (pretty is default)
-unifictl devices list -o csv > devices.csv     # CSV export for reporting
-unifictl devices list --columns name,ip,model --sort-by name --filter "ap"
-unifictl devices list --filter-regex "^SW.*"   # Regex filtering (case-insensitive)
-unifictl local clients --watch 5               # refresh every 5s (clears screen, shows timestamp)
-unifictl hosts list --full-ids                 # do not truncate IDs
+unifictl host list -o json                    # json/csv/raw/pretty (pretty is default)
+unifictl device list -o csv > devices.csv     # CSV export for reporting
+unifictl device list --columns name,ip,model --sort-by name --filter "ap"
+unifictl device list --filter-regex "^SW.*"   # Regex filtering (case-insensitive)
+unifictl local client list --watch 5          # refresh every 5s (clears screen, shows timestamp)
+unifictl host list --full-ids                 # do not truncate IDs
 
 # Safety features
 unifictl local network delete <ID> --dry-run   # Preview what would be deleted
 unifictl local network delete <ID>             # Prompts for confirmation
-unifictl local network delete <ID> --yes      # Skip confirmation (for scripts)
+unifictl local network delete <ID> --yes       # Skip confirmation (for scripts)
 
 # Device management
-unifictl local devices --unadopted             # List pending/unadopted devices
-unifictl local devices --adopt-all             # Adopt all unadopted devices
+unifictl local device list --unadopted         # List pending/unadopted devices
+unifictl local device adopt-all                # Adopt all unadopted devices
 
 # Filtering and export
-unifictl local devices --filter "SW"           # Text filter (case-insensitive)
-unifictl local devices --filter-regex "^SW.*"  # Regex filter (case-insensitive)
-unifictl local clients -o csv > clients.csv    # Export to CSV
+unifictl local device list --filter "SW"       # Text filter (case-insensitive)
+unifictl local device list --filter-regex "^SW.*"  # Regex filter (case-insensitive)
+unifictl local client list -o csv > clients.csv    # Export to CSV
 
 # Config helpers
 unifictl configure --key "<KEY>" --scope local
@@ -205,9 +212,9 @@ Both packaging flows expect the release binary at `target/release/unifictl`.
 - Press Ctrl+C to exit
 
 ### Device Management
-- **`--unadopted`**: Filter to show only pending/unadopted devices
-- **`--adopt-all`**: Bulk adopt all unadopted devices
-- Individual device actions: `--restart`, `--adopt`, `--upgrade`
+- **`device list --unadopted`**: Filter to show only pending/unadopted devices
+- **`device adopt-all`**: Bulk adopt all unadopted devices
+- Individual device actions: `device restart <MAC>`, `device adopt <MAC>`, `device upgrade <MAC>`
 
 ## Notes
 

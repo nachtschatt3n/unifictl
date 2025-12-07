@@ -114,10 +114,6 @@ impl LocalClient {
         self.get(true, true, "stat/dpi", Option::<&()>::None)
     }
 
-    pub fn traffic(&mut self) -> Result<ResponseData> {
-        self.get(true, true, "stat/traffic", Option::<&()>::None)
-    }
-
     pub fn security_settings(&mut self) -> Result<ResponseData> {
         self.get(true, true, "rest/setting/security", Option::<&()>::None)
     }
@@ -223,35 +219,47 @@ impl LocalClient {
     }
 
     pub fn zones(&mut self) -> Result<ResponseData> {
-        self.get(true, false, "rest/zone", Option::<&()>::None)
+        // Use v2 API endpoint: /proxy/network/v2/api/site/{site}/firewall/zone
+        // build_urls() will add the "v2/api/site/{site}/" prefix
+        self.get(true, false, "firewall/zone", Option::<&()>::None)
     }
 
     pub fn create_zone(&mut self, payload: &serde_json::Value) -> Result<ResponseData> {
-        self.post(true, "rest/zone", Some(payload))
+        self.post(true, "firewall/zone", Some(payload))
     }
 
     pub fn update_zone(&mut self, id: &str, payload: &serde_json::Value) -> Result<ResponseData> {
-        self.put(true, &format!("rest/zone/{id}"), Some(payload))
+        self.put(true, &format!("firewall/zone/{id}"), Some(payload))
     }
 
     pub fn delete_zone(&mut self, id: &str) -> Result<ResponseData> {
-        self.delete(true, &format!("rest/zone/{id}"))
+        self.delete(true, &format!("firewall/zone/{id}"))
     }
 
     pub fn objects(&mut self) -> Result<ResponseData> {
-        self.get(true, false, "rest/object", Option::<&()>::None)
+        // Use v2 API endpoint: /proxy/network/v2/api/site/{site}/object-oriented-network-configs
+        self.get(
+            true,
+            false,
+            "object-oriented-network-configs",
+            Option::<&()>::None,
+        )
     }
 
     pub fn create_object(&mut self, payload: &serde_json::Value) -> Result<ResponseData> {
-        self.post(true, "rest/object", Some(payload))
+        self.post(true, "object-oriented-network-configs", Some(payload))
     }
 
     pub fn update_object(&mut self, id: &str, payload: &serde_json::Value) -> Result<ResponseData> {
-        self.put(true, &format!("rest/object/{id}"), Some(payload))
+        self.put(
+            true,
+            &format!("object-oriented-network-configs/{id}"),
+            Some(payload),
+        )
     }
 
     pub fn delete_object(&mut self, id: &str) -> Result<ResponseData> {
-        self.delete(true, &format!("rest/object/{id}"))
+        self.delete(true, &format!("object-oriented-network-configs/{id}"))
     }
 
     fn get<Q: Serialize + ?Sized>(
@@ -381,9 +389,18 @@ impl LocalClient {
                         last_err = Some(anyhow!(msg));
                         continue;
                     }
+
                     let status = status.as_u16();
                     let text = res.text().context("reading response body")?;
+
+                    // Validate that the response is actually JSON, not HTML
+                    // If parsing fails and response looks like HTML, try next URL
                     let json = serde_json::from_str(&text).ok();
+                    if json.is_none() && text.trim_start().starts_with("<!doctype") {
+                        last_err = Some(anyhow!("received HTML instead of JSON at {}", url));
+                        continue;
+                    }
+
                     return Ok(ResponseData {
                         status,
                         body: text,
@@ -574,50 +591,62 @@ impl LocalClient {
 
     fn get_operation_guidance(path: &str, _operation: &str) -> &'static str {
         if path.contains("networkconf") {
-            return "\n\nPossible causes for network operations:\n  • VLAN ID already in use\n  • Invalid subnet format (expected: 192.168.1.0/24)\n  • Conflicting DHCP range\n  • Invalid network name\n\nCheck existing networks:\n  unifictl local networks -o json";
+            return "\n\nPossible causes for network operations:\n  • VLAN ID already in use\n  • Invalid subnet format (expected: 192.168.1.0/24)\n  • Conflicting DHCP range\n  • Invalid network name\n\nCheck existing networks:\n  unifictl local network list -o json";
         }
         if path.contains("wlanconf") {
-            return "\n\nPossible causes for WLAN operations:\n  • SSID already exists\n  • Invalid password (must be 8+ characters for WPA2)\n  • Invalid security settings\n\nCheck existing WLANs:\n  unifictl local wlans -o json";
+            return "\n\nPossible causes for WLAN operations:\n  • SSID already exists\n  • Invalid password (must be 8+ characters for WPA2)\n  • Invalid security settings\n\nCheck existing WLANs:\n  unifictl local wlan list -o json";
         }
         if path.contains("firewallrule") {
-            return "\n\nPossible causes for firewall rule operations:\n  • Invalid action (must be: accept, drop, reject)\n  • Invalid firewall group IDs\n  • Rule index conflict\n\nCheck existing rules:\n  unifictl local firewall-rules -o json";
+            return "\n\nPossible causes for firewall rule operations:\n  • Invalid action (must be: accept, drop, reject)\n  • Invalid firewall group IDs\n  • Rule index conflict\n\nCheck existing rules:\n  unifictl local firewall-rule list -o json";
         }
         if path.contains("firewallgroup") {
-            return "\n\nPossible causes for firewall group operations:\n  • Invalid group type\n  • Invalid member addresses\n  • Duplicate group name\n\nCheck existing groups:\n  unifictl local firewall-groups -o json";
+            return "\n\nPossible causes for firewall group operations:\n  • Invalid group type\n  • Invalid member addresses\n  • Duplicate group name\n\nCheck existing groups:\n  unifictl local firewall-group list -o json";
         }
         if path.contains("routing") {
-            return "\n\nPossible causes for policy table operations:\n  • Invalid policy table name\n  • Conflicting routing rules\n  • Invalid rule configuration\n\nCheck existing policy tables:\n  unifictl local policy-tables -o json";
+            return "\n\nPossible causes for policy table operations:\n  • Invalid policy table name\n  • Conflicting routing rules\n  • Invalid rule configuration\n\nCheck existing policy tables:\n  unifictl local policy-table list -o json";
         }
-        if path.contains("zone") {
-            return "\n\nPossible causes for zone operations:\n  • Invalid zone name\n  • Conflicting zone configuration\n  • Invalid interface assignment\n\nCheck existing zones:\n  unifictl local zones -o json";
+        if path.contains("zone")
+            || path.contains("firewall/zone")
+            || path.contains("firewall/zones")
+        {
+            return "\n\nPossible causes for zone operations:\n  • Invalid zone name\n  • Conflicting zone configuration\n  • Invalid interface assignment\n\nCheck existing zones:\n  unifictl local zone list -o json";
         }
-        if path.contains("object") {
-            return "\n\nPossible causes for object operations:\n  • Invalid object name\n  • Invalid object type (address/service)\n  • Invalid object value\n\nCheck existing objects:\n  unifictl local objects -o json";
+        if path.contains("object")
+            || path.contains("object-oriented-network-configs")
+            || path.contains("network-objects")
+        {
+            return "\n\nPossible causes for object operations:\n  • Invalid object name\n  • Invalid object type (address/service)\n  • Invalid object value\n\nCheck existing objects:\n  unifictl local object list -o json";
         }
         ""
     }
 
     fn get_list_command(path: &str) -> &'static str {
         if path.contains("networkconf") {
-            "networks"
+            "network list"
         } else if path.contains("wlanconf") {
-            "wlans"
+            "wlan list"
         } else if path.contains("firewallrule") {
-            "firewall-rules"
+            "firewall-rule list"
         } else if path.contains("firewallgroup") {
-            "firewall-groups"
+            "firewall-group list"
         } else if path.contains("routing") {
-            "policy-tables"
-        } else if path.contains("zone") {
-            "zones"
-        } else if path.contains("object") {
-            "objects"
+            "policy-table list"
+        } else if path.contains("zone")
+            || path.contains("firewall/zone")
+            || path.contains("firewall/zones")
+        {
+            "zone list"
+        } else if path.contains("object")
+            || path.contains("object-oriented-network-configs")
+            || path.contains("network-objects")
+        {
+            "object list"
         } else if path.contains("device") {
-            "devices"
+            "device list"
         } else if path.contains("sta") {
-            "clients"
+            "client list"
         } else {
-            "sites"
+            "site list"
         }
     }
 
@@ -625,7 +654,42 @@ impl LocalClient {
         let cleaned = path.trim_start_matches('/');
         let mut urls = Vec::new();
 
-        if self.is_legacy {
+        // Check if this is an Integration API v1 path
+        let is_integration_api = cleaned.starts_with("integration/v1/");
+
+        if is_integration_api && site_scoped {
+            // Integration API v1 uses /integration/v1/sites/{site}/{resource}
+            // Extract the resource part after "integration/v1/"
+            let resource = cleaned.strip_prefix("integration/v1/").unwrap_or(cleaned);
+
+            // Try Integration API v1 path first
+            urls.push(
+                self.base_url
+                    .join(&format!("integration/v1/sites/{}/{}", self.site, resource))?,
+            );
+
+            // If fallback is enabled, try REST API equivalent
+            if fallback_global {
+                // Map Integration API resources to REST API paths
+                let rest_path = if resource.starts_with("firewall/zones") {
+                    resource.replace("firewall/zones", "rest/zone")
+                } else if resource.starts_with("network-objects") {
+                    resource.replace("network-objects", "rest/object")
+                } else {
+                    format!("rest/{}", resource)
+                };
+
+                // Try REST API paths
+                urls.push(
+                    self.base_url
+                        .join(&format!("proxy/network/api/s/{}/{}", self.site, rest_path))?,
+                );
+                urls.push(
+                    self.base_url
+                        .join(&format!("api/s/{}/{}", self.site, rest_path))?,
+                );
+            }
+        } else if self.is_legacy {
             if site_scoped {
                 urls.push(
                     self.base_url
@@ -771,6 +835,40 @@ mod tests {
     }
 
     #[test]
+    fn build_urls_for_v2_endpoints() {
+        let client =
+            LocalClient::new("https://example.test:8443/", "u", "p", "default", true).unwrap();
+
+        // Test zones endpoint (v2 API)
+        let urls = client
+            .build_urls(true, false, "firewall/zone")
+            .unwrap()
+            .iter()
+            .map(|u| u.path().to_string())
+            .collect::<HashSet<_>>();
+
+        assert!(urls.contains("/proxy/network/api/s/default/firewall/zone"));
+        assert!(urls.contains("/proxy/network/v2/api/site/default/firewall/zone"));
+        assert!(urls.contains("/proxy/network/v2/api/s/default/firewall/zone"));
+        assert!(urls.contains("/api/s/default/firewall/zone"));
+
+        // Test objects endpoint (v2 API)
+        let urls = client
+            .build_urls(true, false, "object-oriented-network-configs")
+            .unwrap()
+            .iter()
+            .map(|u| u.path().to_string())
+            .collect::<HashSet<_>>();
+
+        assert!(urls.contains("/proxy/network/api/s/default/object-oriented-network-configs"));
+        assert!(
+            urls.contains("/proxy/network/v2/api/site/default/object-oriented-network-configs")
+        );
+        assert!(urls.contains("/proxy/network/v2/api/s/default/object-oriented-network-configs"));
+        assert!(urls.contains("/api/s/default/object-oriented-network-configs"));
+    }
+
+    #[test]
     fn device_stats_filters_to_mac() {
         let server = MockServer::start();
         let login = server.mock(|when, then| {
@@ -840,7 +938,7 @@ mod tests {
         );
         assert!(msg.contains("Failed to create"));
         assert!(msg.contains("VLAN already in use"));
-        assert!(msg.contains("unifictl local networks"));
+        assert!(msg.contains("unifictl local network list"));
 
         // Test 404 error
         let msg = LocalClient::format_error_message(
@@ -852,7 +950,29 @@ mod tests {
         );
         assert!(msg.contains("Resource not found"));
         assert!(msg.contains("Possible causes"));
-        assert!(msg.contains("unifictl local networks"));
+        assert!(msg.contains("unifictl local network list"));
+
+        // Test zone endpoint error handling
+        let msg = LocalClient::format_error_message(
+            &Method::POST,
+            "firewall/zone",
+            StatusCode::BAD_REQUEST,
+            r#"{"meta":{"msg":"Invalid zone configuration"}}"#,
+            "https://example.com/api",
+        );
+        assert!(msg.contains("zone operations"));
+        assert!(msg.contains("unifictl local zone list"));
+
+        // Test object endpoint error handling
+        let msg = LocalClient::format_error_message(
+            &Method::POST,
+            "object-oriented-network-configs",
+            StatusCode::BAD_REQUEST,
+            r#"{"meta":{"msg":"Invalid object type"}}"#,
+            "https://example.com/api",
+        );
+        assert!(msg.contains("object operations"));
+        assert!(msg.contains("unifictl local object list"));
 
         // Test 409 error
         let msg = LocalClient::format_error_message(

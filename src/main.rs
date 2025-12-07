@@ -135,13 +135,13 @@ enum Commands {
     },
     /// Host-related operations
     #[command(subcommand)]
-    Hosts(HostsCommand),
+    Host(HostCommand),
     /// Site-related operations
     #[command(subcommand)]
-    Sites(SitesCommand),
+    Site(SiteCommand),
     /// Device operations
     #[command(subcommand)]
-    Devices(DevicesCommand),
+    Device(DeviceCommand),
     /// ISP metrics (EA) helpers
     #[command(subcommand)]
     Isp(IspCommand),
@@ -172,7 +172,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum HostsCommand {
+enum HostCommand {
     /// List all hosts
     List,
     /// Fetch a host by ID
@@ -183,7 +183,7 @@ enum HostsCommand {
 }
 
 #[derive(Subcommand)]
-enum SitesCommand {
+enum SiteCommand {
     /// List sites (optionally filtered by host ID)
     List {
         #[arg(long)]
@@ -192,7 +192,7 @@ enum SitesCommand {
 }
 
 #[derive(Subcommand)]
-enum DevicesCommand {
+enum DeviceCommand {
     /// List devices (optionally filtered by host/site)
     List {
         #[arg(long)]
@@ -536,79 +536,37 @@ enum LocalCommands {
         )]
         scope: ScopeArg,
     },
-    /// List sites from the local controller
-    Sites,
-    /// List devices from a site
-    Devices {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show only unadopted/pending devices")]
-        unadopted: bool,
-        #[arg(long, help = "Adopt all unadopted devices")]
-        adopt_all: bool,
-    },
-    /// Show health summaries for a site
-    Health {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Show recent events for a site
-    Events {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Manage devices
-    Device {
-        #[arg(value_name = "MAC")]
-        mac: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Show stats for the device (default if no action given)")]
-        stats: bool,
-        #[arg(long, help = "Show config/state for the device")]
-        config: bool,
-        #[arg(long, help = "Show port table for the device")]
-        ports: bool,
-        #[arg(long, help = "Restart the device")]
-        restart: bool,
-        #[arg(long, help = "Adopt the device (if pending)")]
-        adopt: bool,
-        #[arg(long, help = "Upgrade the device")]
-        upgrade: bool,
-    },
-    /// List clients (with filters)
-    Clients {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Only wired clients")]
-        wired: bool,
-        #[arg(long, help = "Only wireless clients")]
-        wireless: bool,
-        #[arg(long, help = "Only blocked clients")]
-        blocked: bool,
-    },
-    Client {
-        #[arg(value_name = "MAC")]
-        mac: String,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, help = "Block the client")]
-        block: bool,
-        #[arg(long, help = "Unblock the client")]
-        unblock: bool,
-        #[arg(long, help = "Force reconnect (kick)")]
-        reconnect: bool,
-    },
-    /// Show security settings from the local controller
-    Security {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Show WAN health (subset of health)
-    Wan {
-        #[arg(long)]
-        site: Option<String>,
-    },
+    /// Site operations
+    #[command(subcommand)]
+    Site(LocalSiteCommand),
+    /// Device operations
+    #[command(subcommand)]
+    Device(LocalDeviceCommand),
+    /// Client operations
+    #[command(subcommand)]
+    Client(LocalClientCommand),
+    /// Event operations
+    #[command(subcommand)]
+    Event(LocalEventCommand),
+    /// Health operations
+    #[command(subcommand)]
+    Health(LocalHealthCommand),
+    /// Security operations
+    #[command(subcommand)]
+    Security(LocalSecurityCommand),
+    /// WAN operations
+    #[command(subcommand)]
+    Wan(LocalWanCommand),
+    /// DPI operations
+    #[command(subcommand)]
+    Dpi(LocalDpiCommand),
+    /// Top client operations
+    #[command(subcommand)]
+    TopClient(LocalTopClientCommand),
+    /// Top device operations
+    #[command(subcommand)]
+    TopDevice(LocalTopDeviceCommand),
+
     /// Network (VLAN) operations
     #[command(subcommand)]
     Network(NetworkCommand),
@@ -624,30 +582,6 @@ enum LocalCommands {
     /// Firewall group operations
     #[command(subcommand)]
     FirewallGroup(FirewallGroupCommand),
-    /// Show top clients by bandwidth
-    TopClients {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-    },
-    /// Show top devices by number of clients (basic heuristic)
-    TopDevices {
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-    },
-    /// DPI applications summary
-    Dpi {
-        #[arg(long)]
-        site: Option<String>,
-    },
-    /// Traffic statistics
-    Traffic {
-        #[arg(long)]
-        site: Option<String>,
-    },
     /// Policy table (routing policy) operations
     #[command(subcommand)]
     PolicyTable(PolicyTableCommand),
@@ -657,6 +591,163 @@ enum LocalCommands {
     /// Object (address/service object) operations
     #[command(subcommand)]
     Object(ObjectCommand),
+}
+
+#[derive(Subcommand)]
+enum LocalSiteCommand {
+    /// List sites from the local controller
+    List,
+}
+
+#[derive(Subcommand)]
+enum LocalDeviceCommand {
+    /// List devices from a site
+    List {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Show only unadopted/pending devices")]
+        unadopted: bool,
+    },
+    /// Get device details/stats
+    Get {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Show config/state for the device")]
+        config: bool,
+        #[arg(long, help = "Show port table for the device")]
+        ports: bool,
+    },
+    /// Restart the device
+    Restart {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Adopt the device (if pending)
+    Adopt {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Adopt all unadopted devices
+    AdoptAll {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Upgrade the device
+    Upgrade {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalClientCommand {
+    /// List clients (with filters)
+    List {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Only wired clients")]
+        wired: bool,
+        #[arg(long, help = "Only wireless clients")]
+        wireless: bool,
+        #[arg(long, help = "Only blocked clients")]
+        blocked: bool,
+    },
+    /// Block the client
+    Block {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Unblock the client
+    Unblock {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Force reconnect (kick)
+    Reconnect {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalEventCommand {
+    /// List recent events
+    List {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalHealthCommand {
+    /// Get health summaries
+    Get {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalSecurityCommand {
+    /// Get security settings
+    Get {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalWanCommand {
+    /// Get WAN health
+    Get {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalDpiCommand {
+    /// Get DPI applications summary
+    Get {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalTopClientCommand {
+    /// List top clients by bandwidth
+    List {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalTopDeviceCommand {
+    /// List top devices by number of clients
+    List {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -735,8 +826,8 @@ fn main() -> Result<()> {
     };
 
     match cli.command {
-        Commands::Hosts(command) => match command {
-            HostsCommand::List => run_get(
+        Commands::Host(command) => match command {
+            HostCommand::List => run_get(
                 &client,
                 "/v1/hosts",
                 vec![],
@@ -753,7 +844,7 @@ fn main() -> Result<()> {
                 ]),
                 cli.watch,
             )?,
-            HostsCommand::Get { id } => run_get(
+            HostCommand::Get { id } => run_get(
                 &client,
                 &format!("/v1/hosts/{id}"),
                 vec![],
@@ -763,8 +854,8 @@ fn main() -> Result<()> {
                 cli.watch,
             )?,
         },
-        Commands::Sites(command) => match command {
-            SitesCommand::List { host_id } => {
+        Commands::Site(command) => match command {
+            SiteCommand::List { host_id } => {
                 let mut query = Vec::new();
                 if let Some(host) = host_id {
                     query.push(("hostId", host));
@@ -780,8 +871,8 @@ fn main() -> Result<()> {
                 )?
             }
         },
-        Commands::Devices(command) => match command {
-            DevicesCommand::List { host_id, site_id } => {
+        Commands::Device(command) => match command {
+            DeviceCommand::List { host_id, site_id } => {
                 let mut query = Vec::new();
                 if let Some(host) = host_id {
                     query.push(("hostId", host));
@@ -811,7 +902,7 @@ fn main() -> Result<()> {
                     cli.watch,
                 )?
             }
-            DevicesCommand::Get {
+            DeviceCommand::Get {
                 id,
                 host_id,
                 site_id,
@@ -1027,8 +1118,8 @@ fn handle_local(
             println!("Saved local controller credentials to {}", path.display());
             Ok(())
         }
-        LocalCommands::Sites => {
-            let effective = resolve_local(cwd, None)?;
+        LocalCommands::Site(LocalSiteCommand::List) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1044,11 +1135,7 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Devices {
-            site: _,
-            unadopted,
-            adopt_all,
-        } => {
+        LocalCommands::Device(LocalDeviceCommand::List { site: _, unadopted }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1057,62 +1144,6 @@ fn handle_local(
                 &effective.site,
                 effective.verify_tls,
             )?;
-
-            if adopt_all {
-                // Get all devices and adopt unadopted ones
-                let devices = client.list_devices()?;
-                if let Some(json) = devices.json {
-                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                        let mut adopted_count = 0;
-                        let mut failed_count = 0;
-
-                        for device in data {
-                            let state = device.get("state").and_then(|s| s.as_str());
-                            let adopted = device.get("adopted").and_then(|a| a.as_bool());
-                            let is_unadopted = state == Some("pending") || adopted == Some(false);
-
-                            if is_unadopted {
-                                if let Some(mac) = device.get("mac").and_then(|m| m.as_str()) {
-                                    match client.device_action(mac, "adopt") {
-                                        Ok(_) => {
-                                            adopted_count += 1;
-                                            if let Some(name) =
-                                                device.get("name").and_then(|n| n.as_str())
-                                            {
-                                                println!("Adopted: {} ({})", name, mac);
-                                            } else {
-                                                println!("Adopted device: {}", mac);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            failed_count += 1;
-                                            if let Some(name) =
-                                                device.get("name").and_then(|n| n.as_str())
-                                            {
-                                                eprintln!(
-                                                    "Failed to adopt {} ({}): {}",
-                                                    name, mac, e
-                                                );
-                                            } else {
-                                                eprintln!("Failed to adopt device {}: {}", mac, e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        println!(
-                            "\nAdoption complete: {} adopted, {} failed",
-                            adopted_count, failed_count
-                        );
-                        return Ok(());
-                    }
-                }
-                println!("No unadopted devices found.");
-                return Ok(());
-            }
-
             render_local(
                 || {
                     let mut resp = client.list_devices()?;
@@ -1120,15 +1151,14 @@ fn handle_local(
                         if let Some(mut json) = resp.json.clone() {
                             if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
                                 arr.retain(|item| {
-                                    // Filter for unadopted devices (state: "pending" or adopted: false)
                                     let state = item.get("state").and_then(|s| s.as_str());
                                     let adopted = item.get("adopted").and_then(|a| a.as_bool());
                                     state == Some("pending") || adopted == Some(false)
                                 });
-                                resp.body = serde_json::to_string(&json)
-                                    .unwrap_or_else(|_| resp.body.clone());
-                                resp.json = Some(json);
                             }
+                            resp.body =
+                                serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                            resp.json = Some(json);
                         }
                     }
                     Ok(resp)
@@ -1141,7 +1171,283 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Health { site: _ } => {
+        LocalCommands::Device(LocalDeviceCommand::AdoptAll { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            // Get all devices and adopt unadopted ones
+            let devices = client.list_devices()?;
+            if let Some(json) = devices.json {
+                if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                    let mut adopted_count = 0;
+                    let mut failed_count = 0;
+
+                    for device in data {
+                        let state = device.get("state").and_then(|s| s.as_str());
+                        let adopted = device.get("adopted").and_then(|a| a.as_bool());
+                        let is_unadopted = state == Some("pending") || adopted == Some(false);
+
+                        if is_unadopted {
+                            if let Some(mac) = device.get("mac").and_then(|m| m.as_str()) {
+                                match client.device_action(mac, "adopt") {
+                                    Ok(_) => {
+                                        adopted_count += 1;
+                                        if let Some(name) =
+                                            device.get("name").and_then(|n| n.as_str())
+                                        {
+                                            println!("Adopted: {} ({})", name, mac);
+                                        } else {
+                                            println!("Adopted device: {}", mac);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        failed_count += 1;
+                                        if let Some(name) =
+                                            device.get("name").and_then(|n| n.as_str())
+                                        {
+                                            eprintln!("Failed to adopt {} ({}): {}", name, mac, e);
+                                        } else {
+                                            eprintln!("Failed to adopt device {}: {}", mac, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    println!(
+                        "\nAdoption complete: {} adopted, {} failed",
+                        adopted_count, failed_count
+                    );
+                    Ok(())
+                } else {
+                    println!("No devices found");
+                    Ok(())
+                }
+            } else {
+                println!("No devices found");
+                Ok(())
+            }
+        }
+        LocalCommands::Device(LocalDeviceCommand::Get {
+            mac,
+            site: _,
+            config,
+            ports,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || {
+                    // stats/config/ports are derived from device listing
+                    let mut resp = client.device_stats(&mac)?;
+                    if let Some(mut json) = resp.json.clone() {
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                            if let Some(first) = arr.get_mut(0) {
+                                if !ports {
+                                    first.as_object_mut().map(|o| {
+                                        o.remove("port_table");
+                                    });
+                                }
+                                if !config {
+                                    // keep stats only (remove config-heavy?)
+                                }
+                            }
+                        }
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
+                    }
+                    Ok(resp)
+                },
+                output,
+                render_opts,
+                Some(&["name", "model", "type", "ip", "mac", "version", "state"]),
+                watch,
+            )
+        }
+        LocalCommands::Device(LocalDeviceCommand::Restart { mac, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_response(
+                client.device_action(&mac, "restart")?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Device(LocalDeviceCommand::Adopt { mac, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_response(
+                client.device_action(&mac, "adopt")?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Device(LocalDeviceCommand::Upgrade { mac, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_response(
+                client.device_action(&mac, "upgrade")?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Client(LocalClientCommand::List {
+            site: _,
+            wired,
+            wireless,
+            blocked,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || {
+                    let mut resp = client.list_clients()?;
+                    if let Some(mut json) = resp.json.clone() {
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                            arr.retain(|item| {
+                                let is_wired = item
+                                    .get("is_wired")
+                                    .and_then(|w| w.as_bool())
+                                    .unwrap_or(false);
+                                let is_wireless = !is_wired;
+                                let is_blocked = item
+                                    .get("blocked")
+                                    .and_then(|b| b.as_bool())
+                                    .unwrap_or(false);
+
+                                (wired && is_wired)
+                                    || (wireless && is_wireless)
+                                    || (blocked && is_blocked)
+                                    || (!wired && !wireless && !blocked)
+                            });
+                        }
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
+                    }
+                    Ok(resp)
+                },
+                output,
+                render_opts,
+                Some(&[
+                    "hostname",
+                    "name",
+                    "ip",
+                    "mac",
+                    "is_wired",
+                    "blocked",
+                    "oui",
+                    "network_name",
+                ]),
+                watch,
+            )
+        }
+        LocalCommands::Client(LocalClientCommand::Block { mac, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_response(
+                client.client_action(&mac, "block")?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Client(LocalClientCommand::Unblock { mac, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_response(
+                client.client_action(&mac, "unblock")?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Client(LocalClientCommand::Reconnect { mac, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_response(
+                client.client_action(&mac, "reconnect")?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Event(LocalEventCommand::List { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.list_events(),
+                output,
+                render_opts,
+                Some(&["time", "key", "msg", "subsystem"]),
+                watch,
+            )
+        }
+        LocalCommands::Health(LocalHealthCommand::Get { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1158,25 +1464,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Events { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
-            render_local(
-                || client.list_events(),
-                output,
-                render_opts,
-                Some(&["time", "datetime", "msg", "subsystem", "user", "hostname"]),
-                watch,
-            )
-        }
-        LocalCommands::Security { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::Security(LocalSecurityCommand::Get { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1192,8 +1481,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Wan { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::Wan(LocalWanCommand::Get { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1332,159 +1621,6 @@ fn handle_local(
                 Some(&["name", "group_type", "group_members"]),
                 watch,
             )
-        }
-        LocalCommands::Device {
-            mac,
-            site,
-            stats: _,
-            config,
-            ports,
-            restart,
-            adopt,
-            upgrade,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
-            if restart {
-                return render_response(
-                    client.device_action(&mac, "restart")?,
-                    output,
-                    render_opts,
-                    None,
-                );
-            }
-            if adopt {
-                return render_response(
-                    client.device_action(&mac, "adopt")?,
-                    output,
-                    render_opts,
-                    None,
-                );
-            }
-            if upgrade {
-                return render_response(
-                    client.device_action(&mac, "upgrade")?,
-                    output,
-                    render_opts,
-                    None,
-                );
-            }
-            render_local(
-                || {
-                    // stats/config/ports are derived from device listing
-                    let mut resp = client.device_stats(&mac)?;
-                    if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            if let Some(first) = arr.get_mut(0) {
-                                if !ports {
-                                    first.as_object_mut().map(|o| {
-                                        o.remove("port_table");
-                                    });
-                                }
-                                if !config {
-                                    // keep stats only (remove config-heavy?)
-                                }
-                            }
-                        }
-                        resp.body =
-                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                        resp.json = Some(json);
-                    }
-                    Ok(resp)
-                },
-                output,
-                render_opts,
-                Some(&["name", "model", "type", "ip", "mac", "version", "state"]),
-                watch,
-            )
-        }
-        LocalCommands::Clients {
-            site,
-            wired,
-            wireless,
-            blocked,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
-            render_local(
-                || {
-                    let mut resp = client.list_clients()?;
-                    if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            arr.retain(|item| {
-                                let is_wired = item
-                                    .get("is_wired")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                let is_blocked = item
-                                    .get("blocked")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                if wired && !is_wired {
-                                    return false;
-                                }
-                                if wireless && is_wired {
-                                    return false;
-                                }
-                                if blocked && !is_blocked {
-                                    return false;
-                                }
-                                true
-                            });
-                            resp.body =
-                                serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                            resp.json = Some(json);
-                        }
-                    }
-                    Ok(resp)
-                },
-                output,
-                render_opts,
-                Some(&[
-                    "hostname", "name", "mac", "ip", "ap_mac", "essid", "is_wired", "blocked",
-                ]),
-                watch,
-            )
-        }
-        LocalCommands::Client {
-            mac,
-            site,
-            block,
-            unblock,
-            reconnect,
-        } => {
-            let effective = resolve_local(cwd, site_override(site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
-            let cmd = if block {
-                "block-sta"
-            } else if unblock {
-                "unblock-sta"
-            } else if reconnect {
-                "kick-sta"
-            } else {
-                return Err(anyhow!(
-                    "Specify an action: --block | --unblock | --reconnect"
-                ));
-            };
-            render_response(client.client_action(&mac, cmd)?, output, render_opts, None)
         }
         LocalCommands::Network(NetworkCommand::Create {
             name,
@@ -1962,8 +2098,8 @@ fn handle_local(
                 )
             }
         }
-        LocalCommands::TopClients { site, limit } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::TopClient(LocalTopClientCommand::List { site: _, limit }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2000,8 +2136,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::TopDevices { site, limit } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::TopDevice(LocalTopDeviceCommand::List { site: _, limit }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2039,8 +2175,8 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Dpi { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
+        LocalCommands::Dpi(LocalDpiCommand::Get { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -2053,23 +2189,6 @@ fn handle_local(
                 output,
                 render_opts,
                 Some(&["app", "cat", "tx_bytes", "rx_bytes"]),
-                watch,
-            )
-        }
-        LocalCommands::Traffic { site } => {
-            let effective = resolve_local(cwd, site_override(site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
-            render_local(
-                || client.traffic(),
-                output,
-                render_opts,
-                Some(&["ip", "mac", "bytes", "duration"]),
                 watch,
             )
         }

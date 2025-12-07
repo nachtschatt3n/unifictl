@@ -5,17 +5,17 @@
 class Unifictl < Formula
   desc "CLI for UniFi Site Manager (API v1/EA)"
   homepage "https://github.com/nachtschatt3n/unifictl"
-  version "0.4.4"
+  version "0.4.5"
   license "GPL-3.0"
 
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/nachtschatt3n/unifictl/releases/download/v0.4.4/unifictl-x86_64-apple-darwin.tar.gz"
-      sha256 "" # Will be updated automatically
+      url "https://github.com/nachtschatt3n/unifictl/releases/download/v0.4.5/unifictl-x86_64-apple-darwin.tar.gz"
+      sha256 "08eb33076cdb95b21b9fa810a7ee7ac0d310e7bbe63923a3ac5e803972479386"
     end
     if Hardware::CPU.arm?
-      url "https://github.com/nachtschatt3n/unifictl/releases/download/v0.4.4/unifictl-aarch64-apple-darwin.tar.gz"
-      sha256 "" # Will be updated automatically
+      url "https://github.com/nachtschatt3n/unifictl/releases/download/v0.4.5/unifictl-aarch64-apple-darwin.tar.gz"
+      sha256 "9dbab71b9bc110a046057e575e77eaa2fd66cf874a5c5ade2c1d105752e48622"
     end
   end
 

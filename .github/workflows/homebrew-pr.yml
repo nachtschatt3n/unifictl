@@ -1,0 +1,178 @@
+name: Create Homebrew PR
+
+on:
+  # Disabled for now - will be enabled when ready for v0.4.6
+  # release:
+  #   types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to submit (e.g., 0.4.6)'
+        required: true
+
+jobs:
+  create-homebrew-pr:
+    name: Create Homebrew PR
+    runs-on: macos-latest
+    # Only runs on manual trigger for now (release trigger disabled above)
+    if: github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Homebrew
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "$(/opt/homebrew/bin/brew shellenv)" >> $GITHUB_ENV
+          /opt/homebrew/bin/brew shellenv >> $GITHUB_ENV
+          /opt/homebrew/bin/brew update
+
+      - name: Set version
+        id: set_version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ github.event.release.tag_name }}"
+            # Remove 'v' prefix if present
+            VERSION=${VERSION#v}
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION}"
+
+      - name: Get SHA256 checksums
+        id: get_checksums
+        run: |
+          VERSION="${{ steps.set_version.outputs.version }}"
+          
+          echo "Downloading binaries to calculate checksums..."
+          curl -L -o /tmp/x86_64.tar.gz "https://github.com/nachtschatt3n/unifictl/releases/download/v${VERSION}/unifictl-x86_64-apple-darwin.tar.gz"
+          curl -L -o /tmp/arm64.tar.gz "https://github.com/nachtschatt3n/unifictl/releases/download/v${VERSION}/unifictl-aarch64-apple-darwin.tar.gz"
+          
+          X86_64_SHA=$(shasum -a 256 /tmp/x86_64.tar.gz | awk '{print $1}')
+          ARM64_SHA=$(shasum -a 256 /tmp/arm64.tar.gz | awk '{print $1}')
+          
+          echo "x86_64_sha=${X86_64_SHA}" >> $GITHUB_OUTPUT
+          echo "arm64_sha=${ARM64_SHA}" >> $GITHUB_OUTPUT
+          echo "x86_64_url=https://github.com/nachtschatt3n/unifictl/releases/download/v${VERSION}/unifictl-x86_64-apple-darwin.tar.gz" >> $GITHUB_OUTPUT
+          echo "arm64_url=https://github.com/nachtschatt3n/unifictl/releases/download/v${VERSION}/unifictl-aarch64-apple-darwin.tar.gz" >> $GITHUB_OUTPUT
+          
+          echo "x86_64 SHA: ${X86_64_SHA}"
+          echo "arm64 SHA: ${ARM64_SHA}"
+
+      - name: Update local formula file
+        run: |
+          VERSION="${{ steps.set_version.outputs.version }}"
+          X86_64_SHA="${{ steps.get_checksums.outputs.x86_64_sha }}"
+          ARM64_SHA="${{ steps.get_checksums.outputs.arm64_sha }}"
+          
+          # Update the formula file in the repo
+          sed -i '' "s/version \"[^\"]*\"/version \"${VERSION}\"/" packaging/homebrew/Formula/unifictl.rb
+          sed -i '' "s|url \".*unifictl-x86_64-apple-darwin.tar.gz\"|url \"https://github.com/nachtschatt3n/unifictl/releases/download/v${VERSION}/unifictl-x86_64-apple-darwin.tar.gz\"|" packaging/homebrew/Formula/unifictl.rb
+          sed -i '' "s|url \".*unifictl-aarch64-apple-darwin.tar.gz\"|url \"https://github.com/nachtschatt3n/unifictl/releases/download/v${VERSION}/unifictl-aarch64-apple-darwin.tar.gz\"|" packaging/homebrew/Formula/unifictl.rb
+          
+          # Update SHA256 checksums (x86_64) - find the line after x86_64 URL
+          perl -i -pe "s/(unifictl-x86_64-apple-darwin\.tar\.gz\"\s*\n\s*sha256 \")[^\"]*/\${1}${X86_64_SHA}/" packaging/homebrew/Formula/unifictl.rb
+          
+          # Update SHA256 checksums (arm64) - find the line after arm64 URL
+          perl -i -pe "s/(unifictl-aarch64-apple-darwin\.tar\.gz\"\s*\n\s*sha256 \")[^\"]*/\${1}${ARM64_SHA}/" packaging/homebrew/Formula/unifictl.rb
+          
+          echo "Updated packaging/homebrew/Formula/unifictl.rb"
+          cat packaging/homebrew/Formula/unifictl.rb
+
+      - name: Commit updated formula
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packaging/homebrew/Formula/unifictl.rb
+          git diff --staged --quiet || git commit -m "Update Homebrew formula to v${{ steps.set_version.outputs.version }}"
+          git push || echo "No changes to commit or push failed"
+
+      - name: Create Homebrew PR using brew bump-formula-pr
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+        run: |
+          VERSION="${{ steps.set_version.outputs.version }}"
+          X86_64_SHA="${{ steps.get_checksums.outputs.x86_64_sha }}"
+          X86_64_URL="${{ steps.get_checksums.outputs.x86_64_url }}"
+          
+          # Check if formula already exists in homebrew-core
+          if curl -s -f "https://raw.githubusercontent.com/Homebrew/homebrew-core/master/Formula/u/unifictl.rb" > /dev/null 2>&1; then
+            echo "Formula exists, updating..."
+            brew bump-formula-pr \
+              --url="${X86_64_URL}" \
+              --sha256="${X86_64_SHA}" \
+              --version="${VERSION}" \
+              --message="Update unifictl to ${VERSION}" \
+              unifictl || {
+                echo "::warning::PR creation failed - might already exist or need manual intervention"
+                echo "Check: https://github.com/Homebrew/homebrew-core/pulls?q=is:pr+is:open+unifictl"
+                exit 0
+              }
+          else
+            echo "Formula does not exist, creating new one..."
+            echo "::notice::New formula submission requires manual PR creation"
+            echo "::notice::Use the formula at: packaging/homebrew/Formula/unifictl.rb"
+            echo ""
+            echo "Run manually:"
+            echo "brew bump-formula-pr --url=${X86_64_URL} --sha256=${X86_64_SHA} unifictl"
+            
+            # Try to create PR anyway (brew will create the formula)
+            brew bump-formula-pr \
+              --url="${X86_64_URL}" \
+              --sha256="${X86_64_SHA}" \
+              --message="Add unifictl ${VERSION}" \
+              unifictl || {
+                echo "::warning::Automatic PR creation failed"
+                echo "::notice::Please create PR manually - see packaging/homebrew/HOMEBREW_SUBMISSION.md"
+                exit 0
+              }
+          fi
+
+      - name: Create GitHub Issue with instructions (fallback)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ steps.set_version.outputs.version }}';
+            const x86_64_sha = '${{ steps.get_checksums.outputs.x86_64_sha }}';
+            const arm64_sha = '${{ steps.get_checksums.outputs.arm64_sha }}';
+            const x86_64_url = '${{ steps.get_checksums.outputs.x86_64_url }}';
+            
+            const body = `## Homebrew Submission Required
+            
+            Automated PR creation failed. Please submit manually:
+            
+            ### Quick Command:
+            \`\`\`bash
+            brew bump-formula-pr \\
+              --url=${x86_64_url} \\
+              --sha256=${x86_64_sha} \\
+              unifictl
+            \`\`\`
+            
+            ### Details:
+            - **Version**: ${version}
+            - **x86_64 SHA**: ${x86_64_sha}
+            - **ARM64 SHA**: ${arm64_sha}
+            - **Formula file**: \`packaging/homebrew/Formula/unifictl.rb\`
+            - **Guide**: See \`packaging/homebrew/HOMEBREW_SUBMISSION.md\`
+            
+            ### Note:
+            After creating the PR, you'll need to manually add ARM64 support by editing the formula to include:
+            \`\`\`ruby
+            if Hardware::CPU.arm?
+              url "https://github.com/nachtschatt3n/unifictl/releases/download/v${version}/unifictl-aarch64-apple-darwin.tar.gz"
+              sha256 "${arm64_sha}"
+            end
+            \`\`\`
+            `;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Homebrew] Submit v${version} to homebrew-core`,
+              body: body,
+              labels: ['homebrew', 'documentation']
+            });
