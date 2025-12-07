@@ -1557,11 +1557,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::Network(NetworkCommand::Delete {
-            id,
-            dry_run,
-            yes,
-        }) => {
+        LocalCommands::Network(NetworkCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1680,11 +1676,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::Wlan(WlanCommand::Delete {
-            id,
-            dry_run,
-            yes,
-        }) => {
+        LocalCommands::Wlan(WlanCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1811,11 +1803,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallRule(FirewallRuleCommand::Delete {
-            id,
-            dry_run,
-            yes,
-        }) => {
+        LocalCommands::FirewallRule(FirewallRuleCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1891,11 +1879,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallGroup(FirewallGroupCommand::Update {
-            id,
-            name,
-            members,
-        }) => {
+        LocalCommands::FirewallGroup(FirewallGroupCommand::Update { id, name, members }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1921,11 +1905,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::FirewallGroup(FirewallGroupCommand::Delete {
-            id,
-            dry_run,
-            yes,
-        }) => {
+        LocalCommands::FirewallGroup(FirewallGroupCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -2110,10 +2090,7 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::PolicyTable(PolicyTableCommand::Create {
-            name,
-            description,
-        }) => {
+        LocalCommands::PolicyTable(PolicyTableCommand::Create { name, description }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -2165,11 +2142,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::PolicyTable(PolicyTableCommand::Delete {
-            id,
-            dry_run,
-            yes,
-        }) => {
+        LocalCommands::PolicyTable(PolicyTableCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -2236,10 +2209,7 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Zone(ZoneCommand::Create {
-            name,
-            description,
-        }) => {
+        LocalCommands::Zone(ZoneCommand::Create { name, description }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -2291,11 +2261,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::Zone(ZoneCommand::Delete {
-            id,
-            dry_run,
-            yes,
-        }) => {
+        LocalCommands::Zone(ZoneCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -2388,11 +2354,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::Object(ObjectCommand::Update {
-            id,
-            name,
-            value,
-        }) => {
+        LocalCommands::Object(ObjectCommand::Update { id, name, value }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -2418,11 +2380,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::Object(ObjectCommand::Delete {
-            id,
-            dry_run,
-            yes,
-        }) => {
+        LocalCommands::Object(ObjectCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
