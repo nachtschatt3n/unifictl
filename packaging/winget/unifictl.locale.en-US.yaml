@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.4.0
+PackageIdentifier: nachtschatt3n.unifictl
+PackageVersion: 0.4.4
+PackageLocale: en-US
+Publisher: Mathias Uhl
+PublisherUrl: https://github.com/nachtschatt3n/unifictl
+PublisherSupportUrl: https://github.com/nachtschatt3n/unifictl/issues
+Author: Mathias Uhl
+PackageName: unifictl
+PackageUrl: https://github.com/nachtschatt3n/unifictl
+License: GPL-3.0
+LicenseUrl: https://www.gnu.org/licenses/gpl-3.0.html
+Copyright: Copyright (C) 2024 Mathias Uhl
+CopyrightUrl: https://github.com/nachtschatt3n/unifictl/blob/master/LICENSE
+ShortDescription: CLI for UniFi Site Manager (API v1/EA)
+Description: A lightweight CLI tool for managing UniFi networks via the Site Manager API. Supports both cloud (API key) and local controller (username/password) access.
+Tags:
+  - unifi
+  - ubiquiti
+  - cli
+  - network
+  - api
+Moniker: unifictl
+ManifestType: defaultLocale
+ManifestVersion: 1.4.0

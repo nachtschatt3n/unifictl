@@ -1,5 +1,7 @@
 // Integration tests for unifictl improvements
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "console")]
+
 use assert_cmd::cargo::cargo_bin_cmd;
 
 #[test]
@@ -25,7 +27,8 @@ fn test_all_delete_commands_have_dry_run() {
         "object-delete",
     ];
 
-    for cmd_name in commands {
+    // Use iterator to avoid deep recursion on Windows
+    for cmd_name in commands.iter() {
         let mut cmd = cargo_bin_cmd!("unifictl");
         cmd.args(["local", cmd_name, "--help"]);
         cmd.assert()

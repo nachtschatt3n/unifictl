@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.4.0
+PackageIdentifier: nachtschatt3n.unifictl
+PackageVersion: 0.4.4
+MinimumOSVersion: 10.0.17763.0
+InstallerType: zip
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/nachtschatt3n/unifictl/releases/download/v0.4.4/unifictl-x86_64-pc-windows-msvc.zip
+    InstallerSha256: "" # Will be updated automatically
+    InstallModes:
+      - perMachine
+      - perUser
+ManifestType: version
+ManifestVersion: 1.4.0
