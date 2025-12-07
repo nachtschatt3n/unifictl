@@ -171,6 +171,103 @@ After implementing a new command, **always** test it manually with a real UniFi 
 - [ ] EXAMPLES.md updated with new command examples
 - [ ] Endpoint added to `test_all_endpoints.sh` and test passes
 
+## CI/CD and GitHub Actions
+
+### Pre-Commit Checklist
+**ALWAYS run these before committing:**
+1. **Format code**: `cargo fmt --all` - The CI pipeline will fail if code is not formatted
+2. **Check compilation**: `cargo check` - Ensures code compiles without errors
+3. **Run tests**: `cargo test` - Ensures all tests pass, including unit tests
+4. **Verify test signatures**: When adding or modifying methods, ensure all test calls match the method signature (parameters, return types)
+
+### Common CI/CD Issues and Solutions
+
+#### 1. Code Formatting Failures
+**Problem**: CI fails with "Diff in..." errors indicating formatting issues.
+
+**Prevention**:
+- Always run `cargo fmt --all` before committing
+- Consider using a pre-commit hook or IDE auto-format on save
+- The CI workflow runs `cargo fmt --all -- --check` which will fail if formatting differs
+
+**Fix**: Run `cargo fmt --all` locally and commit the changes.
+
+#### 2. Test Compilation Errors
+**Problem**: Tests fail to compile because method signatures don't match their usage.
+
+**Prevention**:
+- When modifying method signatures, update all test calls immediately
+- Run `cargo test` locally before pushing
+- Pay attention to required parameters - if a method requires a query parameter, tests must provide it
+
+**Example**: If `traffic_stats(&mut self, query: &serde_json::Value)` requires a query parameter, tests must call it with:
+```rust
+let query = json!({"start": 0, "end": 1000, "includeUnidentified": false});
+let resp = client.traffic_stats(&query).unwrap();
+```
+
+**Fix**: Update test calls to match the current method signature.
+
+#### 3. GitHub Actions Workflow Issues
+
+##### Release Workflow - Checksums Display
+**Problem**: Release notes show file paths instead of actual checksum content.
+
+**Prevention**:
+- When using GitHub Actions outputs with multiline content, use the proper multiline delimiter syntax:
+  ```yaml
+  {
+    echo 'output_name<<DELIMITER'
+    cat file.txt
+    echo 'DELIMITER'
+  } >> $GITHUB_OUTPUT
+  ```
+- Always test workflow changes with a dry-run or test release before production
+
+**Fix**: Use multiline output syntax to read file contents, not file paths.
+
+##### Workflow Syntax
+- Always validate YAML syntax before committing workflow changes
+- Test workflow changes in a branch before merging to master
+- Use `gh run list` and `gh run view` to debug failed workflows
+
+### GitHub Actions Workflow Structure
+
+#### CI Workflow (`.github/workflows/ci.yml`)
+- Runs on every push/PR to master/main
+- Checks: Format, Clippy, Tests (multi-platform), Security audit
+- **Must pass before merging**
+
+#### Release Workflow (`.github/workflows/release.yml`)
+- Triggers on version tags (`v*.*.*`) or manual dispatch
+- Builds binaries for multiple platforms
+- Creates GitHub releases with artifacts
+- Publishes to crates.io (if token is configured)
+
+**Key Points**:
+- Version handling: Tags include 'v' prefix, but package versions don't
+- Artifact paths: Artifacts are downloaded to subdirectories, use `artifacts/**/*` patterns
+- Checksums: Must read file contents, not display paths
+
+### Workflow Debugging
+```bash
+# List recent workflow runs
+gh run list --limit 10
+
+# View failed steps from a run
+gh run view <run-id> --log-failed
+
+# View full logs
+gh run view <run-id> --log
+```
+
+### Best Practices
+1. **Always test locally first**: Run `cargo fmt`, `cargo test`, `cargo check` before pushing
+2. **Check CI status**: Monitor GitHub Actions after pushing to ensure workflows pass
+3. **Fix issues immediately**: Don't let CI failures accumulate
+4. **Document workflow changes**: Update this file when modifying workflows
+5. **Test workflow changes**: Use workflow_dispatch or test branches to verify changes
+
 ## Troubleshooting Context
   - **UDM Rate Limiting**: Users may hit login rate limits on UDM/UniFi OS gateways because `unifictl` creates a new session for each command.
     - **Symptom**: Repeated 401/Login failed errors.
