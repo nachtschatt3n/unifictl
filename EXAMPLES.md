@@ -87,6 +87,10 @@ unifictl local client list --wired           # filters: --wired / --wireless / -
 unifictl local client block <MAC>            # Block client
 unifictl local client unblock <MAC>          # Unblock client
 unifictl local client reconnect <MAC>        # Force reconnect (kick)
+unifictl local client active                 # Get active clients (v2 API)
+unifictl local client history                # Get client connection history
+unifictl local client history --mac <MAC>    # Filter history by MAC address
+unifictl local client update-metadata <MAC> --metadata '{"name": "My Device"}'
 unifictl local event list
 unifictl local health get
 unifictl local security get
@@ -94,6 +98,52 @@ unifictl local wan get                       # WAN subset of health
 unifictl local dpi get
 unifictl local top-client list --limit 10
 unifictl local top-device list --limit 5
+```
+
+System logs (v2 API):
+```bash
+unifictl local log settings                  # Get system log settings
+unifictl local log all                       # Query all system logs
+unifictl local log all --limit 100           # Limit results
+unifictl local log all --limit 50 --offset 100  # Pagination
+unifictl local log count                     # Count log entries
+unifictl local log critical                  # Get critical logs
+unifictl local log critical --limit 50       # Limit critical logs
+unifictl local log device-alert              # Get device alert logs
+unifictl local log device-alert --limit 20   # Limit device alerts
+```
+
+WiFi/Radio operations (v2 API):
+```bash
+unifictl local wifi connectivity             # Get WiFi connectivity statistics
+# WiFi stats require time range (timestamps in milliseconds since epoch)
+unifictl local wifi stats --start 1765049891027 --end 1765136291027
+unifictl local wifi stats --start 1765049891027 --end 1765136291027 --ap-mac e4:38:83:67:db:ba
+unifictl local wifi stats --start 1765049891027 --end 1765136291027 --ap-mac all
+unifictl local wifi stats --radios --start 1765049891027 --end 1765136291027
+unifictl local wifi radio-ai                # Get Radio AI isolation matrix
+unifictl local wifi management              # Get WiFi management data
+unifictl local wifi config                  # Get enhanced WLAN configuration
+```
+
+Traffic/Flow operations (v2 API):
+```bash
+# Traffic stats require time range and includeUnidentified flag
+unifictl local traffic stats --start 1765049891027 --end 1765136291027 --include-unidentified true
+unifictl local traffic stats --start 1765049891027 --end 1765136291027 --include-unidentified false
+
+# Traffic flow latest statistics require period (DAY or MONTH) and top count
+unifictl local traffic flow-latest --period day --top 30
+unifictl local traffic flow-latest --period month --top 50
+
+# Application traffic rate requires time range and includeUnidentified flag
+unifictl local traffic app-rate --start 1765049891027 --end 1765136291027 --include-unidentified true
+
+# Other traffic commands (no required parameters)
+unifictl local traffic filter-data           # Get traffic flow filter metadata
+unifictl local traffic routes                # Get traffic routing rules
+unifictl local traffic rules                 # Get traffic rules
+unifictl local traffic flows --query '{"timestampFrom": 1765049891025, "timestampTo": 1765136291025}'
 ```
 
 Configs and security:
@@ -233,6 +283,27 @@ unifictl local client list --watch 5 --columns hostname,mac,ip,essid
 
 # Sort and filter top clients
 unifictl local top-client list --limit 20 -o csv > top-clients.csv
+
+# Export active clients (v2 API) to CSV
+unifictl local client active -o csv > active-clients.csv
+
+# Export client history to JSON for analysis
+unifictl local client history -o json > client-history.json
+
+# Monitor critical system logs
+unifictl local log critical --watch 10
+
+# Export WiFi statistics to CSV (requires time range)
+unifictl local wifi stats --start 1765049891027 --end 1765136291027 -o csv > wifi-stats.csv
+
+# Get radio statistics in JSON format (requires time range)
+unifictl local wifi stats --radios --start 1765049891027 --end 1765136291027 -o json > radio-stats.json
+
+# Export traffic statistics to CSV (requires time range)
+unifictl local traffic stats --start 1765049891027 --end 1765136291027 --include-unidentified true -o csv > traffic-stats.csv
+
+# Get traffic flow latest statistics (requires period and top)
+unifictl local traffic flow-latest --period day --top 30 -o json > flow-latest.json
 
 # Dry-run before bulk deletion (example workflow)
 unifictl local network list -o json | jq -r '.data[] | select(.name | contains("old")) | ._id' | \

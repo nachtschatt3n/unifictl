@@ -102,6 +102,202 @@ impl LocalClient {
         self.get(true, false, "stat/sta", Option::<&()>::None)
     }
 
+    // Clients (v2 API)
+    pub fn clients_v2_active(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "clients/active", Option::<&()>::None)
+    }
+
+    pub fn clients_v2_history(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "clients/history", Option::<&()>::None)
+    }
+
+    pub fn update_client_metadata(
+        &mut self,
+        _mac: &str,
+        payload: &serde_json::Value,
+    ) -> Result<ResponseData> {
+        // Note: MAC address should be included in the payload JSON
+        self.post(true, "clients/metadata", Some(payload))
+    }
+
+    // System Log (v2 API)
+    pub fn system_log_settings(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "system-log/setting", Option::<&()>::None)
+    }
+
+    pub fn system_log_all(&mut self, payload: Option<&serde_json::Value>) -> Result<ResponseData> {
+        self.post(true, "system-log/all", payload)
+    }
+
+    pub fn system_log_count(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<ResponseData> {
+        // POST endpoints require a payload, use empty object if None
+        let empty = serde_json::json!({});
+        let payload = payload.unwrap_or(&empty);
+        self.post(true, "system-log/count", Some(payload))
+    }
+
+    pub fn system_log_critical(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<ResponseData> {
+        self.post(true, "system-log/critical", payload)
+    }
+
+    pub fn system_log_device_alert(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<ResponseData> {
+        self.post(true, "system-log/device-alert", payload)
+    }
+
+    // WiFi/Radio (v2 API)
+    pub fn wifi_connectivity(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "wifi-connectivity", Option::<&()>::None)
+    }
+
+    pub fn wifi_stats_details(&mut self, query: &serde_json::Value) -> Result<ResponseData> {
+        // Query parameters: start, end, apMac (required)
+        self.get(true, false, "wifi-stats/details", Some(query))
+    }
+
+    pub fn wifi_stats_radios(&mut self, query: &serde_json::Value) -> Result<ResponseData> {
+        // Query parameters: start, end (required)
+        self.get(true, false, "wifi-stats/radios", Some(query))
+    }
+
+    pub fn radio_ai_isolation_matrix(&mut self) -> Result<ResponseData> {
+        self.get(
+            true,
+            false,
+            "radio-ai/isolation-matrix",
+            Option::<&()>::None,
+        )
+    }
+
+    pub fn wifiman(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "wifiman", Option::<&()>::None)
+    }
+
+    pub fn wlan_enriched_config(&mut self) -> Result<ResponseData> {
+        self.get(
+            true,
+            false,
+            "wlan/enriched-configuration",
+            Option::<&()>::None,
+        )
+    }
+
+    // Traffic/Flow (v2 API)
+    pub fn traffic_stats(&mut self, query: &serde_json::Value) -> Result<ResponseData> {
+        // Query parameters: start, end, includeUnidentified (required)
+        self.get(true, false, "traffic", Some(query))
+    }
+
+    pub fn traffic_flow_latest(&mut self, query: &serde_json::Value) -> Result<ResponseData> {
+        // Query parameters: period (DAY/MONTH), top (number) (required)
+        self.get(
+            true,
+            false,
+            "traffic-flow-latest-statistics",
+            Some(query),
+        )
+    }
+
+    pub fn traffic_flows_filter_data(&mut self) -> Result<ResponseData> {
+        self.get(
+            true,
+            false,
+            "traffic-flows/filter-data",
+            Option::<&()>::None,
+        )
+    }
+
+    pub fn traffic_routes(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "trafficroutes", Option::<&()>::None)
+    }
+
+    pub fn traffic_rules(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "trafficrules", Option::<&()>::None)
+    }
+
+    pub fn app_traffic_rate(
+        &mut self,
+        payload: &serde_json::Value,
+        query: &serde_json::Value,
+    ) -> Result<ResponseData> {
+        // POST endpoints require a payload and query parameters: start, end, includeUnidentified (all required)
+        self.post_with_query(true, "app-traffic-rate", Some(query), Some(payload))
+    }
+
+    pub fn traffic_flows_query(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<ResponseData> {
+        // POST endpoints require a payload, use empty object if None
+        let empty = serde_json::json!({});
+        let payload = payload.unwrap_or(&empty);
+        self.post(true, "traffic-flows", Some(payload))
+    }
+
+    // Statistics (v1 API)
+    pub fn stat_ccode(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "stat/ccode", Option::<&()>::None)
+    }
+
+    pub fn stat_current_channel(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "stat/current-channel", Option::<&()>::None)
+    }
+
+    pub fn stat_device_basic(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "stat/device-basic", Option::<&()>::None)
+    }
+
+    pub fn stat_guest(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "stat/guest", Option::<&()>::None)
+    }
+
+    pub fn stat_rogueap(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "stat/rogueap", Option::<&()>::None)
+    }
+
+    pub fn stat_sdn(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "stat/sdn", Option::<&()>::None)
+    }
+
+    pub fn stat_spectrum_scan(&mut self, mac: &str) -> Result<ResponseData> {
+        self.get(
+            true,
+            false,
+            &format!("stat/spectrum-scan/{mac}"),
+            Option::<&()>::None,
+        )
+    }
+
+    pub fn stat_report_5min_ap(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<ResponseData> {
+        self.post(true, "stat/report/5minutes.ap", payload)
+    }
+
+    // Ports (v2 API)
+    pub fn ports_anomalies(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "ports/port-anomalies", Option::<&()>::None)
+    }
+
+    pub fn ports_mac_tables(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<ResponseData> {
+        // POST endpoints require a payload, use empty object if None
+        let empty = serde_json::json!({});
+        let payload = payload.unwrap_or(&empty);
+        self.post(true, "ports/mac-tables", Some(payload))
+    }
+
     pub fn list_health(&mut self) -> Result<ResponseData> {
         self.get(true, false, "stat/health", Option::<&()>::None)
     }
@@ -285,12 +481,22 @@ impl LocalClient {
         path: &str,
         body: Option<&Q>,
     ) -> Result<ResponseData> {
+        self.post_with_query(site_scoped, path, Option::<&()>::None, body)
+    }
+
+    fn post_with_query<Q: Serialize + ?Sized, B: Serialize + ?Sized>(
+        &mut self,
+        site_scoped: bool,
+        path: &str,
+        query: Option<&Q>,
+        body: Option<&B>,
+    ) -> Result<ResponseData> {
         self.request(
             Method::POST,
             site_scoped,
             false,
             path,
-            Option::<&()>::None,
+            query,
             body,
         )
     }
@@ -984,5 +1190,166 @@ mod tests {
         );
         assert!(msg.contains("Conflict"));
         assert!(msg.contains("Resource already exists"));
+    }
+
+    #[test]
+    fn clients_v2_active_calls_correct_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let clients = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/v2/api/site/default/clients/active");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.clients_v2_active().unwrap();
+
+        login.assert();
+        clients.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn clients_v2_history_calls_correct_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let history = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/v2/api/site/default/clients/history");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.clients_v2_history().unwrap();
+
+        login.assert();
+        history.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn system_log_settings_calls_correct_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let settings = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/v2/api/site/default/system-log/setting");
+            then.status(200).json_body(json!({"enabled": true}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.system_log_settings().unwrap();
+
+        login.assert();
+        settings.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn wifi_connectivity_calls_correct_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let wifi = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/v2/api/site/default/wifi-connectivity");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.wifi_connectivity().unwrap();
+
+        login.assert();
+        wifi.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn traffic_stats_calls_correct_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let traffic = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/v2/api/site/default/traffic");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.traffic_stats().unwrap();
+
+        login.assert();
+        traffic.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn stat_rogueap_calls_correct_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let rogueap = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/rogueap");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.stat_rogueap().unwrap();
+
+        login.assert();
+        rogueap.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn ports_anomalies_calls_correct_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let ports = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/v2/api/site/default/ports/port-anomalies");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.ports_anomalies().unwrap();
+
+        login.assert();
+        ports.assert();
+        assert_eq!(resp.status, 200);
     }
 }

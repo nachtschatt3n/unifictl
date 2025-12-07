@@ -3,3 +3,4 @@
 *.deb
 .unifictl.yaml
 *.har
+*.log

@@ -17,10 +17,12 @@
 mod client;
 mod config;
 mod local;
+mod schema;
 
 use crate::client::{ApiClient, ResponseData};
 use crate::config::{LocalConfig, Scope, resolve, resolve_local, save};
 use crate::local::LocalClient;
+use crate::schema::{SchemaRegistry, estimate_tokens};
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use regex::RegexBuilder;
@@ -511,6 +513,93 @@ enum PortProfileCommand {
 }
 
 #[derive(Subcommand)]
+enum CorrelateCommand {
+    /// Correlate all data for a specific client by MAC address
+    Client {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Include historical events (last 24h)")]
+        include_events: bool,
+    },
+    /// Correlate all data for a specific device (AP/switch) by MAC address
+    Device {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Include connected clients")]
+        include_clients: bool,
+    },
+    /// Correlate all data for a specific Access Point and its clients
+    Ap {
+        #[arg(value_name = "AP_MAC")]
+        ap_mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiagnoseCommand {
+    /// Run comprehensive network diagnostics
+    Network {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Diagnose WiFi performance issues
+    Wifi {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Diagnose client connectivity issues
+    Client {
+        #[arg(value_name = "MAC")]
+        mac: Option<String>,
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TimeSeriesCommand {
+    /// Export traffic statistics as time-series data
+    Traffic {
+        #[arg(long, value_name = "TIMESTAMP_MS")]
+        start: u64,
+        #[arg(long, value_name = "TIMESTAMP_MS")]
+        end: u64,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, default_value = "csv", help = "Export format (csv, json)")]
+        format: String,
+    },
+    /// Export WiFi statistics as time-series data
+    Wifi {
+        #[arg(long, value_name = "TIMESTAMP_MS")]
+        start: u64,
+        #[arg(long, value_name = "TIMESTAMP_MS")]
+        end: u64,
+        #[arg(long, help = "Specific AP MAC or 'all'")]
+        ap_mac: Option<String>,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, default_value = "csv", help = "Export format (csv, json)")]
+        format: String,
+    },
+    /// Export event log as time-series data
+    Events {
+        #[arg(long, help = "Number of recent events to export (default: 100)")]
+        limit: Option<usize>,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, default_value = "csv", help = "Export format (csv, json)")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum LocalCommands {
     /// Store local controller credentials (password is saved to the chosen scope)
     Configure {
@@ -566,6 +655,18 @@ enum LocalCommands {
     /// Top device operations
     #[command(subcommand)]
     TopDevice(LocalTopDeviceCommand),
+    /// System log operations
+    #[command(subcommand)]
+    Log(LocalLogCommand),
+    /// WiFi/Radio operations
+    #[command(subcommand)]
+    Wifi(LocalWifiCommand),
+    /// Traffic/Flow operations
+    #[command(subcommand)]
+    Traffic(LocalTrafficCommand),
+    /// Statistics operations
+    #[command(subcommand)]
+    Stat(LocalStatCommand),
 
     /// Network (VLAN) operations
     #[command(subcommand)]
@@ -591,6 +692,15 @@ enum LocalCommands {
     /// Object (address/service object) operations
     #[command(subcommand)]
     Object(ObjectCommand),
+    /// Correlate data across multiple endpoints (client, device, AP, events)
+    #[command(subcommand)]
+    Correlate(CorrelateCommand),
+    /// Run diagnostic analysis (multi-endpoint health check)
+    #[command(subcommand)]
+    Diagnose(DiagnoseCommand),
+    /// Export time-series data for trend analysis
+    #[command(subcommand)]
+    TimeSeries(TimeSeriesCommand),
 }
 
 #[derive(Subcommand)]
@@ -607,6 +717,9 @@ enum LocalDeviceCommand {
         site: Option<String>,
         #[arg(long, help = "Show only unadopted/pending devices")]
         unadopted: bool,
+        /// Maximum number of results to return (default: 30)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
     },
     /// Get device details/stats
     Get {
@@ -645,6 +758,25 @@ enum LocalDeviceCommand {
         #[arg(long)]
         site: Option<String>,
     },
+    /// Get spectrum scan results for device
+    SpectrumScan {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get port anomalies
+    PortAnomalies {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get MAC address tables
+    MacTables {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, value_name = "DEVICE_MAC")]
+        device: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -659,6 +791,9 @@ enum LocalClientCommand {
         wireless: bool,
         #[arg(long, help = "Only blocked clients")]
         blocked: bool,
+        /// Maximum number of results to return (default: 30)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
     },
     /// Block the client
     Block {
@@ -681,6 +816,33 @@ enum LocalClientCommand {
         #[arg(long)]
         site: Option<String>,
     },
+    /// Get active clients (v2 API)
+    Active {
+        #[arg(long)]
+        site: Option<String>,
+        /// Maximum number of results to return (default: 30)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Get client connection history (v2 API)
+    History {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, value_name = "MAC")]
+        mac: Option<String>,
+        /// Maximum number of results to return (default: 30)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Update client metadata
+    UpdateMetadata {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, value_name = "JSON")]
+        metadata: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -689,6 +851,9 @@ enum LocalEventCommand {
     List {
         #[arg(long)]
         site: Option<String>,
+        /// Maximum number of results to return (default: 30)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
     },
 }
 
@@ -750,12 +915,195 @@ enum LocalTopDeviceCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum LocalLogCommand {
+    /// Get system log settings
+    Settings {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Query all system logs
+    All {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, value_name = "LIMIT")]
+        limit: Option<usize>,
+        #[arg(long, value_name = "OFFSET")]
+        offset: Option<usize>,
+    },
+    /// Count log entries
+    Count {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get critical system logs
+    Critical {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, value_name = "LIMIT")]
+        limit: Option<usize>,
+    },
+    /// Get device alert logs
+    DeviceAlert {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, value_name = "LIMIT")]
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalWifiCommand {
+    /// Get WiFi connectivity statistics
+    Connectivity {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get detailed WiFi statistics (requires time range)
+    Stats {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Show radio statistics")]
+        radios: bool,
+        /// Start timestamp (milliseconds since epoch)
+        #[arg(long)]
+        start: i64,
+        /// End timestamp (milliseconds since epoch)
+        #[arg(long)]
+        end: i64,
+        /// AP MAC address (use 'all' for all APs) - only for details, not radios
+        #[arg(long)]
+        ap_mac: Option<String>,
+    },
+    /// Get Radio AI isolation matrix
+    RadioAi {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get WiFi management data
+    Management {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get enhanced WLAN configuration
+    Config {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalTrafficCommand {
+    /// Get traffic statistics (requires time range)
+    Stats {
+        #[arg(long)]
+        site: Option<String>,
+        /// Start timestamp (milliseconds since epoch)
+        #[arg(long)]
+        start: i64,
+        /// End timestamp (milliseconds since epoch)
+        #[arg(long)]
+        end: i64,
+        /// Include unidentified traffic (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        include_unidentified: bool,
+    },
+    /// Get latest traffic flow statistics (requires period and top)
+    FlowLatest {
+        #[arg(long)]
+        site: Option<String>,
+        /// Period: DAY or MONTH
+        #[arg(long, value_enum)]
+        period: FlowPeriod,
+        /// Number of top flows to return
+        #[arg(long)]
+        top: u32,
+    },
+    /// Get traffic flow filter metadata
+    FilterData {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get traffic routing rules
+    Routes {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get traffic rules
+    Rules {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Query application traffic rate (requires time range)
+    AppRate {
+        #[arg(long)]
+        site: Option<String>,
+        /// Start timestamp (milliseconds since epoch)
+        #[arg(long)]
+        start: i64,
+        /// End timestamp (milliseconds since epoch)
+        #[arg(long)]
+        end: i64,
+        /// Include unidentified traffic (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        include_unidentified: bool,
+    },
+    /// Query traffic flows
+    Flows {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, value_name = "JSON")]
+        query: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalStatCommand {
+    /// Get country code statistics
+    Ccode {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get current channel statistics
+    CurrentChannel {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get basic device statistics
+    DeviceBasic {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get guest statistics
+    Guest {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get rogue AP detection results
+    Rogueap {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get SDN statistics
+    Sdn {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Get 5-minute AP report
+    Report5min {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum OutputFormat {
     Pretty,
     Json,
     Raw,
     Csv,
+    /// LLM-optimized output with schema, summaries, and token estimates
+    Llm,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -770,6 +1118,12 @@ enum CompletionShell {
 enum ScopeArg {
     Local,
     User,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FlowPeriod {
+    Day,
+    Month,
 }
 
 impl From<ScopeArg> for Scope {
@@ -1135,7 +1489,7 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Device(LocalDeviceCommand::List { site: _, unadopted }) => {
+        LocalCommands::Device(LocalDeviceCommand::List { site: _, unadopted, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1147,19 +1501,22 @@ fn handle_local(
             render_local(
                 || {
                     let mut resp = client.list_devices()?;
-                    if unadopted {
-                        if let Some(mut json) = resp.json.clone() {
-                            if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                    if let Some(mut json) = resp.json.clone() {
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                            if unadopted {
                                 arr.retain(|item| {
                                     let state = item.get("state").and_then(|s| s.as_str());
                                     let adopted = item.get("adopted").and_then(|a| a.as_bool());
                                     state == Some("pending") || adopted == Some(false)
                                 });
                             }
-                            resp.body =
-                                serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                            resp.json = Some(json);
+                            if arr.len() > limit {
+                                arr.truncate(limit);
+                            }
                         }
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
                     }
                     Ok(resp)
                 },
@@ -1325,11 +1682,64 @@ fn handle_local(
                 None,
             )
         }
+        LocalCommands::Device(LocalDeviceCommand::SpectrumScan { mac, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.stat_spectrum_scan(&mac),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Device(LocalDeviceCommand::PortAnomalies { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.ports_anomalies(),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Device(LocalDeviceCommand::MacTables { site: _, device }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let payload = device.map(|d| serde_json::json!({ "device": d }));
+            render_local(
+                || client.ports_mac_tables(payload.as_ref()),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
         LocalCommands::Client(LocalClientCommand::List {
             site: _,
             wired,
             wireless,
             blocked,
+            limit,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
@@ -1360,6 +1770,9 @@ fn handle_local(
                                     || (blocked && is_blocked)
                                     || (!wired && !wireless && !blocked)
                             });
+                            if arr.len() > limit {
+                                arr.truncate(limit);
+                            }
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
@@ -1430,7 +1843,7 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::Event(LocalEventCommand::List { site: _ }) => {
+        LocalCommands::Client(LocalClientCommand::Active { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1440,10 +1853,577 @@ fn handle_local(
                 effective.verify_tls,
             )?;
             render_local(
-                || client.list_events(),
+                || {
+                    let mut resp = client.clients_v2_active()?;
+                    if let Some(mut json) = resp.json.clone() {
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                            if arr.len() > limit {
+                                arr.truncate(limit);
+                            }
+                        }
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
+                    }
+                    Ok(resp)
+                },
+                output,
+                render_opts,
+                Some(&["mac", "hostname", "ip", "is_wired", "network_name"]),
+                watch,
+            )
+        }
+        LocalCommands::Client(LocalClientCommand::History { site: _, mac, limit }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mac_filter = mac.clone();
+            render_local(
+                move || {
+                    let mut resp = client.clients_v2_history()?;
+                    if let Some(mut json) = resp.json.clone() {
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                            if let Some(ref mac_val) = mac_filter {
+                                arr.retain(|item| {
+                                    item.get("mac")
+                                        .and_then(|m| m.as_str())
+                                        .map(|m| m.eq_ignore_ascii_case(mac_val))
+                                        .unwrap_or(false)
+                                });
+                            }
+                            if arr.len() > limit {
+                                arr.truncate(limit);
+                            }
+                        }
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
+                    }
+                    Ok(resp)
+                },
+                output,
+                render_opts,
+                Some(&[
+                    "mac",
+                    "hostname",
+                    "ip",
+                    "is_wired",
+                    "network_name",
+                    "last_seen",
+                ]),
+                watch,
+            )
+        }
+        LocalCommands::Client(LocalClientCommand::UpdateMetadata {
+            mac,
+            site: _,
+            metadata,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mac_clone = mac.clone();
+            let mut payload = if let Some(meta_json) = metadata {
+                serde_json::from_str::<serde_json::Value>(&meta_json)
+                    .context("parsing metadata JSON")?
+            } else {
+                return Err(anyhow!("--metadata is required"));
+            };
+            // Ensure MAC address is included in payload
+            if let serde_json::Value::Object(ref mut map) = payload {
+                map.insert(
+                    "mac".to_string(),
+                    serde_json::Value::String(mac_clone.clone()),
+                );
+            }
+            render_response(
+                client.update_client_metadata(&mac_clone, &payload)?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Event(LocalEventCommand::List { site: _, limit }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || {
+                    let mut resp = client.list_events()?;
+                    if let Some(mut json) = resp.json.clone() {
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                            if arr.len() > limit {
+                                arr.truncate(limit);
+                            }
+                        }
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
+                    }
+                    Ok(resp)
+                },
                 output,
                 render_opts,
                 Some(&["time", "key", "msg", "subsystem"]),
+                watch,
+            )
+        }
+        LocalCommands::Log(LocalLogCommand::Settings { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.system_log_settings(),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Log(LocalLogCommand::All {
+            site: _,
+            limit,
+            offset,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mut payload = serde_json::json!({});
+            if let Some(lim) = limit {
+                payload["limit"] = serde_json::json!(lim);
+            }
+            if let Some(off) = offset {
+                payload["offset"] = serde_json::json!(off);
+            }
+            render_local(
+                || client.system_log_all(Some(&payload)),
+                output,
+                render_opts,
+                Some(&["time", "level", "msg", "subsystem", "key"]),
+                watch,
+            )
+        }
+        LocalCommands::Log(LocalLogCommand::Count { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.system_log_count(None),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Log(LocalLogCommand::Critical { site: _, limit }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let payload = limit.map(|lim| serde_json::json!({ "limit": lim }));
+            render_local(
+                || client.system_log_critical(payload.as_ref()),
+                output,
+                render_opts,
+                Some(&["time", "level", "msg", "subsystem", "key"]),
+                watch,
+            )
+        }
+        LocalCommands::Log(LocalLogCommand::DeviceAlert { site: _, limit }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let payload = limit.map(|lim| serde_json::json!({ "limit": lim }));
+            render_local(
+                || client.system_log_device_alert(payload.as_ref()),
+                output,
+                render_opts,
+                Some(&["time", "level", "msg", "subsystem", "key"]),
+                watch,
+            )
+        }
+        LocalCommands::Wifi(LocalWifiCommand::Connectivity { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.wifi_connectivity(),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Wifi(LocalWifiCommand::Stats {
+            site: _,
+            radios,
+            start,
+            end,
+            ap_mac,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            if radios {
+                let query = serde_json::json!({
+                    "start": start,
+                    "end": end,
+                });
+                render_local(
+                    || client.wifi_stats_radios(&query),
+                    output,
+                    render_opts,
+                    None,
+                    watch,
+                )
+            } else {
+                let mut query_obj = serde_json::json!({
+                    "start": start,
+                    "end": end,
+                });
+                if let Some(ref mac) = ap_mac {
+                    query_obj["apMac"] = serde_json::Value::String(mac.clone());
+                } else {
+                    query_obj["apMac"] = serde_json::Value::String("all".to_string());
+                }
+                render_local(
+                    || client.wifi_stats_details(&query_obj),
+                    output,
+                    render_opts,
+                    None,
+                    watch,
+                )
+            }
+        }
+        LocalCommands::Wifi(LocalWifiCommand::RadioAi { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.radio_ai_isolation_matrix(),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Wifi(LocalWifiCommand::Management { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(|| client.wifiman(), output, render_opts, None, watch)
+        }
+        LocalCommands::Wifi(LocalWifiCommand::Config { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.wlan_enriched_config(),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Traffic(LocalTrafficCommand::Stats {
+            site: _,
+            start,
+            end,
+            include_unidentified,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let query = serde_json::json!({
+                "start": start,
+                "end": end,
+                "includeUnidentified": include_unidentified,
+            });
+            render_local(
+                || client.traffic_stats(&query),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Traffic(LocalTrafficCommand::FlowLatest {
+            site: _,
+            period,
+            top,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let period_str = match period {
+                FlowPeriod::Day => "DAY",
+                FlowPeriod::Month => "MONTH",
+            };
+            let query = serde_json::json!({
+                "period": period_str,
+                "top": top,
+            });
+            render_local(
+                || client.traffic_flow_latest(&query),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Traffic(LocalTrafficCommand::FilterData { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.traffic_flows_filter_data(),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Traffic(LocalTrafficCommand::Routes { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(|| client.traffic_routes(), output, render_opts, None, watch)
+        }
+        LocalCommands::Traffic(LocalTrafficCommand::Rules { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(|| client.traffic_rules(), output, render_opts, None, watch)
+        }
+        LocalCommands::Traffic(LocalTrafficCommand::AppRate {
+            site: _,
+            start,
+            end,
+            include_unidentified,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let query = serde_json::json!({
+                "start": start,
+                "end": end,
+                "includeUnidentified": include_unidentified,
+            });
+            let payload = serde_json::json!({});
+            render_local(
+                move || client.app_traffic_rate(&payload, &query),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Traffic(LocalTrafficCommand::Flows { site: _, query }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let payload = query
+                .map(|q| serde_json::from_str(&q).context("parsing query JSON"))
+                .transpose()?;
+            render_local(
+                || client.traffic_flows_query(payload.as_ref()),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Stat(LocalStatCommand::Ccode { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(|| client.stat_ccode(), output, render_opts, None, watch)
+        }
+        LocalCommands::Stat(LocalStatCommand::CurrentChannel { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.stat_current_channel(),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Stat(LocalStatCommand::DeviceBasic { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.stat_device_basic(),
+                output,
+                render_opts,
+                None,
+                watch,
+            )
+        }
+        LocalCommands::Stat(LocalStatCommand::Guest { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(|| client.stat_guest(), output, render_opts, None, watch)
+        }
+        LocalCommands::Stat(LocalStatCommand::Rogueap { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(|| client.stat_rogueap(), output, render_opts, None, watch)
+        }
+        LocalCommands::Stat(LocalStatCommand::Sdn { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(|| client.stat_sdn(), output, render_opts, None, watch)
+        }
+        LocalCommands::Stat(LocalStatCommand::Report5min { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.stat_report_5min_ap(None),
+                output,
+                render_opts,
+                None,
                 watch,
             )
         }
@@ -2549,7 +3529,485 @@ fn handle_local(
                 render_response(client.delete_object(&id)?, output, render_opts, None)
             }
         }
+        LocalCommands::Correlate(cmd) => {
+            let effective = resolve_local(cwd, site_override(global_site.clone()))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            handle_correlate_command(&cmd, &mut client, output, render_opts, global_site)?;
+            Ok(())
+        }
+        LocalCommands::Diagnose(cmd) => {
+            let effective = resolve_local(cwd, site_override(global_site.clone()))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            handle_diagnose_command(&cmd, &mut client, output, render_opts, global_site)?;
+            Ok(())
+        }
+        LocalCommands::TimeSeries(cmd) => {
+            let effective = resolve_local(cwd, site_override(global_site.clone()))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            handle_timeseries_command(&cmd, &mut client, output, global_site)?;
+            Ok(())
+        }
     }
+}
+
+fn handle_correlate_command(
+    cmd: &CorrelateCommand,
+    client: &mut LocalClient,
+    output: OutputFormat,
+    render_opts: &RenderOpts,
+    _default_site: Option<String>,
+) -> Result<()> {
+    use serde_json::json;
+
+    match cmd {
+        CorrelateCommand::Client { mac, site: _, include_events } => {
+            let mut correlated = json!({
+                "correlation_type": "client",
+                "mac": mac,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+
+            // Get client details
+            let clients = client.list_clients()?;
+            if let Some(ref json) = clients.json {
+                if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                    let client_data = arr.iter().find(|c| {
+                        c.get("mac").and_then(|m| m.as_str()) == Some(mac)
+                    });
+                    correlated["client"] = client_data.cloned().unwrap_or(json!(null));
+                }
+            }
+
+            // Get connected AP info (if wireless)
+            if let Some(ap_mac) = correlated["client"]["ap_mac"].as_str() {
+                let devices = client.list_devices()?;
+                if let Some(ref json) = devices.json {
+                    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                        let ap_data = arr.iter().find(|d| {
+                            d.get("mac").and_then(|m| m.as_str()) == Some(ap_mac)
+                        });
+                        correlated["connected_ap"] = ap_data.cloned().unwrap_or(json!(null));
+                    }
+                }
+            }
+
+            // Get events if requested
+            if *include_events {
+                if let Ok(events_resp) = client.list_events() {
+                    if let Some(ref json) = events_resp.json {
+                        if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                            let client_events: Vec<_> = arr.iter()
+                                .filter(|e| {
+                                    e.get("user").and_then(|u| u.as_str()) == Some(mac) ||
+                                    e.get("client_mac").and_then(|m| m.as_str()) == Some(mac)
+                                })
+                                .take(20)
+                                .cloned()
+                                .collect();
+                            correlated["recent_events"] = json!(client_events);
+                        }
+                    }
+                }
+            }
+
+            correlated["llm_summary"] = json!({
+                "has_client_data": !correlated["client"].is_null(),
+                "is_wireless": !correlated["connected_ap"].is_null(),
+                "event_count": correlated.get("recent_events")
+                    .and_then(|e| e.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+            });
+
+            render_response(
+                ResponseData {
+                    status: 200,
+                    body: serde_json::to_string(&correlated)?,
+                    json: Some(correlated),
+                },
+                output,
+                render_opts,
+                None,
+            )
+        }
+        CorrelateCommand::Device { mac, site: _, include_clients } => {
+            let mut correlated = json!({
+                "correlation_type": "device",
+                "mac": mac,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+
+            // Get device details
+            let devices = client.list_devices()?;
+            if let Some(ref json) = devices.json {
+                if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                    let device_data = arr.iter().find(|d| {
+                        d.get("mac").and_then(|m| m.as_str()) == Some(mac)
+                    });
+                    correlated["device"] = device_data.cloned().unwrap_or(json!(null));
+                }
+            }
+
+            // Get connected clients if requested and device is an AP
+            if *include_clients {
+                let clients = client.list_clients()?;
+                if let Some(ref json) = clients.json {
+                    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                        let connected_clients: Vec<_> = arr.iter()
+                            .filter(|c| {
+                                c.get("ap_mac").and_then(|m| m.as_str()) == Some(mac) ||
+                                c.get("sw_mac").and_then(|m| m.as_str()) == Some(mac)
+                            })
+                            .cloned()
+                            .collect();
+                        correlated["connected_clients"] = json!(connected_clients);
+                        correlated["connected_clients_count"] = json!(connected_clients.len());
+                    }
+                }
+            }
+
+            correlated["llm_summary"] = json!({
+                "has_device_data": !correlated["device"].is_null(),
+                "device_type": correlated["device"]["type"].as_str().unwrap_or("unknown"),
+                "client_count": correlated.get("connected_clients_count").and_then(|c| c.as_u64()).unwrap_or(0),
+            });
+
+            render_response(
+                ResponseData {
+                    status: 200,
+                    body: serde_json::to_string(&correlated)?,
+                    json: Some(correlated),
+                },
+                output,
+                render_opts,
+                None,
+            )
+        }
+        CorrelateCommand::Ap { ap_mac, site: _ } => {
+            // Reuse Device correlation logic
+            let device_cmd = CorrelateCommand::Device {
+                mac: ap_mac.clone(),
+                site: None,
+                include_clients: true,
+            };
+            handle_correlate_command(&device_cmd, client, output, render_opts, None)
+        }
+    }
+}
+
+fn handle_diagnose_command(
+    cmd: &DiagnoseCommand,
+    client: &mut LocalClient,
+    output: OutputFormat,
+    render_opts: &RenderOpts,
+    _default_site: Option<String>,
+) -> Result<()> {
+    use serde_json::json;
+
+    match cmd {
+        DiagnoseCommand::Network { site: _ } => {
+            let mut diagnostics = json!({
+                "diagnostic_type": "network",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "checks": [],
+            });
+
+            let mut checks = Vec::new();
+
+            // Health check
+            if let Ok(health) = client.list_health() {
+                let health_status: serde_json::Value = if let Some(ref json) = health.json {
+                    json.get("data").cloned().unwrap_or(json!(null))
+                } else {
+                    json!(null)
+                };
+                checks.push(json!({
+                    "name": "Health",
+                    "status": if health.status == 200 { "pass" } else { "fail" },
+                    "data": health_status,
+                }));
+            }
+
+            // WAN check (filter health data for WAN subsystem)
+            if let Ok(wan_health) = client.list_health() {
+                let wan_ok = if let Some(ref json) = wan_health.json {
+                    json.get("data")
+                        .and_then(|d| d.as_array())
+                        .map(|arr| {
+                            arr.iter().any(|item| {
+                                item.get("subsystem").and_then(|s| s.as_str()) == Some("wan")
+                                    && item.get("status").and_then(|s| s.as_str()) == Some("ok")
+                            })
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                checks.push(json!({
+                    "name": "WAN",
+                    "status": if wan_ok { "pass" } else { "fail" },
+                }));
+            }
+
+            // Device check
+            if let Ok(devices) = client.list_devices() {
+                let device_count = devices.json.as_ref()
+                    .and_then(|j| j.get("data"))
+                    .and_then(|d| d.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                checks.push(json!({
+                    "name": "Devices",
+                    "status": "pass",
+                    "device_count": device_count,
+                }));
+            }
+
+            diagnostics["checks"] = json!(checks);
+            diagnostics["llm_summary"] = json!({
+                "total_checks": checks.len(),
+                "passed": checks.iter().filter(|c| c["status"] == "pass").count(),
+                "recommendation": "Review failed checks for detailed troubleshooting",
+            });
+
+            render_response(
+                ResponseData {
+                    status: 200,
+                    body: serde_json::to_string(&diagnostics)?,
+                    json: Some(diagnostics),
+                },
+                output,
+                render_opts,
+                None,
+            )
+        }
+        DiagnoseCommand::Wifi { site: _ } => {
+            let mut diagnostics = json!({
+                "diagnostic_type": "wifi",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+
+            // WiFi connectivity check
+            if let Ok(connectivity) = client.wifi_connectivity() {
+                diagnostics["connectivity"] = connectivity.json.clone().unwrap_or(json!(null));
+            }
+
+            // Get APs
+            if let Ok(devices) = client.list_devices() {
+                if let Some(ref json) = devices.json {
+                    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                        let aps: Vec<_> = arr.iter()
+                            .filter(|d| d.get("type").and_then(|t| t.as_str()) == Some("uap"))
+                            .map(|d| json!({
+                                "mac": d.get("mac"),
+                                "name": d.get("name"),
+                                "state": d.get("state"),
+                                "num_sta": d.get("num_sta"),
+                            }))
+                            .collect();
+                        diagnostics["access_points"] = json!(aps);
+                        diagnostics["ap_count"] = json!(aps.len());
+                    }
+                }
+            }
+
+            diagnostics["llm_summary"] = json!({
+                "ap_count": diagnostics.get("ap_count").and_then(|c| c.as_u64()).unwrap_or(0),
+                "recommendation": "Check WiFi connectivity and AP distribution",
+            });
+
+            render_response(
+                ResponseData {
+                    status: 200,
+                    body: serde_json::to_string(&diagnostics)?,
+                    json: Some(diagnostics),
+                },
+                output,
+                render_opts,
+                None,
+            )
+        }
+        DiagnoseCommand::Client { mac, site: _ } => {
+            if let Some(mac) = mac {
+                // Diagnose specific client
+                handle_correlate_command(
+                    &CorrelateCommand::Client {
+                        mac: mac.clone(),
+                        site: None,
+                        include_events: true,
+                    },
+                    client,
+                    output,
+                    render_opts,
+                    None,
+                )
+            } else {
+                // Diagnose all clients
+                let clients = client.list_clients()?;
+                let mut diagnostics = json!({
+                    "diagnostic_type": "client_overview",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+
+                if let Some(ref json) = clients.json {
+                    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                        let wireless_count = arr.iter().filter(|c| !c.get("is_wired").and_then(|w| w.as_bool()).unwrap_or(false)).count();
+                        let wired_count = arr.len() - wireless_count;
+
+                        diagnostics["total_clients"] = json!(arr.len());
+                        diagnostics["wireless_clients"] = json!(wireless_count);
+                        diagnostics["wired_clients"] = json!(wired_count);
+                    }
+                }
+
+                render_response(
+                    ResponseData {
+                        status: 200,
+                        body: serde_json::to_string(&diagnostics)?,
+                        json: Some(diagnostics),
+                    },
+                    output,
+                    render_opts,
+                    None,
+                )
+            }
+        }
+    }
+}
+
+fn handle_timeseries_command(
+    cmd: &TimeSeriesCommand,
+    client: &mut LocalClient,
+    _output: OutputFormat,
+    _default_site: Option<String>,
+) -> Result<()> {
+    use serde_json::json;
+
+    match cmd {
+        TimeSeriesCommand::Traffic { start, end, site: _, format } => {
+            let query = json!({
+                "start": start,
+                "end": end,
+                "includeUnidentified": true,
+            });
+
+            let stats = client.traffic_stats(&query)?;
+
+            if format == "csv" {
+                print_timeseries_csv(&stats.json.unwrap_or(json!([])), "traffic")?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&stats.json)?);
+            }
+            Ok(())
+        }
+        TimeSeriesCommand::Wifi { start, end, ap_mac, site: _, format } => {
+            let query = json!({
+                "startTime": start,
+                "endTime": end,
+                "apMac": ap_mac.as_deref().unwrap_or("all"),
+            });
+            let stats = client.wifi_stats_details(&query)?;
+
+            if format == "csv" {
+                print_timeseries_csv(&stats.json.unwrap_or(json!([])), "wifi")?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&stats.json)?);
+            }
+            Ok(())
+        }
+        TimeSeriesCommand::Events { limit, site: _, format } => {
+            let events = client.list_events()?;
+
+            if format == "csv" {
+                let mut limited_events = events.json.clone().unwrap_or(json!({"data": []}));
+                if let Some(limit) = limit {
+                    if let Some(arr) = limited_events.get_mut("data").and_then(|d| d.as_array_mut()) {
+                        arr.truncate(*limit);
+                    }
+                }
+                print_timeseries_csv(&limited_events, "events")?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&events.json)?);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()> {
+    use csv::Writer;
+    use std::io;
+
+    let mut wtr = Writer::from_writer(io::stdout());
+
+    match data_type {
+        "traffic" => {
+            wtr.write_record(&["timestamp", "rx_bytes", "tx_bytes"])?;
+            if let Some(arr) = data.as_array() {
+                for item in arr {
+                    wtr.write_record(&[
+                        item.get("time").and_then(|t| t.as_u64()).map(|t| t.to_string()).unwrap_or_default(),
+                        item.get("rx_bytes").and_then(|r| r.as_u64()).map(|r| r.to_string()).unwrap_or_default(),
+                        item.get("tx_bytes").and_then(|t| t.as_u64()).map(|t| t.to_string()).unwrap_or_default(),
+                    ])?;
+                }
+            }
+        }
+        "wifi" => {
+            wtr.write_record(&["timestamp", "ap_mac", "channel", "num_sta", "satisfaction"])?;
+            if let Some(arr) = data.as_array() {
+                for item in arr {
+                    wtr.write_record(&[
+                        item.get("time").and_then(|t| t.as_u64()).map(|t| t.to_string()).unwrap_or_default(),
+                        item.get("ap_mac").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+                        item.get("channel").and_then(|c| c.as_u64()).map(|c| c.to_string()).unwrap_or_default(),
+                        item.get("num_sta").and_then(|n| n.as_u64()).map(|n| n.to_string()).unwrap_or_default(),
+                        item.get("satisfaction").and_then(|s| s.as_f64()).map(|s| s.to_string()).unwrap_or_default(),
+                    ])?;
+                }
+            }
+        }
+        "events" => {
+            wtr.write_record(&["timestamp", "datetime", "key", "msg", "subsystem"])?;
+            if let Some(obj) = data.as_object() {
+                if let Some(arr) = obj.get("data").and_then(|d| d.as_array()) {
+                    for item in arr {
+                        wtr.write_record(&[
+                            item.get("time").and_then(|t| t.as_u64()).map(|t| t.to_string()).unwrap_or_default(),
+                            item.get("datetime").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+                            item.get("key").and_then(|k| k.as_str()).unwrap_or("").to_string(),
+                            item.get("msg").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+                            item.get("subsystem").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                        ])?;
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(anyhow!("Unknown time-series data type: {}", data_type));
+        }
+    }
+
+    wtr.flush()?;
+    Ok(())
 }
 
 fn render_local<F>(
@@ -2715,6 +4173,13 @@ fn render_response(
         OutputFormat::Csv => {
             if let Some(json) = response.json {
                 print_csv(&json, columns, render_opts)?;
+            } else {
+                println!("{}", response.body);
+            }
+        }
+        OutputFormat::Llm => {
+            if let Some(json) = response.json {
+                print_llm(&json)?;
             } else {
                 println!("{}", response.body);
             }
@@ -2905,6 +4370,153 @@ fn print_csv(
     }
 
     wtr.flush()?;
+    Ok(())
+}
+
+fn print_llm(json: &serde_json::Value) -> Result<()> {
+    use serde_json::json;
+
+    // Initialize schema registry
+    let registry = SchemaRegistry::new();
+
+    // Estimate tokens for the full response
+    let total_tokens = estimate_tokens(json);
+
+    // Determine if this is an array or object response
+    let (data_type, item_count, data) = match json {
+        serde_json::Value::Array(arr) => ("array", arr.len(), json.clone()),
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Array(arr)) = map.get("data") {
+                ("array_wrapped", arr.len(), map.get("data").unwrap().clone())
+            } else {
+                ("object", 1, json.clone())
+            }
+        }
+        _ => ("primitive", 1, json.clone()),
+    };
+
+    // Create LLM-optimized output
+    let mut llm_output = json!({
+        "llm_metadata": {
+            "version": "1.0",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "estimated_tokens": total_tokens,
+            "data_type": data_type,
+            "item_count": item_count,
+            "truncation_applied": false,
+            "ai_guidance": {
+                "summary": format!("Response contains {} items with ~{} tokens", item_count, total_tokens),
+                "recommended_max_tokens": 4000,
+                "token_efficient": total_tokens < 4000,
+            }
+        }
+    });
+
+    // Add schema information if available (try to infer endpoint)
+    // This is a simple heuristic - in practice, you'd pass context about which endpoint was called
+    let schema = registry.get("device.list"); // Placeholder - would be dynamic
+    if let Some(schema) = schema {
+        llm_output["schema"] = json!({
+            "name": schema.name,
+            "description": schema.description,
+            "use_cases": schema.use_cases,
+            "important_fields": schema.fields.iter()
+                .filter(|f| f.importance == crate::schema::Importance::High)
+                .map(|f| json!({
+                    "name": f.name,
+                    "type": f.field_type,
+                    "description": f.description,
+                }))
+                .collect::<Vec<_>>(),
+        });
+    }
+
+    // Intelligent truncation for large responses
+    const MAX_TOKENS: usize = 4000;
+    const SAMPLE_SIZE: usize = 5;
+
+    if total_tokens > MAX_TOKENS {
+        llm_output["llm_metadata"]["truncation_applied"] = json!(true);
+
+        if let serde_json::Value::Array(arr) = &data {
+            // For arrays, show samples from beginning, middle, and end
+            let mut samples = Vec::new();
+
+            // First N items
+            for (idx, item) in arr.iter().take(SAMPLE_SIZE).enumerate() {
+                samples.push(json!({
+                    "position": "start",
+                    "index": idx,
+                    "data": item,
+                }));
+            }
+
+            // Middle items (if array is large enough)
+            if arr.len() > SAMPLE_SIZE * 3 {
+                let mid = arr.len() / 2;
+                for (offset, item) in arr.iter().skip(mid).take(SAMPLE_SIZE).enumerate() {
+                    samples.push(json!({
+                        "position": "middle",
+                        "index": mid + offset,
+                        "data": item,
+                    }));
+                }
+            }
+
+            // Last N items
+            if arr.len() > SAMPLE_SIZE {
+                for (offset, item) in arr.iter().rev().take(SAMPLE_SIZE).enumerate() {
+                    samples.push(json!({
+                        "position": "end",
+                        "index": arr.len() - 1 - offset,
+                        "data": item,
+                    }));
+                }
+            }
+
+            llm_output["data_samples"] = json!(samples);
+            llm_output["llm_metadata"]["truncation_note"] = json!(
+                format!("Original response had {} items. Showing {} representative samples. Use --limit flag to control output size.",
+                    arr.len(), samples.len())
+            );
+        } else {
+            // For objects, include the whole thing but warn about size
+            llm_output["data"] = data.clone();
+            llm_output["llm_metadata"]["truncation_note"] = json!(
+                "Large object response included in full. Consider using filters to reduce size."
+            );
+        }
+    } else {
+        // Response is small enough, include everything
+        llm_output["data"] = data.clone();
+    }
+
+    // Add statistics for array responses
+    if let serde_json::Value::Array(arr) = &data {
+        if !arr.is_empty() {
+            // Extract field statistics
+            let mut field_types: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+            for item in arr.iter() {
+                if let serde_json::Value::Object(obj) = item {
+                    for key in obj.keys() {
+                        *field_types.entry(key.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            llm_output["statistics"] = json!({
+                "total_items": arr.len(),
+                "common_fields": field_types.iter()
+                    .filter(|(_, count)| **count == arr.len() as u32)
+                    .map(|(k, _)| k)
+                    .collect::<Vec<_>>(),
+                "field_coverage": field_types,
+            });
+        }
+    }
+
+    println!("{}", serde_json::to_string_pretty(&llm_output)?);
     Ok(())
 }
 
