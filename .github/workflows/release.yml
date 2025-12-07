@@ -284,8 +284,7 @@ jobs:
     name: Create Release
     needs: [build-release, build-arch-packages]
     runs-on: ubuntu-latest
-    if: (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
-    continue-on-error: true
+    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
     
     steps:
       - name: Checkout code
@@ -311,8 +310,14 @@ jobs:
       - name: Generate checksums
         shell: bash
         run: |
-          cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.pkg.tar.zst" \) -exec sha256sum {} \; > checksums.txt
+          if [ -d artifacts ] && [ "$(ls -A artifacts 2>/dev/null)" ]; then
+            cd artifacts
+            find . -type f \( -name "*.tar.gz" -o -name "*.pkg.tar.zst" \) -exec sha256sum {} \; > checksums.txt || touch checksums.txt
+          else
+            echo "No artifacts found, creating empty checksums file"
+            mkdir -p artifacts
+            touch artifacts/checksums.txt
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
