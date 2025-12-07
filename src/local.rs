@@ -198,12 +198,7 @@ impl LocalClient {
 
     pub fn traffic_flow_latest(&mut self, query: &serde_json::Value) -> Result<ResponseData> {
         // Query parameters: period (DAY/MONTH), top (number) (required)
-        self.get(
-            true,
-            false,
-            "traffic-flow-latest-statistics",
-            Some(query),
-        )
+        self.get(true, false, "traffic-flow-latest-statistics", Some(query))
     }
 
     pub fn traffic_flows_filter_data(&mut self) -> Result<ResponseData> {
@@ -491,14 +486,7 @@ impl LocalClient {
         query: Option<&Q>,
         body: Option<&B>,
     ) -> Result<ResponseData> {
-        self.request(
-            Method::POST,
-            site_scoped,
-            false,
-            path,
-            query,
-            body,
-        )
+        self.request(Method::POST, site_scoped, false, path, query, body)
     }
 
     fn put<Q: Serialize + ?Sized>(
@@ -1300,7 +1288,8 @@ mod tests {
         });
 
         let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
-        let resp = client.traffic_stats().unwrap();
+        let query = json!({"start": 0, "end": 1000, "includeUnidentified": false});
+        let resp = client.traffic_stats(&query).unwrap();
 
         login.assert();
         traffic.assert();

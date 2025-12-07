@@ -1489,7 +1489,11 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Device(LocalDeviceCommand::List { site: _, unadopted, limit }) => {
+        LocalCommands::Device(LocalDeviceCommand::List {
+            site: _,
+            unadopted,
+            limit,
+        }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -1873,7 +1877,11 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Client(LocalClientCommand::History { site: _, mac, limit }) => {
+        LocalCommands::Client(LocalClientCommand::History {
+            site: _,
+            mac,
+            limit,
+        }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(
                 &effective.url,
@@ -3578,7 +3586,11 @@ fn handle_correlate_command(
     use serde_json::json;
 
     match cmd {
-        CorrelateCommand::Client { mac, site: _, include_events } => {
+        CorrelateCommand::Client {
+            mac,
+            site: _,
+            include_events,
+        } => {
             let mut correlated = json!({
                 "correlation_type": "client",
                 "mac": mac,
@@ -3589,9 +3601,9 @@ fn handle_correlate_command(
             let clients = client.list_clients()?;
             if let Some(ref json) = clients.json {
                 if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                    let client_data = arr.iter().find(|c| {
-                        c.get("mac").and_then(|m| m.as_str()) == Some(mac)
-                    });
+                    let client_data = arr
+                        .iter()
+                        .find(|c| c.get("mac").and_then(|m| m.as_str()) == Some(mac));
                     correlated["client"] = client_data.cloned().unwrap_or(json!(null));
                 }
             }
@@ -3601,9 +3613,9 @@ fn handle_correlate_command(
                 let devices = client.list_devices()?;
                 if let Some(ref json) = devices.json {
                     if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                        let ap_data = arr.iter().find(|d| {
-                            d.get("mac").and_then(|m| m.as_str()) == Some(ap_mac)
-                        });
+                        let ap_data = arr
+                            .iter()
+                            .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(ap_mac));
                         correlated["connected_ap"] = ap_data.cloned().unwrap_or(json!(null));
                     }
                 }
@@ -3614,10 +3626,11 @@ fn handle_correlate_command(
                 if let Ok(events_resp) = client.list_events() {
                     if let Some(ref json) = events_resp.json {
                         if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                            let client_events: Vec<_> = arr.iter()
+                            let client_events: Vec<_> = arr
+                                .iter()
                                 .filter(|e| {
-                                    e.get("user").and_then(|u| u.as_str()) == Some(mac) ||
-                                    e.get("client_mac").and_then(|m| m.as_str()) == Some(mac)
+                                    e.get("user").and_then(|u| u.as_str()) == Some(mac)
+                                        || e.get("client_mac").and_then(|m| m.as_str()) == Some(mac)
                                 })
                                 .take(20)
                                 .cloned()
@@ -3648,7 +3661,11 @@ fn handle_correlate_command(
                 None,
             )
         }
-        CorrelateCommand::Device { mac, site: _, include_clients } => {
+        CorrelateCommand::Device {
+            mac,
+            site: _,
+            include_clients,
+        } => {
             let mut correlated = json!({
                 "correlation_type": "device",
                 "mac": mac,
@@ -3659,9 +3676,9 @@ fn handle_correlate_command(
             let devices = client.list_devices()?;
             if let Some(ref json) = devices.json {
                 if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                    let device_data = arr.iter().find(|d| {
-                        d.get("mac").and_then(|m| m.as_str()) == Some(mac)
-                    });
+                    let device_data = arr
+                        .iter()
+                        .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(mac));
                     correlated["device"] = device_data.cloned().unwrap_or(json!(null));
                 }
             }
@@ -3671,10 +3688,11 @@ fn handle_correlate_command(
                 let clients = client.list_clients()?;
                 if let Some(ref json) = clients.json {
                     if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                        let connected_clients: Vec<_> = arr.iter()
+                        let connected_clients: Vec<_> = arr
+                            .iter()
                             .filter(|c| {
-                                c.get("ap_mac").and_then(|m| m.as_str()) == Some(mac) ||
-                                c.get("sw_mac").and_then(|m| m.as_str()) == Some(mac)
+                                c.get("ap_mac").and_then(|m| m.as_str()) == Some(mac)
+                                    || c.get("sw_mac").and_then(|m| m.as_str()) == Some(mac)
                             })
                             .cloned()
                             .collect();
@@ -3769,7 +3787,9 @@ fn handle_diagnose_command(
 
             // Device check
             if let Ok(devices) = client.list_devices() {
-                let device_count = devices.json.as_ref()
+                let device_count = devices
+                    .json
+                    .as_ref()
                     .and_then(|j| j.get("data"))
                     .and_then(|d| d.as_array())
                     .map(|a| a.len())
@@ -3814,14 +3834,17 @@ fn handle_diagnose_command(
             if let Ok(devices) = client.list_devices() {
                 if let Some(ref json) = devices.json {
                     if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                        let aps: Vec<_> = arr.iter()
+                        let aps: Vec<_> = arr
+                            .iter()
                             .filter(|d| d.get("type").and_then(|t| t.as_str()) == Some("uap"))
-                            .map(|d| json!({
-                                "mac": d.get("mac"),
-                                "name": d.get("name"),
-                                "state": d.get("state"),
-                                "num_sta": d.get("num_sta"),
-                            }))
+                            .map(|d| {
+                                json!({
+                                    "mac": d.get("mac"),
+                                    "name": d.get("name"),
+                                    "state": d.get("state"),
+                                    "num_sta": d.get("num_sta"),
+                                })
+                            })
                             .collect();
                         diagnostics["access_points"] = json!(aps);
                         diagnostics["ap_count"] = json!(aps.len());
@@ -3869,7 +3892,12 @@ fn handle_diagnose_command(
 
                 if let Some(ref json) = clients.json {
                     if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                        let wireless_count = arr.iter().filter(|c| !c.get("is_wired").and_then(|w| w.as_bool()).unwrap_or(false)).count();
+                        let wireless_count = arr
+                            .iter()
+                            .filter(|c| {
+                                !c.get("is_wired").and_then(|w| w.as_bool()).unwrap_or(false)
+                            })
+                            .count();
                         let wired_count = arr.len() - wireless_count;
 
                         diagnostics["total_clients"] = json!(arr.len());
@@ -3902,7 +3930,12 @@ fn handle_timeseries_command(
     use serde_json::json;
 
     match cmd {
-        TimeSeriesCommand::Traffic { start, end, site: _, format } => {
+        TimeSeriesCommand::Traffic {
+            start,
+            end,
+            site: _,
+            format,
+        } => {
             let query = json!({
                 "start": start,
                 "end": end,
@@ -3918,7 +3951,13 @@ fn handle_timeseries_command(
             }
             Ok(())
         }
-        TimeSeriesCommand::Wifi { start, end, ap_mac, site: _, format } => {
+        TimeSeriesCommand::Wifi {
+            start,
+            end,
+            ap_mac,
+            site: _,
+            format,
+        } => {
             let query = json!({
                 "startTime": start,
                 "endTime": end,
@@ -3933,13 +3972,20 @@ fn handle_timeseries_command(
             }
             Ok(())
         }
-        TimeSeriesCommand::Events { limit, site: _, format } => {
+        TimeSeriesCommand::Events {
+            limit,
+            site: _,
+            format,
+        } => {
             let events = client.list_events()?;
 
             if format == "csv" {
                 let mut limited_events = events.json.clone().unwrap_or(json!({"data": []}));
                 if let Some(limit) = limit {
-                    if let Some(arr) = limited_events.get_mut("data").and_then(|d| d.as_array_mut()) {
+                    if let Some(arr) = limited_events
+                        .get_mut("data")
+                        .and_then(|d| d.as_array_mut())
+                    {
                         arr.truncate(*limit);
                     }
                 }
@@ -3964,9 +4010,18 @@ fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()>
             if let Some(arr) = data.as_array() {
                 for item in arr {
                     wtr.write_record(&[
-                        item.get("time").and_then(|t| t.as_u64()).map(|t| t.to_string()).unwrap_or_default(),
-                        item.get("rx_bytes").and_then(|r| r.as_u64()).map(|r| r.to_string()).unwrap_or_default(),
-                        item.get("tx_bytes").and_then(|t| t.as_u64()).map(|t| t.to_string()).unwrap_or_default(),
+                        item.get("time")
+                            .and_then(|t| t.as_u64())
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                        item.get("rx_bytes")
+                            .and_then(|r| r.as_u64())
+                            .map(|r| r.to_string())
+                            .unwrap_or_default(),
+                        item.get("tx_bytes")
+                            .and_then(|t| t.as_u64())
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
                     ])?;
                 }
             }
@@ -3976,11 +4031,26 @@ fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()>
             if let Some(arr) = data.as_array() {
                 for item in arr {
                     wtr.write_record(&[
-                        item.get("time").and_then(|t| t.as_u64()).map(|t| t.to_string()).unwrap_or_default(),
-                        item.get("ap_mac").and_then(|m| m.as_str()).unwrap_or("").to_string(),
-                        item.get("channel").and_then(|c| c.as_u64()).map(|c| c.to_string()).unwrap_or_default(),
-                        item.get("num_sta").and_then(|n| n.as_u64()).map(|n| n.to_string()).unwrap_or_default(),
-                        item.get("satisfaction").and_then(|s| s.as_f64()).map(|s| s.to_string()).unwrap_or_default(),
+                        item.get("time")
+                            .and_then(|t| t.as_u64())
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                        item.get("ap_mac")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        item.get("channel")
+                            .and_then(|c| c.as_u64())
+                            .map(|c| c.to_string())
+                            .unwrap_or_default(),
+                        item.get("num_sta")
+                            .and_then(|n| n.as_u64())
+                            .map(|n| n.to_string())
+                            .unwrap_or_default(),
+                        item.get("satisfaction")
+                            .and_then(|s| s.as_f64())
+                            .map(|s| s.to_string())
+                            .unwrap_or_default(),
                     ])?;
                 }
             }
@@ -3991,11 +4061,26 @@ fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()>
                 if let Some(arr) = obj.get("data").and_then(|d| d.as_array()) {
                     for item in arr {
                         wtr.write_record(&[
-                            item.get("time").and_then(|t| t.as_u64()).map(|t| t.to_string()).unwrap_or_default(),
-                            item.get("datetime").and_then(|d| d.as_str()).unwrap_or("").to_string(),
-                            item.get("key").and_then(|k| k.as_str()).unwrap_or("").to_string(),
-                            item.get("msg").and_then(|m| m.as_str()).unwrap_or("").to_string(),
-                            item.get("subsystem").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            item.get("time")
+                                .and_then(|t| t.as_u64())
+                                .map(|t| t.to_string())
+                                .unwrap_or_default(),
+                            item.get("datetime")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            item.get("key")
+                                .and_then(|k| k.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            item.get("msg")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            item.get("subsystem")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                         ])?;
                     }
                 }
@@ -4475,10 +4560,11 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
             }
 
             llm_output["data_samples"] = json!(samples);
-            llm_output["llm_metadata"]["truncation_note"] = json!(
-                format!("Original response had {} items. Showing {} representative samples. Use --limit flag to control output size.",
-                    arr.len(), samples.len())
-            );
+            llm_output["llm_metadata"]["truncation_note"] = json!(format!(
+                "Original response had {} items. Showing {} representative samples. Use --limit flag to control output size.",
+                arr.len(),
+                samples.len()
+            ));
         } else {
             // For objects, include the whole thing but warn about size
             llm_output["data"] = data.clone();
@@ -4495,7 +4581,8 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
     if let serde_json::Value::Array(arr) = &data {
         if !arr.is_empty() {
             // Extract field statistics
-            let mut field_types: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            let mut field_types: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
 
             for item in arr.iter() {
                 if let serde_json::Value::Object(obj) = item {

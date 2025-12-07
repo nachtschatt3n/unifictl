@@ -240,7 +240,8 @@ impl SchemaRegistry {
         // Event endpoints
         self.register(EndpointSchema {
             name: "event.list".to_string(),
-            description: "List recent network events (connections, disconnections, alerts)".to_string(),
+            description: "List recent network events (connections, disconnections, alerts)"
+                .to_string(),
             fields: vec![
                 FieldMeta {
                     name: "_id".to_string(),
