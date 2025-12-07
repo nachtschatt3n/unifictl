@@ -104,16 +104,34 @@ unifictl local wlan delete <ID> --yes         # Skip confirmation
 
 unifictl local port-profiles
 unifictl local firewall-rules
-unifictl local firewall-rule create --name "Block WAN" --action drop --dst-group <ID>
-unifictl local firewall-rule update <ID> --action accept
-unifictl local firewall-rule delete <ID> --dry-run    # Preview deletion
-unifictl local firewall-rule delete <ID> --yes        # Skip confirmation
+unifictl local firewall-rule-create --name "Block WAN" --action drop --dst-group <ID>
+unifictl local firewall-rule-update <ID> --action accept
+unifictl local firewall-rule-delete <ID> --dry-run    # Preview deletion
+unifictl local firewall-rule-delete <ID> --yes        # Skip confirmation
 
 unifictl local firewall-groups
-unifictl local firewall-group create --name "BlockedIPs" --members 1.1.1.1,2.2.2.2
-unifictl local firewall-group update <ID> --members 3.3.3.3
-unifictl local firewall-group delete <ID> --dry-run   # Preview deletion
-unifictl local firewall-group delete <ID> --yes      # Skip confirmation
+unifictl local firewall-group-create --name "BlockedIPs" --members 1.1.1.1,2.2.2.2
+unifictl local firewall-group-update <ID> --members 3.3.3.3
+unifictl local firewall-group-delete <ID> --dry-run   # Preview deletion
+unifictl local firewall-group-delete <ID> --yes      # Skip confirmation
+
+unifictl local policy-tables
+unifictl local policy-table-create --name "WAN-Failover" --description "Failover policy"
+unifictl local policy-table-update <ID> --name "WAN-Failover-Updated"
+unifictl local policy-table-delete <ID> --dry-run    # Preview deletion
+unifictl local policy-table-delete <ID> --yes        # Skip confirmation
+
+unifictl local zones
+unifictl local zone-create --name "DMZ" --description "DMZ zone"
+unifictl local zone-update <ID> --name "DMZ-Updated"
+unifictl local zone-delete <ID> --dry-run             # Preview deletion
+unifictl local zone-delete <ID> --yes                # Skip confirmation
+
+unifictl local objects
+unifictl local object-create --name "WebServer" --type address --value 192.168.1.10
+unifictl local object-update <ID> --value 192.168.1.11
+unifictl local object-delete <ID> --dry-run          # Preview deletion
+unifictl local object-delete <ID> --yes              # Skip confirmation
 
 unifictl local security            # controller security settings (JSON-heavy; use -o json)
 unifictl local dpi                 # DPI summary
@@ -129,6 +147,9 @@ unifictl local network delete <ID> --dry-run
 unifictl local wlan delete <ID> --dry-run
 unifictl local firewall-rule delete <ID> --dry-run
 unifictl local firewall-group delete <ID> --dry-run
+unifictl local policy-table delete <ID> --dry-run
+unifictl local zone delete <ID> --dry-run
+unifictl local object delete <ID> --dry-run
 
 # Interactive confirmations (default for delete operations)
 unifictl local network delete <ID>              # Prompts: "Are you sure? [y/N]"
@@ -141,6 +162,10 @@ Export and reporting:
 unifictl local networks -o json
 unifictl local wlans -o json
 unifictl local firewall-rules -o json
+unifictl local firewall-groups -o json
+unifictl local policy-tables -o json
+unifictl local zones -o json
+unifictl local objects -o json
 
 # CSV output for spreadsheets/reporting
 unifictl local clients -o csv > clients.csv

@@ -202,6 +202,58 @@ impl LocalClient {
         self.delete(true, &format!("rest/firewallgroup/{id}"))
     }
 
+    pub fn policy_tables(&mut self) -> Result<ResponseData> {
+        self.get(true, true, "rest/routing", Option::<&()>::None)
+    }
+
+    pub fn create_policy_table(&mut self, payload: &serde_json::Value) -> Result<ResponseData> {
+        self.post(true, "rest/routing", Some(payload))
+    }
+
+    pub fn update_policy_table(
+        &mut self,
+        id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<ResponseData> {
+        self.put(true, &format!("rest/routing/{id}"), Some(payload))
+    }
+
+    pub fn delete_policy_table(&mut self, id: &str) -> Result<ResponseData> {
+        self.delete(true, &format!("rest/routing/{id}"))
+    }
+
+    pub fn zones(&mut self) -> Result<ResponseData> {
+        self.get(true, true, "rest/zone", Option::<&()>::None)
+    }
+
+    pub fn create_zone(&mut self, payload: &serde_json::Value) -> Result<ResponseData> {
+        self.post(true, "rest/zone", Some(payload))
+    }
+
+    pub fn update_zone(&mut self, id: &str, payload: &serde_json::Value) -> Result<ResponseData> {
+        self.put(true, &format!("rest/zone/{id}"), Some(payload))
+    }
+
+    pub fn delete_zone(&mut self, id: &str) -> Result<ResponseData> {
+        self.delete(true, &format!("rest/zone/{id}"))
+    }
+
+    pub fn objects(&mut self) -> Result<ResponseData> {
+        self.get(true, true, "rest/object", Option::<&()>::None)
+    }
+
+    pub fn create_object(&mut self, payload: &serde_json::Value) -> Result<ResponseData> {
+        self.post(true, "rest/object", Some(payload))
+    }
+
+    pub fn update_object(&mut self, id: &str, payload: &serde_json::Value) -> Result<ResponseData> {
+        self.put(true, &format!("rest/object/{id}"), Some(payload))
+    }
+
+    pub fn delete_object(&mut self, id: &str) -> Result<ResponseData> {
+        self.delete(true, &format!("rest/object/{id}"))
+    }
+
     fn get<Q: Serialize + ?Sized>(
         &mut self,
         site_scoped: bool,
@@ -533,6 +585,15 @@ impl LocalClient {
         if path.contains("firewallgroup") {
             return "\n\nPossible causes for firewall group operations:\n  • Invalid group type\n  • Invalid member addresses\n  • Duplicate group name\n\nCheck existing groups:\n  unifictl local firewall-groups -o json";
         }
+        if path.contains("routing") {
+            return "\n\nPossible causes for policy table operations:\n  • Invalid policy table name\n  • Conflicting routing rules\n  • Invalid rule configuration\n\nCheck existing policy tables:\n  unifictl local policy-tables -o json";
+        }
+        if path.contains("zone") {
+            return "\n\nPossible causes for zone operations:\n  • Invalid zone name\n  • Conflicting zone configuration\n  • Invalid interface assignment\n\nCheck existing zones:\n  unifictl local zones -o json";
+        }
+        if path.contains("object") {
+            return "\n\nPossible causes for object operations:\n  • Invalid object name\n  • Invalid object type (address/service)\n  • Invalid object value\n\nCheck existing objects:\n  unifictl local objects -o json";
+        }
         ""
     }
 
@@ -545,6 +606,12 @@ impl LocalClient {
             "firewall-rules"
         } else if path.contains("firewallgroup") {
             "firewall-groups"
+        } else if path.contains("routing") {
+            "policy-tables"
+        } else if path.contains("zone") {
+            "zones"
+        } else if path.contains("object") {
+            "objects"
         } else if path.contains("device") {
             "devices"
         } else if path.contains("sta") {

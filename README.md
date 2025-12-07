@@ -60,11 +60,14 @@ unifictl local clients [--site <SITE>] [--wired|--wireless|--blocked]
 unifictl local client <MAC> --block|--unblock|--reconnect
 unifictl local health [--site <SITE>]
 unifictl local events [--site <SITE>]
-unifictl local networks|wlans|port-profiles|firewall-rules|firewall-groups
-unifictl local network create|update|delete [--dry-run] [--yes]
-unifictl local wlan create|update|delete [--dry-run] [--yes]
-unifictl local firewall-rule create|update|delete [--dry-run] [--yes]
-unifictl local firewall-group create|update|delete [--dry-run] [--yes]
+unifictl local networks|wlans|port-profiles|firewall-rules|firewall-groups|policy-tables|zones|objects
+unifictl local network-create|network-update|network-delete [--dry-run] [--yes]
+unifictl local wlan-create|wlan-update|wlan-delete [--dry-run] [--yes]
+unifictl local firewall-rule-create|firewall-rule-update|firewall-rule-delete [--dry-run] [--yes]
+unifictl local firewall-group-create|firewall-group-update|firewall-group-delete [--dry-run] [--yes]
+unifictl local policy-table-create|policy-table-update|policy-table-delete [--dry-run] [--yes]
+unifictl local zone-create|zone-update|zone-delete [--dry-run] [--yes]
+unifictl local object-create|object-update|object-delete [--dry-run] [--yes]
 unifictl local top-clients [--limit N]
 unifictl local top-devices [--limit N]
 unifictl local dpi

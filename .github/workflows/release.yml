@@ -111,14 +111,44 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fakeroot binutils zstd
 
-      - name: Build release binary
+      - name: Install cross-compilation dependencies
+        if: matrix.arch == 'aarch64'
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            pkg-config-aarch64-linux-gnu
+
+      - name: Build release binary (x86_64)
+        if: matrix.arch == 'x86_64'
+        run: |
+          cargo build --release --target ${{ matrix.target }} --verbose
           strip target/${{ matrix.target }}/release/unifictl || true
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
           OPENSSL_STATIC: 1
           OPENSSL_VENDORED: 1
+
+      - name: Build release binary (aarch64)
+        if: matrix.arch == 'aarch64'
+        run: |
+          # Use single job to avoid OpenSSL make jobserver issues
+          CARGO_BUILD_JOBS=1 cargo build --release --target ${{ matrix.target }} --verbose
+          strip target/${{ matrix.target }}/release/unifictl || true
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDORED: 1
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_ALLOW_CROSS: 1
+          # Force single-threaded OpenSSL build
+          OPENSSL_BUILD_JOBS: 1
+          MAKEFLAGS: "-j1"
 
       - name: Determine version
         id: version

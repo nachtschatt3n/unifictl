@@ -553,6 +553,116 @@ enum LocalCommands {
         #[arg(long)]
         site: Option<String>,
     },
+    /// List policy tables (routing policies)
+    PolicyTables {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Create a policy table
+    PolicyTableCreate {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_name = "DESCRIPTION")]
+        description: Option<String>,
+    },
+    /// Update a policy table by ID
+    PolicyTableUpdate {
+        #[arg(value_name = "TABLE_ID")]
+        id: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_name = "DESCRIPTION")]
+        description: Option<String>,
+    },
+    /// Delete a policy table by ID
+    PolicyTableDelete {
+        #[arg(value_name = "TABLE_ID")]
+        id: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+    /// List zones
+    Zones {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Create a zone
+    ZoneCreate {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_name = "DESCRIPTION")]
+        description: Option<String>,
+    },
+    /// Update a zone by ID
+    ZoneUpdate {
+        #[arg(value_name = "ZONE_ID")]
+        id: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_name = "DESCRIPTION")]
+        description: Option<String>,
+    },
+    /// Delete a zone by ID
+    ZoneDelete {
+        #[arg(value_name = "ZONE_ID")]
+        id: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+    /// List objects (address/service objects)
+    Objects {
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Create an object
+    ObjectCreate {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_name = "TYPE", default_value = "address")]
+        object_type: String,
+        #[arg(long, value_name = "VALUE")]
+        value: Option<String>,
+    },
+    /// Update an object by ID
+    ObjectUpdate {
+        #[arg(value_name = "OBJECT_ID")]
+        id: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_name = "VALUE")]
+        value: Option<String>,
+    },
+    /// Delete an object by ID
+    ObjectDelete {
+        #[arg(value_name = "OBJECT_ID")]
+        id: String,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -1999,6 +2109,399 @@ fn handle_local(
                 Some(&["ip", "mac", "bytes", "duration"]),
                 watch,
             )
+        }
+        LocalCommands::PolicyTables { site } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.policy_tables(),
+                output,
+                render_opts,
+                Some(&["name", "description", "enabled", "rules"]),
+                watch,
+            )
+        }
+        LocalCommands::PolicyTableCreate {
+            site,
+            name,
+            description,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mut payload = serde_json::Map::new();
+            payload.insert("name".into(), json!(name));
+            payload.insert("enabled".into(), json!(true));
+            if let Some(desc) = description {
+                payload.insert("description".into(), json!(desc));
+            }
+            render_response(
+                client.create_policy_table(&serde_json::Value::Object(payload))?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::PolicyTableUpdate {
+            id,
+            site,
+            name,
+            description,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mut payload = serde_json::Map::new();
+            if let Some(name) = name {
+                payload.insert("name".into(), json!(name));
+            }
+            if let Some(desc) = description {
+                payload.insert("description".into(), json!(desc));
+            }
+            if payload.is_empty() {
+                return Err(anyhow!("Provide at least one field to update"));
+            }
+            render_response(
+                client.update_policy_table(&id, &serde_json::Value::Object(payload))?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::PolicyTableDelete {
+            id,
+            site,
+            dry_run,
+            yes,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            if dry_run {
+                let tables = client.policy_tables()?;
+                if let Some(json) = tables.json {
+                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                        if let Some(table) = data.iter().find(|t| {
+                            t.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                || t.get("id").and_then(|id| id.as_str()) == Some(&id)
+                        }) {
+                            println!("Would delete policy table:");
+                            println!("{}", serde_json::to_string_pretty(table)?);
+                            return Ok(());
+                        }
+                    }
+                }
+                println!("Would delete policy table with ID: {}", id);
+                println!("(Policy table details not found - may already be deleted)");
+                Ok(())
+            } else {
+                let tables = client.policy_tables()?;
+                let table_name: Option<String> = if let Some(ref json) = tables.json {
+                    json.get("data")
+                        .and_then(|d| d.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find(|t| {
+                                t.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                    || t.get("id").and_then(|id| id.as_str()) == Some(&id)
+                            })
+                        })
+                        .and_then(|t| t.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+
+                if !confirm_deletion("policy table", &id, table_name.as_deref(), yes)? {
+                    println!("Deletion cancelled.");
+                    return Ok(());
+                }
+                render_response(
+                    client.delete_policy_table(&id)?,
+                    output,
+                    render_opts,
+                    None,
+                )
+            }
+        }
+        LocalCommands::Zones { site } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.zones(),
+                output,
+                render_opts,
+                Some(&["name", "description", "enabled", "interfaces"]),
+                watch,
+            )
+        }
+        LocalCommands::ZoneCreate {
+            site,
+            name,
+            description,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mut payload = serde_json::Map::new();
+            payload.insert("name".into(), json!(name));
+            payload.insert("enabled".into(), json!(true));
+            if let Some(desc) = description {
+                payload.insert("description".into(), json!(desc));
+            }
+            render_response(
+                client.create_zone(&serde_json::Value::Object(payload))?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::ZoneUpdate {
+            id,
+            site,
+            name,
+            description,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mut payload = serde_json::Map::new();
+            if let Some(name) = name {
+                payload.insert("name".into(), json!(name));
+            }
+            if let Some(desc) = description {
+                payload.insert("description".into(), json!(desc));
+            }
+            if payload.is_empty() {
+                return Err(anyhow!("Provide at least one field to update"));
+            }
+            render_response(
+                client.update_zone(&id, &serde_json::Value::Object(payload))?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::ZoneDelete {
+            id,
+            site,
+            dry_run,
+            yes,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            if dry_run {
+                let zones = client.zones()?;
+                if let Some(json) = zones.json {
+                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                        if let Some(zone) = data.iter().find(|z| {
+                            z.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                || z.get("id").and_then(|id| id.as_str()) == Some(&id)
+                        }) {
+                            println!("Would delete zone:");
+                            println!("{}", serde_json::to_string_pretty(zone)?);
+                            return Ok(());
+                        }
+                    }
+                }
+                println!("Would delete zone with ID: {}", id);
+                println!("(Zone details not found - may already be deleted)");
+                Ok(())
+            } else {
+                let zones = client.zones()?;
+                let zone_name: Option<String> = if let Some(ref json) = zones.json {
+                    json.get("data")
+                        .and_then(|d| d.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find(|z| {
+                                z.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                    || z.get("id").and_then(|id| id.as_str()) == Some(&id)
+                            })
+                        })
+                        .and_then(|z| z.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+
+                if !confirm_deletion("zone", &id, zone_name.as_deref(), yes)? {
+                    println!("Deletion cancelled.");
+                    return Ok(());
+                }
+                render_response(client.delete_zone(&id)?, output, render_opts, None)
+            }
+        }
+        LocalCommands::Objects { site } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || client.objects(),
+                output,
+                render_opts,
+                Some(&["name", "type", "value", "description"]),
+                watch,
+            )
+        }
+        LocalCommands::ObjectCreate {
+            site,
+            name,
+            object_type,
+            value,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mut payload = serde_json::Map::new();
+            payload.insert("name".into(), json!(name));
+            payload.insert("type".into(), json!(object_type));
+            if let Some(val) = value {
+                payload.insert("value".into(), json!(val));
+            }
+            render_response(
+                client.create_object(&serde_json::Value::Object(payload))?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::ObjectUpdate {
+            id,
+            site,
+            name,
+            value,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mut payload = serde_json::Map::new();
+            if let Some(name) = name {
+                payload.insert("name".into(), json!(name));
+            }
+            if let Some(val) = value {
+                payload.insert("value".into(), json!(val));
+            }
+            if payload.is_empty() {
+                return Err(anyhow!("Provide at least one field to update"));
+            }
+            render_response(
+                client.update_object(&id, &serde_json::Value::Object(payload))?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::ObjectDelete {
+            id,
+            site,
+            dry_run,
+            yes,
+        } => {
+            let effective = resolve_local(cwd, site_override(site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            if dry_run {
+                let objects = client.objects()?;
+                if let Some(json) = objects.json {
+                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                        if let Some(obj) = data.iter().find(|o| {
+                            o.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                || o.get("id").and_then(|id| id.as_str()) == Some(&id)
+                        }) {
+                            println!("Would delete object:");
+                            println!("{}", serde_json::to_string_pretty(obj)?);
+                            return Ok(());
+                        }
+                    }
+                }
+                println!("Would delete object with ID: {}", id);
+                println!("(Object details not found - may already be deleted)");
+                Ok(())
+            } else {
+                let objects = client.objects()?;
+                let object_name: Option<String> = if let Some(ref json) = objects.json {
+                    json.get("data")
+                        .and_then(|d| d.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find(|o| {
+                                o.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                                    || o.get("id").and_then(|id| id.as_str()) == Some(&id)
+                            })
+                        })
+                        .and_then(|o| o.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+
+                if !confirm_deletion("object", &id, object_name.as_deref(), yes)? {
+                    println!("Deletion cancelled.");
+                    return Ok(());
+                }
+                render_response(client.delete_object(&id)?, output, render_opts, None)
+            }
         }
     }
 }
