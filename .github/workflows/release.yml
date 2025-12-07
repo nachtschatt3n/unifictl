@@ -48,6 +48,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross-compilation dependencies
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:aarch64
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -64,7 +70,13 @@ jobs:
 
       - name: Build release binary
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+          fi
+          cargo build --release --target ${{ matrix.target }} --features vendored-openssl || cargo build --release --target ${{ matrix.target }}
           strip target/${{ matrix.target }}/release/unifictl || true
 
       - name: Create release archive
@@ -115,12 +127,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fakeroot binutils zstd
 
+      - name: Install cross-compilation dependencies
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
+
       - name: Build release binary
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+          fi
+          cargo build --release --target ${{ matrix.target }} --features vendored-openssl || cargo build --release --target ${{ matrix.target }}
           strip target/${{ matrix.target }}/release/unifictl || true
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDORED: 1
 
       - name: Determine version
         id: version

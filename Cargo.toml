@@ -7,6 +7,9 @@ license = "GPL-3.0"
 repository = "https://github.com/nachtschatt3n/unifictl"
 homepage = "https://github.com/nachtschatt3n/unifictl"
 authors = ["Mathias Uhl <mathiasuhl@gmx.de>"]
+keywords = ["unifi", "ubiquiti", "cli", "network", "api", "site-manager"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.93"
@@ -15,7 +18,7 @@ clap_complete = "4.5.18"
 serde_path_to_error = "0.1.16"
 serde_with = "3.9.0"
 dirs = "5.0.1"
-reqwest = { version = "0.12.9", features = ["blocking", "json", "cookies"] }
+reqwest = { version = "0.12.9", features = ["blocking", "json", "cookies", "native-tls-vendored"] }
 serde = { version = "1.0.216", features = ["derive"] }
 serde_json = "1.0.132"
 serde_yaml = "0.9.34"
