@@ -1,0 +1,27 @@
+# Ignore files that shouldn't be included in the published crate
+# Note: cargo package respects .gitignore by default
+# This file adds additional exclusions
+
+# CI/CD and packaging files
+.github/
+packaging/
+*.pkg.tar.zst
+*.tar.gz
+*.zip
+
+# Build artifacts
+target/
+
+# Documentation (keep README.md)
+*.md
+!README.md
+
+# Development files
+.git/
+.gitignore
+Makefile
+publish-crate.sh
+CRATES_IO_PUBLISH.md
+
+# Tests (not needed in published crate)
+tests/

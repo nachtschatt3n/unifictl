@@ -28,20 +28,28 @@ Runs extensive testing:
 
 ### `release.yml` - Build and Release
 **Triggers:** 
-- Push of version tags (e.g., `v0.3.0`)
+- Push of version tags (e.g., `v0.4.0`)
 - Manual workflow dispatch
 
-Builds release binaries for multiple platforms:
-- **Linux**: x86_64, aarch64
-- **macOS**: x86_64, aarch64 (Apple Silicon)
-- **Windows**: x86_64
+**Jobs:**
+1. **build-release**: Builds release binaries for multiple platforms:
+   - **Linux**: x86_64, aarch64
+   - **macOS**: x86_64, aarch64 (Apple Silicon)
+2. **build-arch-packages**: Builds Arch Linux packages (.pkg.tar.zst)
+3. **publish-crates-io**: Automatically publishes to crates.io (requires `CRATES_IO_TOKEN` secret)
+4. **create-release**: Creates GitHub Release with artifacts
 
 **Outputs:**
-- Release archives (`.tar.gz` for Unix, `.zip` for Windows)
+- Release archives (`.tar.gz` for Unix)
+- Arch Linux packages (`.pkg.tar.zst`)
 - Checksums file (`checksums.txt`)
 - GitHub Release with download links
+- Published to crates.io
 
 **Duration:** ~30-45 minutes
+
+**Required Secrets:**
+- `CRATES_IO_TOKEN`: crates.io API token for automated publishing (get from https://crates.io/me)
 
 ## Usage
 
