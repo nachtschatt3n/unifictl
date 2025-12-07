@@ -250,6 +250,247 @@ enum SdwanCommand {
 }
 
 #[derive(Subcommand)]
+enum NetworkCommand {
+    /// List networks (VLANs)
+    List,
+    /// Create a network
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        vlan: Option<u16>,
+        #[arg(long, value_name = "CIDR")]
+        subnet: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dhcp: bool,
+    },
+    /// Update a network by ID
+    Update {
+        #[arg(value_name = "NETWORK_ID")]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        vlan: Option<u16>,
+        #[arg(long, value_name = "CIDR")]
+        subnet: Option<String>,
+        #[arg(long)]
+        dhcp: Option<bool>,
+    },
+    /// Delete a network by ID
+    Delete {
+        #[arg(value_name = "NETWORK_ID")]
+        id: String,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WlanCommand {
+    /// List WLANs (SSIDs)
+    List,
+    /// Create a WLAN
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long, default_value = "wpa2")]
+        security: String,
+        #[arg(long, default_value_t = true)]
+        enabled: bool,
+    },
+    /// Update a WLAN by ID
+    Update {
+        #[arg(value_name = "WLAN_ID")]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Delete a WLAN by ID
+    Delete {
+        #[arg(value_name = "WLAN_ID")]
+        id: String,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum FirewallRuleCommand {
+    /// List firewall rules
+    List,
+    /// Create a firewall rule
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        action: String,
+        #[arg(long, default_value_t = true)]
+        enabled: bool,
+    },
+    /// Update a firewall rule by ID
+    Update {
+        #[arg(value_name = "RULE_ID")]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        action: Option<String>,
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Delete a firewall rule by ID
+    Delete {
+        #[arg(value_name = "RULE_ID")]
+        id: String,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum FirewallGroupCommand {
+    /// List firewall groups
+    List,
+    /// Create a firewall group
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "address-group")]
+        group_type: String,
+    },
+    /// Update a firewall group by ID
+    Update {
+        #[arg(value_name = "GROUP_ID")]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Delete a firewall group by ID
+    Delete {
+        #[arg(value_name = "GROUP_ID")]
+        id: String,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyTableCommand {
+    /// List policy tables (routing policies)
+    List,
+    /// Create a policy table
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Update a policy table by ID
+    Update {
+        #[arg(value_name = "TABLE_ID")]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Delete a policy table by ID
+    Delete {
+        #[arg(value_name = "TABLE_ID")]
+        id: String,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZoneCommand {
+    /// List zones
+    List,
+    /// Create a zone
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Update a zone by ID
+    Update {
+        #[arg(value_name = "ZONE_ID")]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Delete a zone by ID
+    Delete {
+        #[arg(value_name = "ZONE_ID")]
+        id: String,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ObjectCommand {
+    /// List objects (address/service objects)
+    List,
+    /// Create an object
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "address")]
+        object_type: String,
+        #[arg(long)]
+        value: Option<String>,
+    },
+    /// Update an object by ID
+    Update {
+        #[arg(value_name = "OBJECT_ID")]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        value: Option<String>,
+    },
+    /// Delete an object by ID
+    Delete {
+        #[arg(value_name = "OBJECT_ID")]
+        id: String,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PortProfileCommand {
+    /// List port profiles
+    List,
+}
+
+#[derive(Subcommand)]
 enum LocalCommands {
     /// Store local controller credentials (password is saved to the chosen scope)
     Configure {

@@ -67,7 +67,8 @@ jobs:
           cargo build --release --target ${{ matrix.target }}
           strip target/${{ matrix.target }}/release/unifictl || true
 
-      - name: Create release archive
+      - name: Create release archive (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
@@ -76,18 +77,25 @@ jobs:
           fi
           
           mkdir -p release
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp target/${{ matrix.target }}/release/unifictl.exe release/unifictl.exe
-            cp README.md LICENSE release/
-            cd release
-            powershell Compress-Archive -Path * -DestinationPath ../${{ matrix.asset_name }}
-            cd ..
-          else
-            cp target/${{ matrix.target }}/release/unifictl release/
-            cp README.md LICENSE release/
-            tar czf ${{ matrix.asset_name }} -C release .
-          fi
+          cp target/${{ matrix.target }}/release/unifictl release/
+          cp README.md LICENSE release/
+          tar czf ${{ matrix.asset_name }} -C release .
           rm -rf release
+
+      - name: Create release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ github.ref }}".Replace("refs/tags/", "")
+          if ([string]::IsNullOrEmpty($VERSION)) {
+            $VERSION = "${{ github.event.inputs.version }}"
+          }
+          
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/unifictl.exe" "release/unifictl.exe"
+          Copy-Item README.md LICENSE release/
+          Compress-Archive -Path release/* -DestinationPath "${{ matrix.asset_name }}" -Force
+          Remove-Item -Recurse -Force release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -128,8 +136,7 @@ jobs:
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-            pkg-config-aarch64-linux-gnu
+            libc6-dev-arm64-cross
 
       - name: Build release binary (x86_64)
         if: matrix.arch == 'amd64'
@@ -219,8 +226,7 @@ jobs:
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-            pkg-config-aarch64-linux-gnu
+            libc6-dev-arm64-cross
 
       - name: Build release binary (x86_64)
         if: matrix.arch == 'x86_64'

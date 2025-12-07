@@ -223,7 +223,7 @@ impl LocalClient {
     }
 
     pub fn zones(&mut self) -> Result<ResponseData> {
-        self.get(true, true, "rest/zone", Option::<&()>::None)
+        self.get(true, false, "rest/zone", Option::<&()>::None)
     }
 
     pub fn create_zone(&mut self, payload: &serde_json::Value) -> Result<ResponseData> {
@@ -239,7 +239,7 @@ impl LocalClient {
     }
 
     pub fn objects(&mut self) -> Result<ResponseData> {
-        self.get(true, true, "rest/object", Option::<&()>::None)
+        self.get(true, false, "rest/object", Option::<&()>::None)
     }
 
     pub fn create_object(&mut self, payload: &serde_json::Value) -> Result<ResponseData> {
