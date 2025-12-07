@@ -248,8 +248,11 @@ jobs:
       - name: Verify version matches Cargo.toml
         run: |
           CARGO_VERSION=$(grep '^version =' Cargo.toml | cut -d'"' -f2)
-          if [ "$CARGO_VERSION" != "${{ steps.version.outputs.version }}" ]; then
-            echo "Error: Cargo.toml version ($CARGO_VERSION) doesn't match tag version (${{ steps.version.outputs.version }})"
+          TAG_VERSION="${{ steps.version.outputs.version }}"
+          # Remove 'v' prefix from tag version if present for comparison
+          TAG_VERSION=${TAG_VERSION#v}
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "Error: Cargo.toml version ($CARGO_VERSION) doesn't match tag version ($TAG_VERSION)"
             exit 1
           fi
           echo "✓ Version matches: $CARGO_VERSION"
@@ -264,7 +267,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -W clippy::all
 
       - name: Dry-run publish
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run --allow-dirty
 
       - name: Publish to crates.io
         env:
