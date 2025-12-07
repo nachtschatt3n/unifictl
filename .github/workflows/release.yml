@@ -93,7 +93,8 @@ jobs:
           
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/unifictl.exe" "release/unifictl.exe"
-          Copy-Item README.md LICENSE release/
+          Copy-Item README.md "release/"
+          Copy-Item LICENSE "release/"
           Compress-Archive -Path release/* -DestinationPath "${{ matrix.asset_name }}" -Force
           Remove-Item -Recurse -Force release
 
