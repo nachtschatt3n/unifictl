@@ -282,9 +282,9 @@ jobs:
 
   create-release:
     name: Create Release
-    needs: []
+    needs: [build-release, build-arch-packages]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
     
     steps:
       - name: Checkout code
@@ -294,10 +294,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.run_id }}
         continue-on-error: true
-        if: always()
 
       - name: Determine version
         id: version
@@ -378,7 +375,7 @@ jobs:
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.pkg.tar.zst
-            artifacts/checksums.txt
+            artifacts/**/checksums.txt
           draft: false
           prerelease: false
         env:
