@@ -117,6 +117,37 @@ All error messages include:
 - Troubleshooting steps
 - Recommended commands to investigate
 
+## Troubleshooting
+
+### UDM Rate Limiting
+
+If you encounter repeated login failures or authentication errors when using local controller commands, your UniFi Dream Machine (UDM) may be hitting the default rate limit for login attempts.
+
+**Symptoms:**
+- `Error: login failed at https://..../api/login: sending login request`
+- Commands fail intermittently with authentication errors
+- Some commands work while others fail
+
+**Solution:**
+
+SSH into your UDM and increase the login rate limit in `/usr/lib/ulp-go/config.props`:
+
+```bash
+# Edit the config file
+vi /usr/lib/ulp-go/config.props
+
+# Find and modify this line:
+success.login.limit.count=<higher_value>
+
+# Default is usually 5-10, increase to 50-100 for CLI tools
+# Example: success.login.limit.count=100
+
+# Restart the UniFi OS to apply changes
+systemctl restart unifi-os
+```
+
+**Note:** This setting controls how many successful logins are allowed within a time window. CLI tools like `unifictl` create new sessions for each command, which can quickly exceed the default limit during normal usage.
+
 ## Testing
 
 ```bash

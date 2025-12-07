@@ -2236,12 +2236,7 @@ fn handle_local(
                     println!("Deletion cancelled.");
                     return Ok(());
                 }
-                render_response(
-                    client.delete_policy_table(&id)?,
-                    output,
-                    render_opts,
-                    None,
-                )
+                render_response(client.delete_policy_table(&id)?, output, render_opts, None)
             }
         }
         LocalCommands::Zones { site } => {
