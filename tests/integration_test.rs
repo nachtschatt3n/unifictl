@@ -20,6 +20,9 @@ fn test_all_delete_commands_have_dry_run() {
         "wlan-delete",
         "firewall-rule-delete",
         "firewall-group-delete",
+        "policy-table-delete",
+        "zone-delete",
+        "object-delete",
     ];
 
     for cmd_name in commands {
