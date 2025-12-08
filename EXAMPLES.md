@@ -93,6 +93,7 @@ unifictl local client history --mac <MAC>    # Filter history by MAC address
 unifictl local client update-metadata <MAC> --metadata '{"name": "My Device"}'
 unifictl local event list
 unifictl local health get
+unifictl local vpn get                       # VPN health with packet-loss reasons
 unifictl local security get
 unifictl local wan get                       # WAN subset of health
 unifictl local dpi get

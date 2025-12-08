@@ -297,6 +297,23 @@ impl LocalClient {
         self.get(true, false, "stat/health", Option::<&()>::None)
     }
 
+    pub fn vpn_health(&mut self) -> Result<ResponseData> {
+        let mut resp = self.list_health()?;
+        if let Some(mut json) = resp.json.clone() {
+            if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                arr.retain(|item| {
+                    item.get("subsystem")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("vpn"))
+                        .unwrap_or(false)
+                });
+            }
+            resp.body = serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+            resp.json = Some(json);
+        }
+        Ok(resp)
+    }
+
     pub fn list_events(&mut self) -> Result<ResponseData> {
         self.get(true, false, "stat/event", Option::<&()>::None)
     }
@@ -735,7 +752,7 @@ impl LocalClient {
             }
 
             // Add context-specific guidance
-            msg.push_str(&Self::get_operation_guidance(path, operation));
+            msg.push_str(Self::get_operation_guidance(path, operation));
 
             return msg;
         }
@@ -1340,5 +1357,36 @@ mod tests {
         login.assert();
         ports.assert();
         assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn vpn_health_filters_and_calls_health() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let health = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/health");
+            then.status(200).json_body(json!({
+                "data": [
+                    { "subsystem": "vpn", "status": "error", "packet_loss": 0.5 },
+                    { "subsystem": "wan", "status": "ok" }
+                ]
+            }));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.vpn_health().unwrap();
+
+        login.assert();
+        health.assert();
+
+        let data = resp.json.unwrap()["data"].as_array().unwrap().clone();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["subsystem"], "vpn");
     }
 }

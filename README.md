@@ -206,6 +206,9 @@ unifictl local diagnose network -o llm
 
 # WiFi performance check
 unifictl local diagnose wifi
+
+# VPN health with packet loss reasons
+unifictl local vpn get -o json
 ```
 
 ### 📈 Bandwidth Analysis

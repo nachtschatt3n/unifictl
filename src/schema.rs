@@ -79,10 +79,6 @@ impl SchemaRegistry {
         self.schemas.get(endpoint)
     }
 
-    pub fn list_all(&self) -> Vec<&EndpointSchema> {
-        self.schemas.values().collect()
-    }
-
     fn register(&mut self, schema: EndpointSchema) {
         self.schemas.insert(schema.name.clone(), schema);
     }

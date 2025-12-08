@@ -22,7 +22,7 @@ mod schema;
 use crate::client::{ApiClient, ResponseData};
 use crate::config::{LocalConfig, Scope, resolve, resolve_local, save};
 use crate::local::LocalClient;
-use crate::schema::{SchemaRegistry, estimate_tokens};
+use crate::schema::{SchemaRegistry, estimate_tokens, summarize_response};
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use regex::RegexBuilder;
@@ -640,6 +640,9 @@ enum LocalCommands {
     /// Health operations
     #[command(subcommand)]
     Health(LocalHealthCommand),
+    /// VPN operations
+    #[command(subcommand)]
+    Vpn(LocalVpnCommand),
     /// Security operations
     #[command(subcommand)]
     Security(LocalSecurityCommand),
@@ -860,6 +863,15 @@ enum LocalEventCommand {
 #[derive(Subcommand)]
 enum LocalHealthCommand {
     /// Get health summaries
+    Get {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalVpnCommand {
+    /// Get VPN health (site-to-site, remote user)
     Get {
         #[arg(long)]
         site: Option<String>,
@@ -1553,28 +1565,26 @@ fn handle_local(
                         let adopted = device.get("adopted").and_then(|a| a.as_bool());
                         let is_unadopted = state == Some("pending") || adopted == Some(false);
 
-                        if is_unadopted {
-                            if let Some(mac) = device.get("mac").and_then(|m| m.as_str()) {
-                                match client.device_action(mac, "adopt") {
-                                    Ok(_) => {
-                                        adopted_count += 1;
-                                        if let Some(name) =
-                                            device.get("name").and_then(|n| n.as_str())
-                                        {
-                                            println!("Adopted: {} ({})", name, mac);
-                                        } else {
-                                            println!("Adopted device: {}", mac);
-                                        }
+                        if is_unadopted
+                            && let Some(mac) = device.get("mac").and_then(|m| m.as_str())
+                        {
+                            match client.device_action(mac, "adopt") {
+                                Ok(_) => {
+                                    adopted_count += 1;
+                                    if let Some(name) = device.get("name").and_then(|n| n.as_str())
+                                    {
+                                        println!("Adopted: {} ({})", name, mac);
+                                    } else {
+                                        println!("Adopted device: {}", mac);
                                     }
-                                    Err(e) => {
-                                        failed_count += 1;
-                                        if let Some(name) =
-                                            device.get("name").and_then(|n| n.as_str())
-                                        {
-                                            eprintln!("Failed to adopt {} ({}): {}", name, mac, e);
-                                        } else {
-                                            eprintln!("Failed to adopt device {}: {}", mac, e);
-                                        }
+                                }
+                                Err(e) => {
+                                    failed_count += 1;
+                                    if let Some(name) = device.get("name").and_then(|n| n.as_str())
+                                    {
+                                        eprintln!("Failed to adopt {} ({}): {}", name, mac, e);
+                                    } else {
+                                        eprintln!("Failed to adopt device {}: {}", mac, e);
                                     }
                                 }
                             }
@@ -1614,16 +1624,14 @@ fn handle_local(
                     // stats/config/ports are derived from device listing
                     let mut resp = client.device_stats(&mac)?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            if let Some(first) = arr.get_mut(0) {
-                                if !ports {
-                                    first.as_object_mut().map(|o| {
-                                        o.remove("port_table");
-                                    });
-                                }
-                                if !config {
-                                    // keep stats only (remove config-heavy?)
-                                }
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+                            && let Some(first) = arr.get_mut(0)
+                        {
+                            if !ports && let Some(o) = first.as_object_mut() {
+                                o.remove("port_table");
+                            }
+                            if !config {
+                                // keep stats only (remove config-heavy?)
                             }
                         }
                         resp.body =
@@ -1860,10 +1868,10 @@ fn handle_local(
                 || {
                     let mut resp = client.clients_v2_active()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+                            && arr.len() > limit
+                        {
+                            arr.truncate(limit);
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
@@ -1974,10 +1982,10 @@ fn handle_local(
                 || {
                     let mut resp = client.list_events()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+                            && arr.len() > limit
+                        {
+                            arr.truncate(limit);
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
@@ -2445,7 +2453,42 @@ fn handle_local(
                 effective.verify_tls,
             )?;
             render_local(
-                || client.list_health(),
+                || {
+                    let mut resp = client.list_health()?;
+                    if let Some(mut json) = resp.json.clone() {
+                        enrich_health_status_messages(&mut json);
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
+                    }
+                    Ok(resp)
+                },
+                output,
+                render_opts,
+                Some(&["subsystem", "status", "status_msg", "status_message"]),
+                watch,
+            )
+        }
+        LocalCommands::Vpn(LocalVpnCommand::Get { site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || {
+                    let mut resp = client.vpn_health()?;
+                    if let Some(mut json) = resp.json.clone() {
+                        enrich_health_status_messages(&mut json);
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
+                    }
+                    Ok(resp)
+                },
                 output,
                 render_opts,
                 Some(&["subsystem", "status", "status_msg", "status_message"]),
@@ -2481,18 +2524,19 @@ fn handle_local(
             render_local(
                 || {
                     let mut resp = client.list_health()?;
-                    if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            arr.retain(|item| {
-                                item.get("subsystem")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.eq_ignore_ascii_case("wan"))
-                                    .unwrap_or(false)
-                            });
-                            resp.body =
-                                serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                            resp.json = Some(json);
-                        }
+                    if let Some(mut json) = resp.json.clone()
+                        && let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+                    {
+                        arr.retain(|item| {
+                            item.get("subsystem")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.eq_ignore_ascii_case("wan"))
+                                .unwrap_or(false)
+                        });
+                        enrich_health_status_messages(&mut json);
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
                     }
                     Ok(resp)
                 },
@@ -2693,17 +2737,16 @@ fn handle_local(
             if dry_run {
                 // Fetch the network to show what would be deleted
                 let networks = client.networks()?;
-                if let Some(json) = networks.json {
-                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                        if let Some(network) = data.iter().find(|n| {
-                            n.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || n.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }) {
-                            println!("Would delete network:");
-                            println!("{}", serde_json::to_string_pretty(network)?);
-                            return Ok(());
-                        }
-                    }
+                if let Some(json) = networks.json
+                    && let Some(data) = json.get("data").and_then(|d| d.as_array())
+                    && let Some(network) = data.iter().find(|n| {
+                        n.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                            || n.get("id").and_then(|id| id.as_str()) == Some(&id)
+                    })
+                {
+                    println!("Would delete network:");
+                    println!("{}", serde_json::to_string_pretty(network)?);
+                    return Ok(());
                 }
                 println!("Would delete network with ID: {}", id);
                 println!("(Network details not found - may already be deleted)");
@@ -2812,17 +2855,16 @@ fn handle_local(
             if dry_run {
                 // Fetch the WLAN to show what would be deleted
                 let wlans = client.wlans()?;
-                if let Some(json) = wlans.json {
-                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                        if let Some(wlan) = data.iter().find(|w| {
-                            w.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || w.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }) {
-                            println!("Would delete WLAN:");
-                            println!("{}", serde_json::to_string_pretty(wlan)?);
-                            return Ok(());
-                        }
-                    }
+                if let Some(json) = wlans.json
+                    && let Some(data) = json.get("data").and_then(|d| d.as_array())
+                    && let Some(wlan) = data.iter().find(|w| {
+                        w.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                            || w.get("id").and_then(|id| id.as_str()) == Some(&id)
+                    })
+                {
+                    println!("Would delete WLAN:");
+                    println!("{}", serde_json::to_string_pretty(wlan)?);
+                    return Ok(());
                 }
                 println!("Would delete WLAN with ID: {}", id);
                 println!("(WLAN details not found - may already be deleted)");
@@ -2939,17 +2981,16 @@ fn handle_local(
             if dry_run {
                 // Fetch the firewall rule to show what would be deleted
                 let rules = client.firewall_rules()?;
-                if let Some(json) = rules.json {
-                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                        if let Some(rule) = data.iter().find(|r| {
-                            r.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || r.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }) {
-                            println!("Would delete firewall rule:");
-                            println!("{}", serde_json::to_string_pretty(rule)?);
-                            return Ok(());
-                        }
-                    }
+                if let Some(json) = rules.json
+                    && let Some(data) = json.get("data").and_then(|d| d.as_array())
+                    && let Some(rule) = data.iter().find(|r| {
+                        r.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                            || r.get("id").and_then(|id| id.as_str()) == Some(&id)
+                    })
+                {
+                    println!("Would delete firewall rule:");
+                    println!("{}", serde_json::to_string_pretty(rule)?);
+                    return Ok(());
                 }
                 println!("Would delete firewall rule with ID: {}", id);
                 println!("(Firewall rule details not found - may already be deleted)");
@@ -3041,17 +3082,16 @@ fn handle_local(
             if dry_run {
                 // Fetch the firewall group to show what would be deleted
                 let groups = client.firewall_groups()?;
-                if let Some(json) = groups.json {
-                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                        if let Some(group) = data.iter().find(|g| {
-                            g.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || g.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }) {
-                            println!("Would delete firewall group:");
-                            println!("{}", serde_json::to_string_pretty(group)?);
-                            return Ok(());
-                        }
-                    }
+                if let Some(json) = groups.json
+                    && let Some(data) = json.get("data").and_then(|d| d.as_array())
+                    && let Some(group) = data.iter().find(|g| {
+                        g.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                            || g.get("id").and_then(|id| id.as_str()) == Some(&id)
+                    })
+                {
+                    println!("Would delete firewall group:");
+                    println!("{}", serde_json::to_string_pretty(group)?);
+                    return Ok(());
                 }
                 println!("Would delete firewall group with ID: {}", id);
                 println!("(Firewall group details not found - may already be deleted)");
@@ -3105,7 +3145,7 @@ fn handle_local(
                                 let rx = item.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                                 tx as u128 + rx as u128
                             };
-                            arr.sort_by(|a, b| score(b).cmp(&score(a)));
+                            arr.sort_by_key(|item| std::cmp::Reverse(score(item)));
                             if arr.len() > limit {
                                 arr.truncate(limit);
                             }
@@ -3144,7 +3184,7 @@ fn handle_local(
                                     .or_else(|| item.get("num_clients").and_then(|v| v.as_i64()))
                                     .unwrap_or(0)
                             };
-                            arr.sort_by(|a, b| score(b).cmp(&score(a)));
+                            arr.sort_by_key(|item| std::cmp::Reverse(score(item)));
                             if arr.len() > limit {
                                 arr.truncate(limit);
                             }
@@ -3260,17 +3300,16 @@ fn handle_local(
             )?;
             if dry_run {
                 let tables = client.policy_tables()?;
-                if let Some(json) = tables.json {
-                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                        if let Some(table) = data.iter().find(|t| {
-                            t.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || t.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }) {
-                            println!("Would delete policy table:");
-                            println!("{}", serde_json::to_string_pretty(table)?);
-                            return Ok(());
-                        }
-                    }
+                if let Some(json) = tables.json
+                    && let Some(data) = json.get("data").and_then(|d| d.as_array())
+                    && let Some(table) = data.iter().find(|t| {
+                        t.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                            || t.get("id").and_then(|id| id.as_str()) == Some(&id)
+                    })
+                {
+                    println!("Would delete policy table:");
+                    println!("{}", serde_json::to_string_pretty(table)?);
+                    return Ok(());
                 }
                 println!("Would delete policy table with ID: {}", id);
                 println!("(Policy table details not found - may already be deleted)");
@@ -3379,17 +3418,16 @@ fn handle_local(
             )?;
             if dry_run {
                 let zones = client.zones()?;
-                if let Some(json) = zones.json {
-                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                        if let Some(zone) = data.iter().find(|z| {
-                            z.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || z.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }) {
-                            println!("Would delete zone:");
-                            println!("{}", serde_json::to_string_pretty(zone)?);
-                            return Ok(());
-                        }
-                    }
+                if let Some(json) = zones.json
+                    && let Some(data) = json.get("data").and_then(|d| d.as_array())
+                    && let Some(zone) = data.iter().find(|z| {
+                        z.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                            || z.get("id").and_then(|id| id.as_str()) == Some(&id)
+                    })
+                {
+                    println!("Would delete zone:");
+                    println!("{}", serde_json::to_string_pretty(zone)?);
+                    return Ok(());
                 }
                 println!("Would delete zone with ID: {}", id);
                 println!("(Zone details not found - may already be deleted)");
@@ -3498,17 +3536,16 @@ fn handle_local(
             )?;
             if dry_run {
                 let objects = client.objects()?;
-                if let Some(json) = objects.json {
-                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                        if let Some(obj) = data.iter().find(|o| {
-                            o.get("_id").and_then(|id| id.as_str()) == Some(&id)
-                                || o.get("id").and_then(|id| id.as_str()) == Some(&id)
-                        }) {
-                            println!("Would delete object:");
-                            println!("{}", serde_json::to_string_pretty(obj)?);
-                            return Ok(());
-                        }
-                    }
+                if let Some(json) = objects.json
+                    && let Some(data) = json.get("data").and_then(|d| d.as_array())
+                    && let Some(obj) = data.iter().find(|o| {
+                        o.get("_id").and_then(|id| id.as_str()) == Some(&id)
+                            || o.get("id").and_then(|id| id.as_str()) == Some(&id)
+                    })
+                {
+                    println!("Would delete object:");
+                    println!("{}", serde_json::to_string_pretty(obj)?);
+                    return Ok(());
                 }
                 println!("Would delete object with ID: {}", id);
                 println!("(Object details not found - may already be deleted)");
@@ -3599,46 +3636,44 @@ fn handle_correlate_command(
 
             // Get client details
             let clients = client.list_clients()?;
-            if let Some(ref json) = clients.json {
-                if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                    let client_data = arr
-                        .iter()
-                        .find(|c| c.get("mac").and_then(|m| m.as_str()) == Some(mac));
-                    correlated["client"] = client_data.cloned().unwrap_or(json!(null));
-                }
+            if let Some(ref json) = clients.json
+                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
+            {
+                let client_data = arr
+                    .iter()
+                    .find(|c| c.get("mac").and_then(|m| m.as_str()) == Some(mac));
+                correlated["client"] = client_data.cloned().unwrap_or(json!(null));
             }
 
             // Get connected AP info (if wireless)
             if let Some(ap_mac) = correlated["client"]["ap_mac"].as_str() {
                 let devices = client.list_devices()?;
-                if let Some(ref json) = devices.json {
-                    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                        let ap_data = arr
-                            .iter()
-                            .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(ap_mac));
-                        correlated["connected_ap"] = ap_data.cloned().unwrap_or(json!(null));
-                    }
+                if let Some(ref json) = devices.json
+                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
+                {
+                    let ap_data = arr
+                        .iter()
+                        .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(ap_mac));
+                    correlated["connected_ap"] = ap_data.cloned().unwrap_or(json!(null));
                 }
             }
 
             // Get events if requested
-            if *include_events {
-                if let Ok(events_resp) = client.list_events() {
-                    if let Some(ref json) = events_resp.json {
-                        if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                            let client_events: Vec<_> = arr
-                                .iter()
-                                .filter(|e| {
-                                    e.get("user").and_then(|u| u.as_str()) == Some(mac)
-                                        || e.get("client_mac").and_then(|m| m.as_str()) == Some(mac)
-                                })
-                                .take(20)
-                                .cloned()
-                                .collect();
-                            correlated["recent_events"] = json!(client_events);
-                        }
-                    }
-                }
+            if *include_events
+                && let Ok(events_resp) = client.list_events()
+                && let Some(ref json) = events_resp.json
+                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
+            {
+                let client_events: Vec<_> = arr
+                    .iter()
+                    .filter(|e| {
+                        e.get("user").and_then(|u| u.as_str()) == Some(mac)
+                            || e.get("client_mac").and_then(|m| m.as_str()) == Some(mac)
+                    })
+                    .take(20)
+                    .cloned()
+                    .collect();
+                correlated["recent_events"] = json!(client_events);
             }
 
             correlated["llm_summary"] = json!({
@@ -3674,31 +3709,31 @@ fn handle_correlate_command(
 
             // Get device details
             let devices = client.list_devices()?;
-            if let Some(ref json) = devices.json {
-                if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                    let device_data = arr
-                        .iter()
-                        .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(mac));
-                    correlated["device"] = device_data.cloned().unwrap_or(json!(null));
-                }
+            if let Some(ref json) = devices.json
+                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
+            {
+                let device_data = arr
+                    .iter()
+                    .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(mac));
+                correlated["device"] = device_data.cloned().unwrap_or(json!(null));
             }
 
             // Get connected clients if requested and device is an AP
             if *include_clients {
                 let clients = client.list_clients()?;
-                if let Some(ref json) = clients.json {
-                    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                        let connected_clients: Vec<_> = arr
-                            .iter()
-                            .filter(|c| {
-                                c.get("ap_mac").and_then(|m| m.as_str()) == Some(mac)
-                                    || c.get("sw_mac").and_then(|m| m.as_str()) == Some(mac)
-                            })
-                            .cloned()
-                            .collect();
-                        correlated["connected_clients"] = json!(connected_clients);
-                        correlated["connected_clients_count"] = json!(connected_clients.len());
-                    }
+                if let Some(ref json) = clients.json
+                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
+                {
+                    let connected_clients: Vec<_> = arr
+                        .iter()
+                        .filter(|c| {
+                            c.get("ap_mac").and_then(|m| m.as_str()) == Some(mac)
+                                || c.get("sw_mac").and_then(|m| m.as_str()) == Some(mac)
+                        })
+                        .cloned()
+                        .collect();
+                    correlated["connected_clients"] = json!(connected_clients);
+                    correlated["connected_clients_count"] = json!(connected_clients.len());
                 }
             }
 
@@ -3831,25 +3866,24 @@ fn handle_diagnose_command(
             }
 
             // Get APs
-            if let Ok(devices) = client.list_devices() {
-                if let Some(ref json) = devices.json {
-                    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                        let aps: Vec<_> = arr
-                            .iter()
-                            .filter(|d| d.get("type").and_then(|t| t.as_str()) == Some("uap"))
-                            .map(|d| {
-                                json!({
-                                    "mac": d.get("mac"),
-                                    "name": d.get("name"),
-                                    "state": d.get("state"),
-                                    "num_sta": d.get("num_sta"),
-                                })
-                            })
-                            .collect();
-                        diagnostics["access_points"] = json!(aps);
-                        diagnostics["ap_count"] = json!(aps.len());
-                    }
-                }
+            if let Ok(devices) = client.list_devices()
+                && let Some(ref json) = devices.json
+                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
+            {
+                let aps: Vec<_> = arr
+                    .iter()
+                    .filter(|d| d.get("type").and_then(|t| t.as_str()) == Some("uap"))
+                    .map(|d| {
+                        json!({
+                            "mac": d.get("mac"),
+                            "name": d.get("name"),
+                            "state": d.get("state"),
+                            "num_sta": d.get("num_sta"),
+                        })
+                    })
+                    .collect();
+                diagnostics["access_points"] = json!(aps);
+                diagnostics["ap_count"] = json!(aps.len());
             }
 
             diagnostics["llm_summary"] = json!({
@@ -3890,20 +3924,18 @@ fn handle_diagnose_command(
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
 
-                if let Some(ref json) = clients.json {
-                    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
-                        let wireless_count = arr
-                            .iter()
-                            .filter(|c| {
-                                !c.get("is_wired").and_then(|w| w.as_bool()).unwrap_or(false)
-                            })
-                            .count();
-                        let wired_count = arr.len() - wireless_count;
+                if let Some(ref json) = clients.json
+                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
+                {
+                    let wireless_count = arr
+                        .iter()
+                        .filter(|c| !c.get("is_wired").and_then(|w| w.as_bool()).unwrap_or(false))
+                        .count();
+                    let wired_count = arr.len() - wireless_count;
 
-                        diagnostics["total_clients"] = json!(arr.len());
-                        diagnostics["wireless_clients"] = json!(wireless_count);
-                        diagnostics["wired_clients"] = json!(wired_count);
-                    }
+                    diagnostics["total_clients"] = json!(arr.len());
+                    diagnostics["wireless_clients"] = json!(wireless_count);
+                    diagnostics["wired_clients"] = json!(wired_count);
                 }
 
                 render_response(
@@ -3981,13 +4013,12 @@ fn handle_timeseries_command(
 
             if format == "csv" {
                 let mut limited_events = events.json.clone().unwrap_or(json!({"data": []}));
-                if let Some(limit) = limit {
-                    if let Some(arr) = limited_events
+                if let Some(limit) = limit
+                    && let Some(arr) = limited_events
                         .get_mut("data")
                         .and_then(|d| d.as_array_mut())
-                    {
-                        arr.truncate(*limit);
-                    }
+                {
+                    arr.truncate(*limit);
                 }
                 print_timeseries_csv(&limited_events, "events")?;
             } else {
@@ -4006,7 +4037,7 @@ fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()>
 
     match data_type {
         "traffic" => {
-            wtr.write_record(&["timestamp", "rx_bytes", "tx_bytes"])?;
+            wtr.write_record(["timestamp", "rx_bytes", "tx_bytes"])?;
             if let Some(arr) = data.as_array() {
                 for item in arr {
                     wtr.write_record(&[
@@ -4027,7 +4058,7 @@ fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()>
             }
         }
         "wifi" => {
-            wtr.write_record(&["timestamp", "ap_mac", "channel", "num_sta", "satisfaction"])?;
+            wtr.write_record(["timestamp", "ap_mac", "channel", "num_sta", "satisfaction"])?;
             if let Some(arr) = data.as_array() {
                 for item in arr {
                     wtr.write_record(&[
@@ -4056,33 +4087,33 @@ fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()>
             }
         }
         "events" => {
-            wtr.write_record(&["timestamp", "datetime", "key", "msg", "subsystem"])?;
-            if let Some(obj) = data.as_object() {
-                if let Some(arr) = obj.get("data").and_then(|d| d.as_array()) {
-                    for item in arr {
-                        wtr.write_record(&[
-                            item.get("time")
-                                .and_then(|t| t.as_u64())
-                                .map(|t| t.to_string())
-                                .unwrap_or_default(),
-                            item.get("datetime")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            item.get("key")
-                                .and_then(|k| k.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            item.get("msg")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            item.get("subsystem")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        ])?;
-                    }
+            wtr.write_record(["timestamp", "datetime", "key", "msg", "subsystem"])?;
+            if let Some(obj) = data.as_object()
+                && let Some(arr) = obj.get("data").and_then(|d| d.as_array())
+            {
+                for item in arr {
+                    wtr.write_record(&[
+                        item.get("time")
+                            .and_then(|t| t.as_u64())
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                        item.get("datetime")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        item.get("key")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        item.get("msg")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        item.get("subsystem")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ])?;
                 }
             }
         }
@@ -4316,22 +4347,22 @@ fn print_csv(
         for key in override_cols {
             if rows
                 .iter()
-                .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
+                .any(|row| row.get(key).map(is_non_empty).unwrap_or(false))
             {
                 csv_columns.push(key.to_string());
             }
         }
     }
 
-    if csv_columns.is_empty() {
-        if let Some(hint) = columns_hint {
-            for key in hint {
-                if rows
-                    .iter()
-                    .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
-                {
-                    csv_columns.push((*key).to_string());
-                }
+    if csv_columns.is_empty()
+        && let Some(hint) = columns_hint
+    {
+        for key in hint {
+            if rows
+                .iter()
+                .any(|row| row.get(key).map(is_non_empty).unwrap_or(false))
+            {
+                csv_columns.push((*key).to_string());
             }
         }
     }
@@ -4341,7 +4372,7 @@ fn print_csv(
         for key in first_obj.keys() {
             if rows
                 .iter()
-                .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
+                .any(|row| row.get(key).map(is_non_empty).unwrap_or(false))
             {
                 csv_columns.push(key.to_string());
             }
@@ -4352,13 +4383,12 @@ fn print_csv(
     }
 
     // Always include id if present
-    if !csv_columns.contains(&"id".to_string()) {
-        if rows
+    if !csv_columns.contains(&"id".to_string())
+        && rows
             .iter()
-            .any(|row| row.get("id").map(|v| is_non_empty(v)).unwrap_or(false))
-        {
-            csv_columns.push("id".to_string());
-        }
+            .any(|row| row.get("id").map(is_non_empty).unwrap_or(false))
+    {
+        csv_columns.push("id".to_string());
     }
 
     if csv_columns.is_empty() {
@@ -4394,25 +4424,25 @@ fn print_csv(
             let mut matches = true;
 
             // Apply text filter
-            if let Some(needle) = &needle {
-                if !csv_columns.iter().any(|col| {
+            if let Some(needle) = &needle
+                && !csv_columns.iter().any(|col| {
                     map.get(col)
                         .map(|v| value_to_str(v).to_ascii_lowercase().contains(needle))
                         .unwrap_or(false)
-                }) {
-                    matches = false;
-                }
+                })
+            {
+                matches = false;
             }
 
             // Apply regex filter
-            if let Some(ref re) = regex_pattern {
-                if !csv_columns.iter().any(|col| {
+            if let Some(ref re) = regex_pattern
+                && !csv_columns.iter().any(|col| {
                     map.get(col)
                         .map(|v| re.is_match(&value_to_str(v)))
                         .unwrap_or(false)
-                }) {
-                    matches = false;
-                }
+                })
+            {
+                matches = false;
             }
 
             matches
@@ -4516,6 +4546,8 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
         });
     }
 
+    llm_output["summary"] = summarize_response(&data, schema);
+
     // Intelligent truncation for large responses
     const MAX_TOKENS: usize = 4000;
     const SAMPLE_SIZE: usize = 5;
@@ -4578,29 +4610,29 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
     }
 
     // Add statistics for array responses
-    if let serde_json::Value::Array(arr) = &data {
-        if !arr.is_empty() {
-            // Extract field statistics
-            let mut field_types: std::collections::HashMap<String, u32> =
-                std::collections::HashMap::new();
+    if let serde_json::Value::Array(arr) = &data
+        && !arr.is_empty()
+    {
+        // Extract field statistics
+        let mut field_types: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
-            for item in arr.iter() {
-                if let serde_json::Value::Object(obj) = item {
-                    for key in obj.keys() {
-                        *field_types.entry(key.clone()).or_insert(0) += 1;
-                    }
+        for item in arr.iter() {
+            if let serde_json::Value::Object(obj) = item {
+                for key in obj.keys() {
+                    *field_types.entry(key.clone()).or_insert(0) += 1;
                 }
             }
-
-            llm_output["statistics"] = json!({
-                "total_items": arr.len(),
-                "common_fields": field_types.iter()
-                    .filter(|(_, count)| **count == arr.len() as u32)
-                    .map(|(k, _)| k)
-                    .collect::<Vec<_>>(),
-                "field_coverage": field_types,
-            });
         }
+
+        llm_output["statistics"] = json!({
+            "total_items": arr.len(),
+            "common_fields": field_types.iter()
+                .filter(|(_, count)| **count == arr.len() as u32)
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>(),
+            "field_coverage": field_types,
+        });
     }
 
     println!("{}", serde_json::to_string_pretty(&llm_output)?);
@@ -4651,22 +4683,22 @@ fn print_table(
         for key in override_cols {
             if rows
                 .iter()
-                .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
+                .any(|row| row.get(key).map(is_non_empty).unwrap_or(false))
             {
                 columns.push(key.to_string());
             }
         }
     }
 
-    if columns.is_empty() {
-        if let Some(hint) = columns_hint {
-            for key in hint {
-                if rows
-                    .iter()
-                    .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
-                {
-                    columns.push((*key).to_string());
-                }
+    if columns.is_empty()
+        && let Some(hint) = columns_hint
+    {
+        for key in hint {
+            if rows
+                .iter()
+                .any(|row| row.get(key).map(is_non_empty).unwrap_or(false))
+            {
+                columns.push((*key).to_string());
             }
         }
     }
@@ -4676,7 +4708,7 @@ fn print_table(
         for key in first_obj.keys() {
             if rows
                 .iter()
-                .any(|row| row.get(key).map(|v| is_non_empty(v)).unwrap_or(false))
+                .any(|row| row.get(key).map(is_non_empty).unwrap_or(false))
             {
                 columns.push(key.to_string());
             }
@@ -4687,13 +4719,12 @@ fn print_table(
     }
 
     // Always include id if present and not already included.
-    if !columns.contains(&"id".to_string()) {
-        if rows
+    if !columns.contains(&"id".to_string())
+        && rows
             .iter()
-            .any(|row| row.get("id").map(|v| is_non_empty(v)).unwrap_or(false))
-        {
-            columns.push("id".to_string());
-        }
+            .any(|row| row.get("id").map(is_non_empty).unwrap_or(false))
+    {
+        columns.push("id".to_string());
     }
 
     if columns.is_empty() {
@@ -4735,19 +4766,18 @@ fn print_table(
             // Apply filters
             let mut matches = true;
 
-            if let Some(needle) = &needle {
-                if !out_row
+            if let Some(needle) = &needle
+                && !out_row
                     .iter()
                     .any(|cell| cell.to_ascii_lowercase().contains(needle))
-                {
-                    matches = false;
-                }
+            {
+                matches = false;
             }
 
-            if let Some(ref re) = regex_pattern {
-                if !out_row.iter().any(|cell| re.is_match(cell)) {
-                    matches = false;
-                }
+            if let Some(ref re) = regex_pattern
+                && !out_row.iter().any(|cell| re.is_match(cell))
+            {
+                matches = false;
             }
 
             if !matches {
@@ -4814,6 +4844,190 @@ fn print_table(
     true
 }
 
+fn packet_loss_pct(obj: &serde_json::Map<String, serde_json::Value>) -> Option<f64> {
+    const PACKET_LOSS_KEYS: [&str; 4] = [
+        "packet_loss",
+        "packet_loss_pct",
+        "packet_loss_percent",
+        "packetloss",
+    ];
+
+    for key in PACKET_LOSS_KEYS {
+        if let Some(val) = obj.get(key) {
+            if let Some(loss) = val.as_f64() {
+                if (0.0..=1000.0).contains(&loss) {
+                    return Some(if loss <= 1.0 { loss * 100.0 } else { loss });
+                }
+            } else if let Some(loss) = val.as_i64()
+                && (1..=1000).contains(&loss)
+            {
+                return Some(loss as f64);
+            }
+        }
+    }
+
+    None
+}
+
+fn latency_ms(obj: &serde_json::Map<String, serde_json::Value>) -> Option<f64> {
+    const LAT_KEYS: [&str; 3] = ["latency", "latency_ms", "avg_latency"];
+    for key in LAT_KEYS {
+        if let Some(val) = obj.get(key).and_then(|v| v.as_f64())
+            && (0.0..=100_000.0).contains(&val)
+        {
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn uptime_pct(obj: &serde_json::Map<String, serde_json::Value>) -> Option<f64> {
+    const UP_KEYS: [&str; 3] = ["uptime", "uptime_pct", "uptime_percent"];
+    for key in UP_KEYS {
+        if let Some(val) = obj.get(key) {
+            if let Some(pct) = val.as_f64() {
+                if (0.0..=100.0).contains(&pct) {
+                    return Some(if pct <= 1.0 { pct * 100.0 } else { pct });
+                }
+            } else if let Some(pct) = val.as_i64()
+                && (1..=100).contains(&pct)
+            {
+                return Some(pct as f64);
+            }
+        }
+    }
+    None
+}
+
+fn availability_pct(obj: &serde_json::Map<String, serde_json::Value>) -> Option<f64> {
+    if let Some(avail) = obj.get("availability").and_then(|v| v.as_f64())
+        && (0.0..=100.0).contains(&avail)
+    {
+        return Some(avail);
+    }
+    None
+}
+
+fn enrich_health_status_messages(json: &mut serde_json::Value) {
+    if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+        for item in arr {
+            let Some(obj) = item.as_object_mut() else {
+                continue;
+            };
+
+            let mut reasons = Vec::new();
+
+            if let Some(reason) = obj
+                .get("status_reason")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                reasons.push(reason.to_string());
+            }
+
+            if obj
+                .get("subsystem")
+                .and_then(|s| s.as_str())
+                .map(|s| s.eq_ignore_ascii_case("vpn"))
+                .unwrap_or(false)
+            {
+                let site_to_site_enabled = obj
+                    .get("site_to_site_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let site_to_site_active = obj
+                    .get("site_to_site_num_active")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let site_to_site_inactive = obj
+                    .get("site_to_site_num_inactive")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                reasons.push(format!(
+                    "site-to-site: enabled {}, active {}, inactive {}",
+                    site_to_site_enabled, site_to_site_active, site_to_site_inactive
+                ));
+
+                let remote_user_enabled = obj
+                    .get("remote_user_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let remote_user_active = obj
+                    .get("remote_user_num_active")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let remote_user_inactive = obj
+                    .get("remote_user_num_inactive")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                reasons.push(format!(
+                    "remote-user: enabled {}, active {}, inactive {}",
+                    remote_user_enabled, remote_user_active, remote_user_inactive
+                ));
+
+                if obj
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("error"))
+                    .unwrap_or(false)
+                    && site_to_site_inactive > 0
+                {
+                    obj.insert(
+                        "status".to_string(),
+                        serde_json::Value::String("warn".to_string()),
+                    );
+                }
+            }
+
+            let mut metrics = Vec::new();
+            if let Some(lat) = latency_ms(obj) {
+                metrics.push(format!("latency {:.1} ms", lat));
+            }
+            if let Some(loss) = packet_loss_pct(obj) {
+                metrics.push(format!("packet loss {:.2}%", loss));
+            }
+            if let Some(up) = uptime_pct(obj) {
+                metrics.push(format!("uptime {:.2}%", up));
+            } else if let Some(up) = obj
+                .get("uptime_stats")
+                .and_then(|v| v.as_object())
+                .and_then(availability_pct)
+            {
+                metrics.push(format!("uptime {:.2}%", up));
+            }
+
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(existing) = obj
+                .get("status_msg")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                parts.push(existing.to_string());
+            } else if let Some(existing) = obj
+                .get("status_message")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                parts.push(existing.to_string());
+            }
+
+            if !reasons.is_empty() {
+                parts.push(reasons.join("; "));
+            }
+            if !metrics.is_empty() {
+                parts.push(metrics.join("; "));
+            }
+
+            if !parts.is_empty() {
+                obj.insert(
+                    "status_msg".to_string(),
+                    serde_json::Value::String(parts.join(" | ")),
+                );
+            }
+        }
+    }
+}
+
 fn value_to_str(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "".into(),
@@ -4852,5 +5066,104 @@ fn parse_body(
         }
         (None, None) => Ok(None),
         (Some(_), Some(_)) => Err(anyhow!("use only one of --body or --body-file")),
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn enriches_packet_loss_when_missing_status_msg() {
+        let mut json = json!({
+            "data": [
+                {
+                    "subsystem": "vpn",
+                    "status": "error",
+                    "packet_loss": 0.12
+                }
+            ]
+        });
+
+        enrich_health_status_messages(&mut json);
+
+        let msg = json["data"][0]["status_msg"]
+            .as_str()
+            .expect("status_msg added");
+        assert!(msg.contains("packet loss"));
+        assert!(msg.contains("12")); // 0.12 -> 12%
+    }
+
+    #[test]
+    fn builds_vpn_status_with_counts() {
+        let mut json = json!({
+            "data": [
+                {
+                    "subsystem": "vpn",
+                    "status": "error",
+                    "site_to_site_enabled": true,
+                    "site_to_site_num_active": 0,
+                    "site_to_site_num_inactive": 1,
+                    "remote_user_enabled": true,
+                    "remote_user_num_active": 0,
+                    "remote_user_num_inactive": 0
+                }
+            ]
+        });
+
+        enrich_health_status_messages(&mut json);
+
+        let msg = json["data"][0]["status_msg"]
+            .as_str()
+            .expect("status_msg added");
+        assert!(msg.contains("site-to-site"));
+        assert!(msg.contains("inactive 1"));
+        assert!(msg.contains("remote-user"));
+        assert_eq!(json["data"][0]["status"], "warn");
+    }
+
+    #[test]
+    fn preserves_existing_status_message() {
+        let mut json = json!({
+            "data": [
+                {
+                    "subsystem": "vpn",
+                    "status": "error",
+                    "status_msg": "existing message",
+                    "packet_loss": 99.0
+                }
+            ]
+        });
+
+        enrich_health_status_messages(&mut json);
+
+        let msg = json["data"][0]["status_msg"].as_str().unwrap();
+        assert!(msg.contains("existing message"));
+        assert!(msg.contains("packet loss"));
+    }
+
+    #[test]
+    fn appends_metrics_alongside_existing_message() {
+        let mut json = json!({
+            "data": [
+                {
+                    "subsystem": "wan",
+                    "status": "error",
+                    "status_msg": "controller reported error",
+                    "latency": 3.2,
+                    "uptime_pct": 99.95,
+                    "packet_loss": 0.01
+                }
+            ]
+        });
+
+        enrich_health_status_messages(&mut json);
+
+        let msg = json["data"][0]["status_msg"].as_str().unwrap();
+        assert!(msg.contains("controller reported error"));
+        assert!(msg.contains("latency 3.2"));
+        assert!(msg.contains("uptime"));
+        assert!(msg.contains("packet loss"));
     }
 }
