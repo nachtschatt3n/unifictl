@@ -11,11 +11,11 @@ class Unifictl < Formula
   on_macos do
     if Hardware::CPU.intel?
       url "https://github.com/nachtschatt3n/unifictl/releases/download/v0.5.1/unifictl-x86_64-apple-darwin.tar.gz"
-      sha256 "08eb33076cdb95b21b9fa810a7ee7ac0d310e7bbe63923a3ac5e803972479386"
+      sha256 "c21c7d85a0bba1d7a6858b20b192bafc4f702cb1b9d5f358f05f0bbce54cd2d9"
     end
     if Hardware::CPU.arm?
       url "https://github.com/nachtschatt3n/unifictl/releases/download/v0.5.1/unifictl-aarch64-apple-darwin.tar.gz"
-      sha256 "9dbab71b9bc110a046057e575e77eaa2fd66cf874a5c5ade2c1d105752e48622"
+      sha256 "a9cdce5661d021f69af3091459d0de5f346c0b91cb0b2edb164f3d254aa5bf29"
     end
   end
 
