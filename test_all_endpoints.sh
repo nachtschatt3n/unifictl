@@ -14,6 +14,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Summary tracking
+SUMMARY_PRINTED=0
+
 # Check if binary exists
 if [ ! -f "$BINARY" ]; then
     echo "Error: Binary not found at $BINARY"
@@ -29,6 +32,49 @@ END_TS=$(python3 -c "import time; print(int(time.time() * 1000))")
 TOTAL=0
 PASSED=0
 FAILED=0
+
+print_summary() {
+    # Avoid double-printing if trap fires after manual call
+    if [ "$SUMMARY_PRINTED" -eq 1 ]; then
+        return
+    fi
+    SUMMARY_PRINTED=1
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════════════════════"
+    echo "TEST SUMMARY"
+    echo "════════════════════════════════════════════════════════════════════════════════════"
+    echo "Total Tests: $TOTAL"
+    echo -e "${GREEN}Passed: $PASSED${NC}"
+    echo -e "${RED}Failed: $FAILED${NC}"
+    echo ""
+    echo "Full results logged to: $LOG_FILE"
+    echo ""
+
+    {
+        echo ""
+        echo "=================================================================================="
+        echo "TEST SUMMARY"
+        echo "=================================================================================="
+        echo "Total Tests: $TOTAL"
+        echo "Passed: $PASSED"
+        echo "Failed: $FAILED"
+        python3 - <<PY
+total = $TOTAL
+passed = $PASSED
+failed = $FAILED
+if total:
+    rate = passed / total * 100
+    print(f"Success Rate: {rate:.1f}%")
+else:
+    print("Success Rate: N/A")
+PY
+        echo "=================================================================================="
+    } >> "$LOG_FILE"
+}
+
+# Always print summary even if the script exits early
+trap print_summary EXIT
 
 # Function to test a command
 test_command() {
@@ -371,29 +417,7 @@ test_command_outputs "Event List (LLM Format)" "$BINARY local event list --limit
 # Summary
 # ============================================================================
 
-echo ""
-echo "════════════════════════════════════════════════════════════════════════════════════"
-echo "TEST SUMMARY"
-echo "════════════════════════════════════════════════════════════════════════════════════"
-echo "Total Tests: $TOTAL"
-echo -e "${GREEN}Passed: $PASSED${NC}"
-echo -e "${RED}Failed: $FAILED${NC}"
-echo ""
-echo "Full results logged to: $LOG_FILE"
-echo ""
-
-# Log summary
-{
-    echo ""
-    echo "=================================================================================="
-    echo "TEST SUMMARY"
-    echo "=================================================================================="
-    echo "Total Tests: $TOTAL"
-    echo "Passed: $PASSED"
-    echo "Failed: $FAILED"
-    echo "Success Rate: $(python3 -c "print(f'{($PASSED/$TOTAL*100):.1f}%' if $TOTAL > 0 else 'N/A')")"
-    echo "=================================================================================="
-} >> "$LOG_FILE"
+print_summary
 
 # Exit with error if any tests failed
 if [ $FAILED -gt 0 ]; then
