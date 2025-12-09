@@ -83,11 +83,16 @@ test_command() {
     } >> "$LOG_FILE"
     
     # Show first few lines of output
+    output_lines=$(echo "$OUTPUT" | wc -l)
     echo "Output (first 10 lines):"
     echo "$OUTPUT" | head -10
-    if [ $(echo "$OUTPUT" | wc -l) -gt 10 ]; then
+    if [ "$output_lines" -gt 10 ]; then
         echo "... (truncated, see log file for full output)"
+    else
+        :
     fi
+
+    return 0
 }
 
 test_command_outputs() {
