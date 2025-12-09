@@ -91,6 +91,15 @@ test_command() {
     fi
 }
 
+test_command_outputs() {
+    local name="$1"
+    local base_cmd="$2"
+    local expected_status="${3:-0}"
+    for fmt in json pretty raw csv llm; do
+        test_command "${name} (${fmt})" "${base_cmd} -o ${fmt}" "$expected_status"
+    done
+}
+
 # Start logging
 {
     echo "=================================================================================="
@@ -115,10 +124,10 @@ echo "════════════════════════�
 echo "CLOUD API ENDPOINTS"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "Host List" "$BINARY host list -o json"
-test_command "Site List" "$BINARY site list -o json"
-test_command "Device List" "$BINARY device list -o json"
-test_command "SD-WAN List" "$BINARY sdwan list -o json"
+test_command_outputs "Host List" "$BINARY host list"
+test_command_outputs "Site List" "$BINARY site list"
+test_command_outputs "Device List" "$BINARY device list"
+test_command_outputs "SD-WAN List" "$BINARY sdwan list"
 
 # ============================================================================
 # Local Controller - Site & Device Management
@@ -129,22 +138,14 @@ echo "════════════════════════�
 echo "LOCAL CONTROLLER - SITE & DEVICE MANAGEMENT"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "Site List" "$BINARY local site list -o json"
-test_command "Device List" "$BINARY local device list -o json"
-test_command "Device List (Unadopted)" "$BINARY local device list --unadopted -o json"
-test_command "Health Get" "$BINARY local health get -o json"
-test_command "Health Get" "$BINARY local health get -o pretty"
-test_command "Health Get" "$BINARY local health get -o raw"
-test_command "Health Get" "$BINARY local health get -o csv"
-test_command "Health Get" "$BINARY local health get -o llm"
-test_command "VPN Health Get" "$BINARY local vpn get -o json"
-test_command "VPN Health Get" "$BINARY local vpn get -o pretty"
-test_command "VPN Health Get" "$BINARY local vpn get -o raw"
-test_command "VPN Health Get" "$BINARY local vpn get -o csv"
-test_command "VPN Health Get" "$BINARY local vpn get -o llm"
-test_command "Security Get" "$BINARY local security get -o json"
-test_command "WAN Get" "$BINARY local wan get -o json"
-test_command "DPI Get" "$BINARY local dpi get -o json"
+test_command_outputs "Site List" "$BINARY local site list"
+test_command_outputs "Device List" "$BINARY local device list"
+test_command_outputs "Device List (Unadopted)" "$BINARY local device list --unadopted"
+test_command_outputs "Health Get" "$BINARY local health get"
+test_command_outputs "VPN Health Get" "$BINARY local vpn get"
+test_command_outputs "Security Get" "$BINARY local security get"
+test_command_outputs "WAN Get" "$BINARY local wan get"
+test_command_outputs "DPI Get" "$BINARY local dpi get"
 
 # ============================================================================
 # Local Controller - Client Management
@@ -155,13 +156,13 @@ echo "════════════════════════�
 echo "LOCAL CONTROLLER - CLIENT MANAGEMENT"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "Client List" "$BINARY local client list -o json"
-test_command "Client List (Wired)" "$BINARY local client list --wired -o json"
-test_command "Client List (Wireless)" "$BINARY local client list --wireless -o json"
-test_command "Client Active (v2)" "$BINARY local client active -o json"
-test_command "Client History" "$BINARY local client history -o json"
-test_command "Top Client List" "$BINARY local top-client list --limit 10 -o json"
-test_command "Top Device List" "$BINARY local top-device list --limit 10 -o json"
+test_command_outputs "Client List" "$BINARY local client list"
+test_command_outputs "Client List (Wired)" "$BINARY local client list --wired"
+test_command_outputs "Client List (Wireless)" "$BINARY local client list --wireless"
+test_command_outputs "Client Active (v2)" "$BINARY local client active"
+test_command_outputs "Client History" "$BINARY local client history"
+test_command_outputs "Top Client List" "$BINARY local top-client list --limit 10"
+test_command_outputs "Top Device List" "$BINARY local top-device list --limit 10"
 
 # ============================================================================
 # Local Controller - System Log (v2 API)
@@ -172,11 +173,11 @@ echo "════════════════════════�
 echo "LOCAL CONTROLLER - SYSTEM LOG (v2 API)"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "Log Settings" "$BINARY local log settings -o json"
-test_command "Log All" "$BINARY local log all --limit 5 -o json"
-test_command "Log Count" "$BINARY local log count -o json"
-test_command "Log Critical" "$BINARY local log critical --limit 5 -o json"
-test_command "Log Device Alert" "$BINARY local log device-alert --limit 5 -o json"
+test_command_outputs "Log Settings" "$BINARY local log settings"
+test_command_outputs "Log All" "$BINARY local log all --limit 5"
+test_command_outputs "Log Count" "$BINARY local log count"
+test_command_outputs "Log Critical" "$BINARY local log critical --limit 5"
+test_command_outputs "Log Device Alert" "$BINARY local log device-alert --limit 5"
 
 # ============================================================================
 # Local Controller - WiFi/Radio (v2 API) - REQUIRES PARAMETERS
@@ -187,13 +188,13 @@ echo "════════════════════════�
 echo "LOCAL CONTROLLER - WIFI/RADIO (v2 API) - WITH REQUIRED PARAMETERS"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "WiFi Connectivity" "$BINARY local wifi connectivity -o json"
-test_command "WiFi Stats (Details)" "$BINARY local wifi stats --start $START_TS --end $END_TS -o json"
-test_command "WiFi Stats (Details, all APs)" "$BINARY local wifi stats --start $START_TS --end $END_TS --ap-mac all -o json"
-test_command "WiFi Stats (Radios)" "$BINARY local wifi stats --radios --start $START_TS --end $END_TS -o json"
-test_command "WiFi Radio AI" "$BINARY local wifi radio-ai -o json"
-test_command "WiFi Management" "$BINARY local wifi management -o json"
-test_command "WiFi Config" "$BINARY local wifi config -o json"
+test_command_outputs "WiFi Connectivity" "$BINARY local wifi connectivity"
+test_command_outputs "WiFi Stats (Details)" "$BINARY local wifi stats --start $START_TS --end $END_TS"
+test_command_outputs "WiFi Stats (Details, all APs)" "$BINARY local wifi stats --start $START_TS --end $END_TS --ap-mac all"
+test_command_outputs "WiFi Stats (Radios)" "$BINARY local wifi stats --radios --start $START_TS --end $END_TS"
+test_command_outputs "WiFi Radio AI" "$BINARY local wifi radio-ai"
+test_command_outputs "WiFi Management" "$BINARY local wifi management"
+test_command_outputs "WiFi Config" "$BINARY local wifi config"
 
 # ============================================================================
 # Local Controller - Traffic/Flow (v2 API) - REQUIRES PARAMETERS
@@ -204,16 +205,16 @@ echo "════════════════════════�
 echo "LOCAL CONTROLLER - TRAFFIC/FLOW (v2 API) - WITH REQUIRED PARAMETERS"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "Traffic Stats" "$BINARY local traffic stats --start $START_TS --end $END_TS --include-unidentified true -o json"
-test_command "Traffic Stats (no unidentified)" "$BINARY local traffic stats --start $START_TS --end $END_TS --include-unidentified false -o json"
-test_command "Traffic Flow Latest (Day)" "$BINARY local traffic flow-latest --period day --top 30 -o json"
-test_command "Traffic Flow Latest (Month)" "$BINARY local traffic flow-latest --period month --top 30 -o json"
-test_command "Traffic App Rate" "$BINARY local traffic app-rate --start $START_TS --end $END_TS --include-unidentified true -o json"
-test_command "Traffic Filter Data" "$BINARY local traffic filter-data -o json"
-test_command "Traffic Routes" "$BINARY local traffic routes -o json"
-test_command "Traffic Rules" "$BINARY local traffic rules -o json"
+test_command_outputs "Traffic Stats" "$BINARY local traffic stats --start $START_TS --end $END_TS --include-unidentified true"
+test_command_outputs "Traffic Stats (no unidentified)" "$BINARY local traffic stats --start $START_TS --end $END_TS --include-unidentified false"
+test_command_outputs "Traffic Flow Latest (Day)" "$BINARY local traffic flow-latest --period day --top 30"
+test_command_outputs "Traffic Flow Latest (Month)" "$BINARY local traffic flow-latest --period month --top 30"
+test_command_outputs "Traffic App Rate" "$BINARY local traffic app-rate --start $START_TS --end $END_TS --include-unidentified true"
+test_command_outputs "Traffic Filter Data" "$BINARY local traffic filter-data"
+test_command_outputs "Traffic Routes" "$BINARY local traffic routes"
+test_command_outputs "Traffic Rules" "$BINARY local traffic rules"
 FLOWS_QUERY=$(printf '{"timestampFrom": %s, "timestampTo": %s, "pageNumber": 0, "pageSize": 10}' "$START_TS" "$END_TS")
-test_command "Traffic Flows" "$BINARY local traffic flows --query '$FLOWS_QUERY' -o json"
+test_command_outputs "Traffic Flows" "$BINARY local traffic flows --query '$FLOWS_QUERY'"
 
 # ============================================================================
 # Local Controller - Statistics (v1 API)
@@ -224,13 +225,13 @@ echo "════════════════════════�
 echo "LOCAL CONTROLLER - STATISTICS (v1 API)"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "Stat Country Code" "$BINARY local stat ccode -o json"
-test_command "Stat Current Channel" "$BINARY local stat current-channel -o json"
-test_command "Stat Device Basic" "$BINARY local stat device-basic -o json"
-test_command "Stat Guest" "$BINARY local stat guest -o json"
-test_command "Stat Rogue AP" "$BINARY local stat rogueap -o json"
-test_command "Stat SDN" "$BINARY local stat sdn -o json"
-test_command "Stat Report 5min" "$BINARY local stat report5min -o json"
+test_command_outputs "Stat Country Code" "$BINARY local stat ccode"
+test_command_outputs "Stat Current Channel" "$BINARY local stat current-channel"
+test_command_outputs "Stat Device Basic" "$BINARY local stat device-basic"
+test_command_outputs "Stat Guest" "$BINARY local stat guest"
+test_command_outputs "Stat Rogue AP" "$BINARY local stat rogueap"
+test_command_outputs "Stat SDN" "$BINARY local stat sdn"
+test_command_outputs "Stat Report 5min" "$BINARY local stat report5min"
 
 # ============================================================================
 # Local Controller - Device Operations
@@ -256,13 +257,13 @@ except:
 " 2>/dev/null || echo "")
 
 if [ -n "$DEVICE_MAC" ]; then
-    test_command "Device Get" "$BINARY local device get $DEVICE_MAC -o json"
-    test_command "Device Spectrum Scan" "$BINARY local device spectrum-scan $DEVICE_MAC -o json"
+test_command_outputs "Device Get" "$BINARY local device get $DEVICE_MAC"
+test_command_outputs "Device Spectrum Scan" "$BINARY local device spectrum-scan $DEVICE_MAC"
 else
     echo "Skipping device-specific tests (no devices found)"
 fi
 
-test_command "Device Port Anomalies" "$BINARY local device port-anomalies -o json"
+test_command_outputs "Device Port Anomalies" "$BINARY local device port-anomalies"
 test_command "Device Mac Tables" "$BINARY local device mac-tables -o json" 1  # May return 404
 
 # ============================================================================
@@ -274,14 +275,14 @@ echo "════════════════════════�
 echo "LOCAL CONTROLLER - NETWORK MANAGEMENT"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "Network List" "$BINARY local network list -o json"
-test_command "WLAN List" "$BINARY local wlan list -o json"
-test_command "Port Profile List" "$BINARY local port-profile list -o json"
-test_command "Firewall Rule List" "$BINARY local firewall-rule list -o json"
-test_command "Firewall Group List" "$BINARY local firewall-group list -o json"
-test_command "Policy Table List" "$BINARY local policy-table list -o json"
-test_command "Zone List" "$BINARY local zone list -o json"
-test_command "Object List" "$BINARY local object list -o json"
+test_command_outputs "Network List" "$BINARY local network list"
+test_command_outputs "WLAN List" "$BINARY local wlan list"
+test_command_outputs "Port Profile List" "$BINARY local port-profile list"
+test_command_outputs "Firewall Rule List" "$BINARY local firewall-rule list"
+test_command_outputs "Firewall Group List" "$BINARY local firewall-group list"
+test_command_outputs "Policy Table List" "$BINARY local policy-table list"
+test_command_outputs "Zone List" "$BINARY local zone list"
+test_command_outputs "Object List" "$BINARY local object list"
 
 # ============================================================================
 # Local Controller - Events
@@ -292,7 +293,7 @@ echo "════════════════════════�
 echo "LOCAL CONTROLLER - EVENTS"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command "Event List" "$BINARY local event list -o json"
+test_command_outputs "Event List" "$BINARY local event list"
 
 # ============================================================================
 # Local Controller - AI-Powered Features (Correlation, Diagnostics, Time-Series)
@@ -319,38 +320,38 @@ except:
 
 # Correlation Commands
 if [ -n "$CLIENT_MAC" ]; then
-    test_command "Correlate Client" "$BINARY local correlate client $CLIENT_MAC -o json"
-    test_command "Correlate Client with Events" "$BINARY local correlate client $CLIENT_MAC --include-events -o json"
+test_command_outputs "Correlate Client" "$BINARY local correlate client $CLIENT_MAC"
+test_command_outputs "Correlate Client with Events" "$BINARY local correlate client $CLIENT_MAC --include-events"
 else
     echo "Skipping client correlation tests (no clients found)"
 fi
 
 if [ -n "$DEVICE_MAC" ]; then
-    test_command "Correlate Device" "$BINARY local correlate device $DEVICE_MAC -o json"
-    test_command "Correlate Device with Clients" "$BINARY local correlate device $DEVICE_MAC --include-clients -o json"
-    test_command "Correlate AP" "$BINARY local correlate ap $DEVICE_MAC -o json"
+test_command_outputs "Correlate Device" "$BINARY local correlate device $DEVICE_MAC"
+test_command_outputs "Correlate Device with Clients" "$BINARY local correlate device $DEVICE_MAC --include-clients"
+test_command_outputs "Correlate AP" "$BINARY local correlate ap $DEVICE_MAC"
 else
     echo "Skipping device correlation tests (no devices found)"
 fi
 
 # Diagnostic Commands
-test_command "Diagnose Network" "$BINARY local diagnose network -o json"
-test_command "Diagnose WiFi" "$BINARY local diagnose wifi -o json"
-test_command "Diagnose Client Overview" "$BINARY local diagnose client -o json"
+test_command_outputs "Diagnose Network" "$BINARY local diagnose network"
+test_command_outputs "Diagnose WiFi" "$BINARY local diagnose wifi"
+test_command_outputs "Diagnose Client Overview" "$BINARY local diagnose client"
 
 if [ -n "$CLIENT_MAC" ]; then
-    test_command "Diagnose Specific Client" "$BINARY local diagnose client $CLIENT_MAC -o json"
+test_command_outputs "Diagnose Specific Client" "$BINARY local diagnose client $CLIENT_MAC"
 fi
 
 # Time-Series Commands (use same timestamps from earlier in script)
-test_command "Time-Series Traffic" "$BINARY local time-series traffic --start $START_TS --end $END_TS --format json -o json"
-test_command "Time-Series WiFi" "$BINARY local time-series wifi --start $START_TS --end $END_TS --format json -o json"
-test_command "Time-Series Events" "$BINARY local time-series events --limit 10 --format json -o json"
+test_command_outputs "Time-Series Traffic" "$BINARY local time-series traffic --start $START_TS --end $END_TS --format json"
+test_command_outputs "Time-Series WiFi" "$BINARY local time-series wifi --start $START_TS --end $END_TS --format json"
+test_command_outputs "Time-Series Events" "$BINARY local time-series events --limit 10 --format json"
 
 # LLM Output Format Tests (verify -o llm works with various commands)
-test_command "Device List (LLM Format)" "$BINARY local device list --limit 5 -o llm"
-test_command "Client List (LLM Format)" "$BINARY local client list --limit 5 -o llm"
-test_command "Event List (LLM Format)" "$BINARY local event list --limit 5 -o llm"
+test_command_outputs "Device List (LLM Format)" "$BINARY local device list --limit 5"
+test_command_outputs "Client List (LLM Format)" "$BINARY local client list --limit 5"
+test_command_outputs "Event List (LLM Format)" "$BINARY local event list --limit 5"
 
 # ============================================================================
 # Summary
