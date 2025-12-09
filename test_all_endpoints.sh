@@ -125,9 +125,15 @@ echo "CLOUD API ENDPOINTS"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
 test_command_outputs "Host List" "$BINARY host list"
+test_command_outputs "Host Get (expected fail without real ID)" "$BINARY host get dummy-host-id" 1
 test_command_outputs "Site List" "$BINARY site list"
 test_command_outputs "Device List" "$BINARY device list"
+test_command_outputs "Device Get (expected fail without real ID)" "$BINARY device get dummy-device-id" 1
+test_command_outputs "ISP Metrics (expected auth)" "$BINARY isp get --type 5m --start $(date -Iseconds) --end $(date -Iseconds)" 1
+test_command_outputs "ISP Query (expected auth)" "$BINARY isp query --type hourly --body '{\"limit\":1}'" 1
 test_command_outputs "SD-WAN List" "$BINARY sdwan list"
+test_command_outputs "SD-WAN Get (expected fail without real ID)" "$BINARY sdwan get dummy-sdwan-id" 1
+test_command_outputs "SD-WAN Status (expected fail without real ID)" "$BINARY sdwan status dummy-sdwan-id" 1
 
 # ============================================================================
 # Local Controller - Site & Device Management
