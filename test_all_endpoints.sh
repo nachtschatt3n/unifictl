@@ -56,12 +56,11 @@ test_command() {
         echo ""
     } >> "$LOG_FILE"
     
-    # Run command and capture output
-    if OUTPUT=$(eval "$cmd" 2>&1); then
-        EXIT_CODE=$?
-    else
-        EXIT_CODE=$?
-    fi
+    # Run command and capture output without aborting on non-zero
+    set +e
+    OUTPUT=$(eval "$cmd" 2>&1)
+    EXIT_CODE=$?
+    set -e
     
     # Check if exit code matches expected
     if [ $EXIT_CODE -eq $expected_status ]; then
