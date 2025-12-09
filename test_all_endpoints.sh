@@ -248,6 +248,7 @@ echo "LOCAL CONTROLLER - DEVICE OPERATIONS"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
 # Get a device MAC for testing (if available)
+set +e +o pipefail
 DEVICE_MAC=$(timeout 5 $BINARY local device list -o json 2>/dev/null | python3 -c "
 import sys, json
 try:
@@ -257,9 +258,10 @@ try:
         mac = devices[0].get('mac')
         if mac:
             print(mac)
-except:
+except Exception:
     pass
-" 2>/dev/null || echo "")
+" 2>/dev/null || true)
+set -e -o pipefail
 
 if [ -n "$DEVICE_MAC" ]; then
 test_command_outputs "Device Get" "$BINARY local device get $DEVICE_MAC"
@@ -310,6 +312,7 @@ echo "LOCAL CONTROLLER - AI-POWERED FEATURES"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
 # Get a client MAC for testing (if available)
+set +e +o pipefail
 CLIENT_MAC=$(timeout 5 $BINARY local client list -o json 2>/dev/null | python3 -c "
 import sys, json
 try:
@@ -319,9 +322,10 @@ try:
         mac = clients[0].get('mac')
         if mac:
             print(mac)
-except:
+except Exception:
     pass
-" 2>/dev/null || echo "")
+" 2>/dev/null || true)
+set -e -o pipefail
 
 # Correlation Commands
 if [ -n "$CLIENT_MAC" ]; then
