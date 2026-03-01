@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.5.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
+[![Version](https://img.shields.io/badge/version-5.3.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
 [![Tests](https://img.shields.io/badge/tests-75%20passing-success.svg)](#testing)
 
 **A powerful CLI tool for UniFi networks with AI-first design**
@@ -139,30 +139,41 @@ cargo deb
 sudo dpkg -i target/debian/unifictl_*.deb
 ```
 
-**Arch Linux**
+**Arch Linux (AUR)**
 ```bash
+# Using an AUR helper (recommended)
+yay -S unifictl
+# or
+paru -S unifictl
+
+# Manually from source
+git clone https://github.com/nachtschatt3n/unifictl.git
+cd unifictl
+cargo build --release
 cd packaging/arch
 makepkg -si
 ```
 
 ## Quick Start
 
-### 1. Configure Cloud API
+### 1. Login (cloud + local in one step)
 
 ```bash
-unifictl configure --key "YOUR_API_KEY"
+# Cloud API key only
+unifictl login --api-key "YOUR_API_KEY"
+
+# Local controller only (password prompted securely)
+unifictl login \
+  --controller-url https://192.168.1.1 \
+  --username admin
+
+# Both at once
+unifictl login \
+  --api-key "YOUR_API_KEY" \
+  --controller-url https://192.168.1.1 \
+  --username admin
+
 unifictl host list
-```
-
-### 2. Configure Local Controller
-
-```bash
-unifictl local configure \
-  --url https://192.168.1.1:8443 \
-  --username admin \
-  --password 'your-password' \
-  --site default \
-  --scope local
 ```
 
 ### 3. Basic Commands
@@ -419,22 +430,19 @@ Current test coverage: **75 endpoints, 100% passing**
 
 **Precedence order**: CLI flag → Local config (`.unifictl.yaml`) → User config (`~/.config/unifictl/config.yaml`)
 
-### Cloud API
 ```bash
-unifictl configure --key "YOUR_API_KEY" [--scope local|user]
+# Cloud API key + local controller in one command
+unifictl login --api-key "YOUR_API_KEY" \
+  --controller-url https://192.168.1.1 \
+  --username admin \
+  --site default \
+  [--verify-tls] \
+  [--scope local|user]
+
 unifictl config-show  # View current config (passwords masked)
 ```
 
-### Local Controller
-```bash
-unifictl local configure \
-  --url https://192.168.1.1:8443 \
-  --username admin \
-  --password 'password' \
-  --site default \
-  [--verify-tls] \
-  [--scope local]
-```
+Omitting `--password` causes an interactive prompt with hidden input — this is the recommended approach to avoid exposing credentials in shell history.
 
 **Note**: TLS verification is disabled by default for self-signed certificates. Use `--verify-tls` if your controller has a valid certificate.
 
