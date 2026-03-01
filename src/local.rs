@@ -648,7 +648,6 @@ impl LocalClient {
             "remember": true,
             "strict": true,
         });
-
         // Preserve the original port explicitly
         let original_port = self.base_url.port();
         let mut bases = vec![self.base_url.clone()];
@@ -705,7 +704,8 @@ impl LocalClient {
         url: &Url,
         creds: &serde_json::Value,
     ) -> Result<reqwest::blocking::Response> {
-        self.http
+        let resp = self
+            .http
             .post(url.clone())
             .header(ACCEPT, HeaderValue::from_static("application/json"))
             .header(
@@ -714,8 +714,27 @@ impl LocalClient {
             )
             .json(creds)
             .send()
-            .and_then(|r| r.error_for_status())
-            .context("sending login request")
+            .context("sending login request")?;
+
+        // Detect HTTP -> HTTPS redirect: the POST body is dropped on redirect (301 becomes GET),
+        // so login appears to succeed but no session cookie is set, causing silent auth failure.
+        if url.scheme() == "http" && resp.url().scheme() == "https" {
+            let https_url = format!(
+                "https://{}{}",
+                url.host_str().unwrap_or("your-controller"),
+                url.port().map(|p| format!(":{p}")).unwrap_or_default()
+            );
+            eprintln!(
+                "Warning: controller at {url} redirected to HTTPS. \
+                 Update your controller URL to avoid authentication failures:\n  \
+                 unifictl login --controller-url \"{https_url}\" ..."
+            );
+            return Err(anyhow::anyhow!(
+                "controller redirected http:// to https:// — re-run login with https://"
+            ));
+        }
+
+        resp.error_for_status().context("sending login request")
     }
 
     fn format_error_message(
