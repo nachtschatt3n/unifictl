@@ -121,6 +121,12 @@ Advanced filtering with `--filter`, `--filter-regex`, `--sort-by`, `--columns`, 
 
 ## Installation
 
+### cargo (recommended)
+
+```bash
+cargo install unifictl
+```
+
 ### From Source
 
 ```bash
@@ -139,22 +145,17 @@ cargo deb
 sudo dpkg -i target/debian/unifictl_*.deb
 ```
 
-**Arch Linux (AUR)**
+**Arch Linux**
 ```bash
-# Using an AUR helper (recommended)
-yay -S unifictl
-# or
-paru -S unifictl
-
-# Manually from source
-git clone https://github.com/nachtschatt3n/unifictl.git
-cd unifictl
-cargo build --release
-cd packaging/arch
-makepkg -si
+cargo install unifictl
 ```
 
 ### Updating to a New Version
+
+**cargo**
+```bash
+cargo install unifictl
+```
 
 **From source**
 ```bash
@@ -170,22 +171,6 @@ cd unifictl
 git pull
 cargo deb
 sudo dpkg -i target/debian/unifictl_*.deb
-```
-
-**Arch Linux (AUR)**
-```bash
-yay -Syu unifictl
-# or
-paru -Syu unifictl
-```
-
-**Arch Linux (manual)**
-```bash
-cd unifictl
-git pull
-cargo build --release
-cd packaging/arch
-makepkg -si
 ```
 
 ## Quick Start
