@@ -1,7 +1,20 @@
 #!/bin/bash
 
-# Test script for all unifictl endpoints
+# Test script for all unifictl read-only endpoints
 # Usage: ./test_all_endpoints.sh [output_log_file]
+#
+# This script tests ALL read-only commands in unifictl, covering:
+# - Cloud API: host, site, device, isp, sdwan
+# - Standalone: validate, config-show
+# - Local Controller: All read-only operations across all subcommands
+# - AI Features: correlate, diagnose, time-series
+#
+# EXCLUDED (write/mutate operations):
+# - device: restart, adopt, adopt-all, upgrade
+# - client: block, unblock, reconnect, update-metadata
+# - network/wlan/firewall-rule/firewall-group/policy-table/zone/object: create, update, delete
+#
+# Each command is tested with all output formats: json, pretty, raw, csv, llm
 
 set -euo pipefail
 
@@ -184,6 +197,20 @@ test_command_outputs "ISP Query (expected auth)" "$BINARY isp query --type hourl
 test_command_outputs "SD-WAN List" "$BINARY sdwan list"
 test_command_outputs "SD-WAN Get (expected fail without real ID)" "$BINARY sdwan get dummy-sdwan-id" 1
 test_command_outputs "SD-WAN Status (expected fail without real ID)" "$BINARY sdwan status dummy-sdwan-id" 1
+
+# ============================================================================
+# Standalone Commands - Validation & Configuration
+# ============================================================================
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════════════════════"
+echo "STANDALONE COMMANDS - VALIDATION & CONFIGURATION"
+echo "════════════════════════════════════════════════════════════════════════════════════"
+
+test_command_outputs "Validate All Credentials" "$BINARY validate"
+test_command_outputs "Validate Cloud Only" "$BINARY validate --cloud-only"
+test_command_outputs "Validate Local Only" "$BINARY validate --local-only"
+test_command_outputs "Config Show" "$BINARY config-show"
 
 # ============================================================================
 # Local Controller - Site & Device Management

@@ -117,10 +117,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Persist an API key to the chosen scope
-    Configure {
-        #[arg(long)]
-        key: String,
+    /// Set credentials for the cloud API and/or a local controller
+    Login {
+        #[arg(long, value_name = "KEY", help = "Cloud API key (api.ui.com)")]
+        api_key: Option<String>,
+        #[arg(
+            long,
+            value_name = "URL",
+            help = "Local controller base URL (e.g. https://192.168.1.1)"
+        )]
+        controller_url: Option<String>,
+        #[arg(long, value_name = "USER", help = "Local controller username")]
+        username: Option<String>,
+        #[arg(long, value_name = "PASS", help = "Local controller password")]
+        password: Option<String>,
+        #[arg(
+            long,
+            value_name = "SITE",
+            default_value = "default",
+            help = "Local controller site name"
+        )]
+        site: String,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Enable TLS certificate verification for the local controller"
+        )]
+        verify_tls: bool,
         #[arg(
             long,
             value_enum,
@@ -128,12 +151,6 @@ enum Commands {
             help = "Where to write the config (local project dir or user config dir)"
         )]
         scope: ScopeArg,
-        #[arg(
-            long,
-            value_name = "URL",
-            help = "Optional base URL to store alongside the key"
-        )]
-        base_url: Option<String>,
     },
     /// Host-related operations
     #[command(subcommand)]
@@ -601,30 +618,6 @@ enum TimeSeriesCommand {
 
 #[derive(Subcommand)]
 enum LocalCommands {
-    /// Store local controller credentials (password is saved to the chosen scope)
-    Configure {
-        #[arg(long)]
-        url: String,
-        #[arg(long)]
-        username: String,
-        #[arg(long)]
-        password: String,
-        #[arg(long, default_value = "default")]
-        site: String,
-        #[arg(
-            long,
-            default_value_t = false,
-            help = "Enable TLS verification for the controller (self-signed certs may require disabling)"
-        )]
-        verify_tls: bool,
-        #[arg(
-            long,
-            value_enum,
-            default_value_t = ScopeArg::Local,
-            help = "Where to write the credentials (defaults to local project file)"
-        )]
-        scope: ScopeArg,
-    },
     /// Site operations
     #[command(subcommand)]
     Site(LocalSiteCommand),
@@ -1155,25 +1148,82 @@ struct RenderOpts {
     filter_regex: Option<String>,
 }
 
+fn validate_controller_url(url: &str) -> Result<String> {
+    let url = url.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(anyhow!(
+            "controller URL must start with http:// or https://, got: {url}"
+        ));
+    }
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap();
+    let host = after_scheme.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return Err(anyhow!(
+            "controller URL must contain a valid host, got: {url}"
+        ));
+    }
+    Ok(url.trim_end_matches('/').to_string())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().context("reading current directory")?;
     FULL_IDS.get_or_init(|| cli.full_ids);
 
-    if let Commands::Configure {
-        key,
+    if let Commands::Login {
+        api_key,
+        controller_url,
+        username,
+        password,
+        site,
+        verify_tls,
         scope,
-        base_url,
     } = &cli.command
     {
+        if api_key.is_none() && controller_url.is_none() {
+            return Err(anyhow!(
+                "Provide at least --api-key or --controller-url (with --username and --password)"
+            ));
+        }
+
         let mut existing = config::load_scope((*scope).into(), &cwd)?;
-        existing.api_key = Some(key.clone());
-        if let Some(url) = base_url.clone() {
-            existing.base_url = Some(url);
+
+        if let Some(key) = api_key {
+            existing.api_key = Some(key.trim().to_string());
+        }
+
+        if let Some(url) = controller_url {
+            let validated_url = validate_controller_url(url)?;
+            let u = username.clone().ok_or_else(|| {
+                anyhow!("--username is required when setting a local controller URL")
+            })?;
+            let p = match password {
+                Some(p) => {
+                    eprintln!(
+                        "Warning: passing --password on the command line is insecure.\n\
+                         The value is visible in your shell history and to other users via\n\
+                         process listings (e.g. `ps aux`). Omit --password next time to be\n\
+                         prompted securely with hidden input."
+                    );
+                    p.clone()
+                }
+                None => rpassword::prompt_password("Local controller password: ")
+                    .context("reading password from terminal")?,
+            };
+            let mut local_cfg = existing.local.unwrap_or_default();
+            local_cfg.url = Some(validated_url);
+            local_cfg.username = Some(u);
+            local_cfg.password = Some(p);
+            local_cfg.site = Some(site.clone());
+            local_cfg.verify_tls = *verify_tls;
+            existing.local = Some(local_cfg);
         }
 
         let path = save((*scope).into(), &existing, &cwd)?;
-        println!("Saved API key to {}", path.display());
+        println!("Credentials saved to {}", path.display());
         return Ok(());
     }
 
@@ -1449,7 +1499,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Configure { .. } => unreachable!("handled earlier"),
+        Commands::Login { .. } => unreachable!("handled earlier"),
     }
 
     Ok(())
@@ -1464,26 +1514,6 @@ fn handle_local(
     watch: Option<u64>,
 ) -> Result<()> {
     match cmd {
-        LocalCommands::Configure {
-            url,
-            username,
-            password,
-            site,
-            verify_tls,
-            scope,
-        } => {
-            let mut existing = config::load_scope(scope.into(), cwd)?;
-            let mut local_cfg = existing.local.unwrap_or_default();
-            local_cfg.url = Some(url);
-            local_cfg.username = Some(username);
-            local_cfg.password = Some(password);
-            local_cfg.site = Some(site);
-            local_cfg.verify_tls = verify_tls;
-            existing.local = Some(local_cfg);
-            let path = save(scope.into(), &existing, cwd)?;
-            println!("Saved local controller credentials to {}", path.display());
-            Ok(())
-        }
         LocalCommands::Site(LocalSiteCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
             let mut client = LocalClient::new(

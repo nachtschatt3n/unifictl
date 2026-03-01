@@ -53,10 +53,10 @@ pub enum Scope {
 pub enum ConfigError {
     #[error("could not locate a writable config directory for the current user")]
     MissingConfigDir,
-    #[error("API key is required; set it with `unifictl configure --key <key>`")]
+    #[error("API key is required; set it with `unifictl login --api-key <key>`")]
     MissingApiKey,
     #[error(
-        "Local controller url/username/password/site are required; set them with `unifictl local configure ...`"
+        "Local controller url/username/password/site are required; set them with `unifictl login --controller-url <url> --username <user> --password <pass>`"
     )]
     MissingLocalFields,
 }
