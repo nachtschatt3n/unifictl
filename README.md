@@ -154,6 +154,40 @@ cd packaging/arch
 makepkg -si
 ```
 
+### Updating to a New Version
+
+**From source**
+```bash
+cd unifictl
+git pull
+cargo build --release
+sudo cp target/release/unifictl /usr/local/bin/
+```
+
+**Debian/Ubuntu**
+```bash
+cd unifictl
+git pull
+cargo deb
+sudo dpkg -i target/debian/unifictl_*.deb
+```
+
+**Arch Linux (AUR)**
+```bash
+yay -Syu unifictl
+# or
+paru -Syu unifictl
+```
+
+**Arch Linux (manual)**
+```bash
+cd unifictl
+git pull
+cargo build --release
+cd packaging/arch
+makepkg -si
+```
+
 ## Quick Start
 
 ### 1. Login (cloud + local in one step)
