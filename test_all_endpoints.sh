@@ -142,9 +142,9 @@ test_command() {
     } >> "$LOG_FILE"
     
     # Show first few lines of output
-    output_lines=$(echo "$OUTPUT" | wc -l)
+    output_lines=$(printf '%s\n' "$OUTPUT" | wc -l)
     echo "Output (first 10 lines):"
-    echo "$OUTPUT" | head -10
+    printf '%s\n' "$OUTPUT" | sed -n '1,10p'
     if [ "$output_lines" -gt 10 ]; then
         echo "... (truncated, see log file for full output)"
     else
@@ -187,16 +187,16 @@ echo "════════════════════════�
 echo "CLOUD API ENDPOINTS"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command_outputs "Host List" "$BINARY host list"
-test_command_outputs "Host Get (expected fail without real ID)" "$BINARY host get dummy-host-id" 1
-test_command_outputs "Site List" "$BINARY site list"
-test_command_outputs "Device List" "$BINARY device list"
-test_command_outputs "Device Get (expected fail without real ID)" "$BINARY device get dummy-device-id" 1
-test_command_outputs "ISP Metrics (expected auth)" "$BINARY isp get --type 5m --start $(date -Iseconds) --end $(date -Iseconds)" 1
-test_command_outputs "ISP Query (expected auth)" "$BINARY isp query --type hourly --body '{\"limit\":1}'" 1
-test_command_outputs "SD-WAN List" "$BINARY sdwan list"
-test_command_outputs "SD-WAN Get (expected fail without real ID)" "$BINARY sdwan get dummy-sdwan-id" 1
-test_command_outputs "SD-WAN Status (expected fail without real ID)" "$BINARY sdwan status dummy-sdwan-id" 1
+test_command_outputs "Host List" "$BINARY cloud host list"
+test_command_outputs "Host Get (expected fail without real ID)" "$BINARY cloud host get dummy-host-id" 1
+test_command_outputs "Site List" "$BINARY cloud site list"
+test_command_outputs "Device List" "$BINARY cloud device list"
+test_command_outputs "Device Get (expected fail without real ID)" "$BINARY cloud device get dummy-device-id" 1
+test_command_outputs "ISP Metrics" "$BINARY cloud isp get --type 5m --start $(date -Iseconds) --end $(date -Iseconds)"
+test_command_outputs "ISP Query (expected auth)" "$BINARY cloud isp query --type hourly --body '{\"limit\":1}'" 1
+test_command_outputs "SD-WAN List" "$BINARY cloud sdwan list"
+test_command_outputs "SD-WAN Get (expected fail without real ID)" "$BINARY cloud sdwan get dummy-sdwan-id" 1
+test_command_outputs "SD-WAN Status (expected fail without real ID)" "$BINARY cloud sdwan status dummy-sdwan-id" 1
 
 # ============================================================================
 # Standalone Commands - Validation & Configuration
@@ -207,10 +207,10 @@ echo "════════════════════════�
 echo "STANDALONE COMMANDS - VALIDATION & CONFIGURATION"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
-test_command_outputs "Validate All Credentials" "$BINARY validate"
-test_command_outputs "Validate Cloud Only" "$BINARY validate --cloud-only"
-test_command_outputs "Validate Local Only" "$BINARY validate --local-only"
-test_command_outputs "Config Show" "$BINARY config-show"
+test_command_outputs "Validate All Credentials" "$BINARY login validate"
+test_command_outputs "Validate Cloud Only" "$BINARY login validate --cloud-only"
+test_command_outputs "Validate Local Only" "$BINARY login validate --local-only"
+test_command_outputs "Config Show" "$BINARY login show"
 
 # ============================================================================
 # Local Controller - Site & Device Management

@@ -11,51 +11,51 @@ unifictl configure --key "<API_KEY>"
 
 List hosts:
 ```bash
-unifictl host list
-unifictl host get <HOST_ID>         # fetch one host
+unifictl cloud host list
+unifictl cloud host get <HOST_ID>   # fetch one host
 ```
 
 Sites and devices:
 ```bash
-unifictl site list                  # optional: --host-id <HOST_ID>
-unifictl device list                # optional: --host-id <HOST_ID> --site-id <SITE_ID>
-unifictl device get <DEVICE_ID>     # optional: --host-id <HOST_ID> --site-id <SITE_ID>
+unifictl cloud site list                  # optional: --host-id <HOST_ID>
+unifictl cloud device list                # optional: --host-id <HOST_ID> --site-id <SITE_ID>
+unifictl cloud device get <DEVICE_ID>     # optional: --host-id <HOST_ID> --site-id <SITE_ID>
 ```
 
 ISP metrics (EA):
 ```bash
-unifictl isp get --type 5m --site-id <SITE_ID> --start <RFC3339> --end <RFC3339>
-unifictl isp query --type hourly --body-file ./query.json
+unifictl cloud isp get --type 5m --site-id <SITE_ID> --start <RFC3339> --end <RFC3339>
+unifictl cloud isp query --type hourly --body-file ./query.json
 ```
 
 SD-WAN configs (EA):
 ```bash
-unifictl sdwan list
-unifictl sdwan get <CONFIG_ID>
-unifictl sdwan status <CONFIG_ID>
+unifictl cloud sdwan list
+unifictl cloud sdwan get <CONFIG_ID>
+unifictl cloud sdwan status <CONFIG_ID>
 ```
 
 Output formats:
 ```bash
-unifictl host list -o json           # JSON output
-unifictl device list -o csv          # CSV output (great for reporting)
-unifictl device list -o raw          # Raw response body
-unifictl device list                 # Pretty table (default)
+unifictl cloud host list -o json     # JSON output
+unifictl cloud device list -o csv    # CSV output (great for reporting)
+unifictl cloud device list -o raw    # Raw response body
+unifictl cloud device list           # Pretty table (default)
 ```
 
 Filtering and sorting:
 ```bash
-unifictl device list --filter "SW"                    # Simple text filter (case-insensitive)
-unifictl device list --filter-regex "^SW.*"           # Regex filter (case-insensitive)
-unifictl device list --sort-by name                   # Sort by column
-unifictl device list --columns name,ip,model          # Custom columns
-unifictl host list --full-ids                         # Show complete IDs (no truncation)
+unifictl cloud device list --filter "SW"              # Simple text filter (case-insensitive)
+unifictl cloud device list --filter-regex "^SW.*"     # Regex filter (case-insensitive)
+unifictl cloud device list --sort-by name             # Sort by column
+unifictl cloud device list --columns name,ip,model    # Custom columns
+unifictl cloud host list --full-ids                   # Show complete IDs (no truncation)
 ```
 
 Watch mode (live refresh):
 ```bash
 unifictl local client list --watch 5                 # Refresh every 5 seconds
-unifictl host list --watch 10                         # Refresh every 10 seconds
+unifictl cloud host list --watch 10                   # Refresh every 10 seconds
 # Press Ctrl+C to stop watching
 ```
 
@@ -63,13 +63,29 @@ unifictl host list --watch 10                         # Refresh every 10 seconds
 
 Store local credentials (plaintext in chosen scope; use `--scope local` to keep it repo-local):
 ```bash
-unifictl local configure \
-  --url https://192.168.55.1:8443 \
+unifictl login \
+  --controller-url https://192.168.55.1 \
   --username <USER> \
-  --password '<PASS>' \
   --site default \
-  --scope local \
-  --verify-tls false
+  --scope local
+```
+
+Validate local auth before running a larger endpoint sweep:
+```bash
+unifictl cloud validate --local-only
+```
+
+If a UniFi OS gateway returns `AUTHENTICATION_FAILED_LIMIT_REACHED`, recover over SSH:
+```bash
+ssh root@<udm-ip>
+systemctl list-units | grep -i 'unifi\|ulp'
+systemctl restart ulp-go
+systemctl restart unifi-core unifi-directory uos-agent
+```
+
+On newer UniFi OS builds, `unifi-os` may not exist as a service. The rate-limit config lives at:
+```bash
+grep -n "success.login.limit.count" /usr/lib/ulp-go/config.props
 ```
 
 Inventory and health:
@@ -258,12 +274,12 @@ unifictl local device list --unadopted --filter "pending"    # Combine filters
 Error handling and troubleshooting:
 ```bash
 # Validate credentials before use
-unifictl validate                              # Test both cloud and local
-unifictl validate --cloud-only                 # Test only cloud API
-unifictl validate --local-only                # Test only local controller
+unifictl cloud validate                        # Test both cloud and local
+unifictl cloud validate --cloud-only           # Test only cloud API
+unifictl cloud validate --local-only           # Test only local controller
 
 # View configuration (secrets masked)
-unifictl config-show
+unifictl cloud config-show
 
 # Better error messages now include:
 # - Specific error codes and causes

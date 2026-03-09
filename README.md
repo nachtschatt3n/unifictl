@@ -192,7 +192,7 @@ unifictl login \
   --controller-url https://192.168.1.1 \
   --username admin
 
-unifictl host list
+unifictl cloud host list
 ```
 
 ### 3. Basic Commands
@@ -308,18 +308,18 @@ print(f"Token efficient: {data['llm_metadata']['ai_guidance']['token_efficient']
 
 ```bash
 # Hosts
-unifictl host list
-unifictl host get <HOST_ID>
+unifictl cloud host list
+unifictl cloud host get <HOST_ID>
 
 # Sites and devices
-unifictl site list [--host-id <HOST_ID>]
-unifictl device list [--host-id <HOST_ID>] [--site-id <SITE_ID>]
-unifictl device get <DEVICE_ID>
+unifictl cloud site list [--host-id <HOST_ID>]
+unifictl cloud device list [--host-id <HOST_ID>] [--site-id <SITE_ID>]
+unifictl cloud device get <DEVICE_ID>
 
 # ISP metrics and SD-WAN (EA)
-unifictl isp get --type 5m --site-id <SITE_ID> --start <RFC3339> --end <RFC3339>
-unifictl sdwan list
-unifictl sdwan get <CONFIG_ID>
+unifictl cloud isp get --type 5m --site-id <SITE_ID> --start <RFC3339> --end <RFC3339>
+unifictl cloud sdwan list
+unifictl cloud sdwan get <CONFIG_ID>
 ```
 
 ### Local Controller
@@ -458,7 +458,7 @@ unifictl login --api-key "YOUR_API_KEY" \
   [--verify-tls] \
   [--scope local|user]
 
-unifictl config-show  # View current config (passwords masked)
+unifictl cloud config-show  # View current config (passwords masked)
 ```
 
 Omitting `--password` causes an interactive prompt with hidden input — this is the recommended approach to avoid exposing credentials in shell history.
@@ -471,19 +471,37 @@ Omitting `--password` causes an interactive prompt with hidden input — this is
 
 UniFi Dream Machines may hit login rate limits with CLI tools that create new sessions per command.
 
-**Symptoms**: Repeated 401 errors, intermittent authentication failures
+**Symptoms**: `403 invalid username/password`, `429 AUTHENTICATION_FAILED_LIMIT_REACHED`, or repeated local login failures
 
-**Solution**:
+**SSH recovery process (current UniFi OS)**:
 ```bash
-# SSH into your UDM
-vi /usr/lib/ulp-go/config.props
+# SSH directly to the console as root
+ssh root@<udm-ip>
 
-# Find and increase this value
-success.login.limit.count=100  # Default is 5-10
+# Inspect UniFi-related services
+systemctl list-units | grep -i 'unifi\|ulp'
 
-# Restart UniFi OS
-systemctl restart unifi-os
+# Confirm the login limiter config exists
+grep -n "success.login.limit.count" /usr/lib/ulp-go/config.props
+
+# Restart the auth service that owns the limiter on current UDM builds
+systemctl restart ulp-go
+
+# If needed, also restart the main UniFi services
+systemctl restart unifi-core unifi-directory uos-agent
 ```
+
+**Notes**:
+```bash
+# On newer firmware, `unifi-os` may not exist as a systemd service.
+# If you change the limiter, the config file is:
+/usr/lib/ulp-go/config.props
+
+# Example setting
+success.login.limit.count = 200
+```
+
+In testing on a current UDM Pro, restarting `ulp-go` cleared `AUTHENTICATION_FAILED_LIMIT_REACHED` while `systemctl restart unifi` and `systemctl restart unifi-core unifi-directory uos-agent` alone did not.
 
 ### Common Issues
 

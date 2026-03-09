@@ -24,7 +24,7 @@ use crate::config::{LocalConfig, Scope, resolve, resolve_local, save};
 use crate::local::LocalClient;
 use crate::schema::{SchemaRegistry, estimate_tokens, summarize_response};
 use anyhow::{Context, Result, anyhow};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use regex::RegexBuilder;
 use serde_json::json;
 use std::sync::OnceLock;
@@ -118,40 +118,34 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Set credentials for the cloud API and/or a local controller
+    #[command(args_conflicts_with_subcommands = true)]
     Login {
-        #[arg(long, value_name = "KEY", help = "Cloud API key (api.ui.com)")]
-        api_key: Option<String>,
-        #[arg(
-            long,
-            value_name = "URL",
-            help = "Local controller base URL (e.g. https://192.168.1.1)"
-        )]
-        controller_url: Option<String>,
-        #[arg(long, value_name = "USER", help = "Local controller username")]
-        username: Option<String>,
-        #[arg(long, value_name = "PASS", help = "Local controller password")]
-        password: Option<String>,
-        #[arg(
-            long,
-            value_name = "SITE",
-            default_value = "default",
-            help = "Local controller site name"
-        )]
-        site: String,
-        #[arg(
-            long,
-            default_value_t = false,
-            help = "Enable TLS certificate verification for the local controller"
-        )]
-        verify_tls: bool,
-        #[arg(
-            long,
-            value_enum,
-            default_value_t = ScopeArg::User,
-            help = "Where to write the config (local project dir or user config dir)"
-        )]
-        scope: ScopeArg,
+        #[command(subcommand)]
+        command: Option<LoginCommand>,
+        #[command(flatten)]
+        args: LoginSetArgs,
     },
+    /// Cloud (Site Manager API) operations
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommands,
+    },
+    /// Operate against a local UniFi controller using username/password
+    Local {
+        #[arg(long, global = true)]
+        site: Option<String>,
+        #[command(subcommand)]
+        command: LocalCommands,
+    },
+    /// Generate shell completion scripts
+    Completion {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudCommands {
     /// Host-related operations
     #[command(subcommand)]
     Host(HostCommand),
@@ -167,13 +161,46 @@ enum Commands {
     /// SD-WAN configuration helpers (EA)
     #[command(subcommand)]
     Sdwan(SdwanCommand),
-    /// Operate against a local UniFi controller using username/password
-    Local {
-        #[arg(long, global = true)]
-        site: Option<String>,
-        #[command(subcommand)]
-        command: LocalCommands,
-    },
+}
+
+#[derive(Args)]
+struct LoginSetArgs {
+    #[arg(long, value_name = "KEY", help = "Cloud API key (api.ui.com)")]
+    api_key: Option<String>,
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Local controller base URL (e.g. https://192.168.1.1)"
+    )]
+    controller_url: Option<String>,
+    #[arg(long, value_name = "USER", help = "Local controller username")]
+    username: Option<String>,
+    #[arg(long, value_name = "PASS", help = "Local controller password")]
+    password: Option<String>,
+    #[arg(
+        long,
+        value_name = "SITE",
+        default_value = "default",
+        help = "Local controller site name"
+    )]
+    site: String,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Enable TLS certificate verification for the local controller"
+    )]
+    verify_tls: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ScopeArg::User,
+        help = "Where to write the config (local project dir or user config dir)"
+    )]
+    scope: ScopeArg,
+}
+
+#[derive(Subcommand)]
+enum LoginCommand {
     /// Validate stored credentials (cloud/local)
     Validate {
         #[arg(long, help = "Validate only cloud (Site Manager) credentials")]
@@ -182,12 +209,7 @@ enum Commands {
         local_only: bool,
     },
     /// Show current configuration (secrets masked)
-    ConfigShow,
-    /// Generate shell completion scripts
-    Completion {
-        #[arg(value_enum)]
-        shell: CompletionShell,
-    },
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -1174,33 +1196,28 @@ fn main() -> Result<()> {
     FULL_IDS.get_or_init(|| cli.full_ids);
 
     if let Commands::Login {
-        api_key,
-        controller_url,
-        username,
-        password,
-        site,
-        verify_tls,
-        scope,
+        command: None,
+        args,
     } = &cli.command
     {
-        if api_key.is_none() && controller_url.is_none() {
+        if args.api_key.is_none() && args.controller_url.is_none() {
             return Err(anyhow!(
                 "Provide at least --api-key or --controller-url (with --username and --password)"
             ));
         }
 
-        let mut existing = config::load_scope((*scope).into(), &cwd)?;
+        let mut existing = config::load_scope(args.scope.into(), &cwd)?;
 
-        if let Some(key) = api_key {
+        if let Some(key) = &args.api_key {
             existing.api_key = Some(key.trim().to_string());
         }
 
-        if let Some(url) = controller_url {
+        if let Some(url) = &args.controller_url {
             let validated_url = validate_controller_url(url)?;
-            let u = username.clone().ok_or_else(|| {
+            let u = args.username.clone().ok_or_else(|| {
                 anyhow!("--username is required when setting a local controller URL")
             })?;
-            let p = match password {
+            let p = match &args.password {
                 Some(p) => {
                     eprintln!(
                         "Warning: passing --password on the command line is insecure.\n\
@@ -1217,12 +1234,12 @@ fn main() -> Result<()> {
             local_cfg.url = Some(validated_url);
             local_cfg.username = Some(u);
             local_cfg.password = Some(p);
-            local_cfg.site = Some(site.clone());
-            local_cfg.verify_tls = *verify_tls;
+            local_cfg.site = Some(args.site.clone());
+            local_cfg.verify_tls = args.verify_tls;
             existing.local = Some(local_cfg);
         }
 
-        let path = save((*scope).into(), &existing, &cwd)?;
+        let path = save(args.scope.into(), &existing, &cwd)?;
         println!("Credentials saved to {}", path.display());
         return Ok(());
     }
@@ -1242,201 +1259,205 @@ fn main() -> Result<()> {
     };
 
     match cli.command {
-        Commands::Host(command) => match command {
-            HostCommand::List => run_get(
-                &client,
-                "/v1/hosts",
-                vec![],
-                cli.output,
-                &render_opts,
-                Some(&[
-                    "name",
-                    "displayName",
-                    "type",
-                    "hostType",
-                    "status",
-                    "publicIp",
-                    "id",
-                ]),
-                cli.watch,
-            )?,
-            HostCommand::Get { id } => run_get(
-                &client,
-                &format!("/v1/hosts/{id}"),
-                vec![],
-                cli.output,
-                &render_opts,
-                None,
-                cli.watch,
-            )?,
-        },
-        Commands::Site(command) => match command {
-            SiteCommand::List { host_id } => {
-                let mut query = Vec::new();
-                if let Some(host) = host_id {
-                    query.push(("hostId", host));
-                }
-                run_get(
+        Commands::Cloud { command } => match command {
+            CloudCommands::Host(command) => match command {
+                HostCommand::List => run_get(
                     &client,
-                    "/v1/sites",
-                    query,
-                    cli.output,
-                    &render_opts,
-                    Some(&["name", "displayName", "hostId", "siteId", "id"]),
-                    cli.watch,
-                )?
-            }
-        },
-        Commands::Device(command) => match command {
-            DeviceCommand::List { host_id, site_id } => {
-                let mut query = Vec::new();
-                if let Some(host) = host_id {
-                    query.push(("hostId", host));
-                }
-                if let Some(site) = site_id {
-                    query.push(("siteId", site));
-                }
-                run_get(
-                    &client,
-                    "/v1/devices",
-                    query,
-                    cli.output,
-                    &render_opts,
-                    Some(&[
-                        "name",
-                        "displayName",
-                        "hostname",
-                        "model",
-                        "type",
-                        "siteId",
-                        "hostId",
-                        "ip",
-                        "mac",
-                        "version",
-                        "status",
-                    ]),
-                    cli.watch,
-                )?
-            }
-            DeviceCommand::Get {
-                id,
-                host_id,
-                site_id,
-            } => {
-                let mut query = Vec::new();
-                if let Some(host) = host_id {
-                    query.push(("hostId", host));
-                }
-                if let Some(site) = site_id {
-                    query.push(("siteId", site));
-                }
-                run_get(
-                    &client,
-                    &format!("/v1/devices/{id}"),
-                    query,
-                    cli.output,
-                    &render_opts,
-                    Some(&[
-                        "name",
-                        "displayName",
-                        "hostname",
-                        "model",
-                        "type",
-                        "ip",
-                        "mac",
-                        "siteId",
-                        "hostId",
-                        "version",
-                        "status",
-                    ]),
-                    cli.watch,
-                )?
-            }
-        },
-        Commands::Isp(command) => match command {
-            IspCommand::Get {
-                metric_type,
-                host_id,
-                site_id,
-                start,
-                end,
-            } => {
-                let mut query = Vec::new();
-                if let Some(host) = host_id {
-                    query.push(("hostId", host));
-                }
-                if let Some(site) = site_id {
-                    query.push(("siteId", site));
-                }
-                if let Some(start) = start {
-                    query.push(("start", start));
-                }
-                if let Some(end) = end {
-                    query.push(("end", end));
-                }
-                run_get(
-                    &client,
-                    &format!("/ea/isp-metrics/{metric_type}"),
-                    query,
-                    cli.output,
-                    &render_opts,
-                    None,
-                    cli.watch,
-                )?
-            }
-            IspCommand::Query {
-                metric_type,
-                body,
-                body_file,
-            } => {
-                let payload = parse_body(&body, &body_file)?
-                    .ok_or_else(|| anyhow!("Provide --body or --body-file with JSON content"))?;
-                run_post(
-                    &client,
-                    &format!("/ea/isp-metrics/{metric_type}/query"),
+                    "/v1/hosts",
                     vec![],
-                    payload,
+                    cli.output,
+                    &render_opts,
+                    Some(&[
+                        "name",
+                        "displayName",
+                        "type",
+                        "hostType",
+                        "status",
+                        "publicIp",
+                        "id",
+                    ]),
+                    cli.watch,
+                )?,
+                HostCommand::Get { id } => run_get(
+                    &client,
+                    &format!("/v1/hosts/{id}"),
+                    vec![],
                     cli.output,
                     &render_opts,
                     None,
-                )?
-            }
+                    cli.watch,
+                )?,
+            },
+            CloudCommands::Site(command) => match command {
+                SiteCommand::List { host_id } => {
+                    let mut query = Vec::new();
+                    if let Some(host) = host_id {
+                        query.push(("hostId", host));
+                    }
+                    run_get(
+                        &client,
+                        "/v1/sites",
+                        query,
+                        cli.output,
+                        &render_opts,
+                        Some(&["name", "displayName", "hostId", "siteId", "id"]),
+                        cli.watch,
+                    )?
+                }
+            },
+            CloudCommands::Device(command) => match command {
+                DeviceCommand::List { host_id, site_id } => {
+                    let mut query = Vec::new();
+                    if let Some(host) = host_id {
+                        query.push(("hostId", host));
+                    }
+                    if let Some(site) = site_id {
+                        query.push(("siteId", site));
+                    }
+                    run_get(
+                        &client,
+                        "/v1/devices",
+                        query,
+                        cli.output,
+                        &render_opts,
+                        Some(&[
+                            "name",
+                            "displayName",
+                            "hostname",
+                            "model",
+                            "type",
+                            "siteId",
+                            "hostId",
+                            "ip",
+                            "mac",
+                            "version",
+                            "status",
+                        ]),
+                        cli.watch,
+                    )?
+                }
+                DeviceCommand::Get {
+                    id,
+                    host_id,
+                    site_id,
+                } => {
+                    let mut query = Vec::new();
+                    if let Some(host) = host_id {
+                        query.push(("hostId", host));
+                    }
+                    if let Some(site) = site_id {
+                        query.push(("siteId", site));
+                    }
+                    run_get(
+                        &client,
+                        &format!("/v1/devices/{id}"),
+                        query,
+                        cli.output,
+                        &render_opts,
+                        Some(&[
+                            "name",
+                            "displayName",
+                            "hostname",
+                            "model",
+                            "type",
+                            "ip",
+                            "mac",
+                            "siteId",
+                            "hostId",
+                            "version",
+                            "status",
+                        ]),
+                        cli.watch,
+                    )?
+                }
+            },
+            CloudCommands::Isp(command) => match command {
+                IspCommand::Get {
+                    metric_type,
+                    host_id,
+                    site_id,
+                    start,
+                    end,
+                } => {
+                    let mut query = Vec::new();
+                    if let Some(host) = host_id {
+                        query.push(("hostId", host));
+                    }
+                    if let Some(site) = site_id {
+                        query.push(("siteId", site));
+                    }
+                    if let Some(start) = start {
+                        query.push(("start", start));
+                    }
+                    if let Some(end) = end {
+                        query.push(("end", end));
+                    }
+                    run_get(
+                        &client,
+                        &format!("/ea/isp-metrics/{metric_type}"),
+                        query,
+                        cli.output,
+                        &render_opts,
+                        None,
+                        cli.watch,
+                    )?
+                }
+                IspCommand::Query {
+                    metric_type,
+                    body,
+                    body_file,
+                } => {
+                    let payload = parse_body(&body, &body_file)?.ok_or_else(|| {
+                        anyhow!("Provide --body or --body-file with JSON content")
+                    })?;
+                    run_post(
+                        &client,
+                        &format!("/ea/isp-metrics/{metric_type}/query"),
+                        vec![],
+                        payload,
+                        cli.output,
+                        &render_opts,
+                        None,
+                    )?
+                }
+            },
+            CloudCommands::Sdwan(command) => match command {
+                SdwanCommand::List => run_get(
+                    &client,
+                    "/ea/sd-wan-configs",
+                    vec![],
+                    cli.output,
+                    &render_opts,
+                    Some(&["id", "name", "status", "hostId", "siteId"]),
+                    cli.watch,
+                )?,
+                SdwanCommand::Get { id } => run_get(
+                    &client,
+                    &format!("/ea/sd-wan-configs/{id}"),
+                    vec![],
+                    cli.output,
+                    &render_opts,
+                    None,
+                    cli.watch,
+                )?,
+                SdwanCommand::Status { id } => run_get(
+                    &client,
+                    &format!("/ea/sd-wan-configs/{id}/status"),
+                    vec![],
+                    cli.output,
+                    &render_opts,
+                    None,
+                    cli.watch,
+                )?,
+            },
         },
-        Commands::Sdwan(command) => match command {
-            SdwanCommand::List => run_get(
-                &client,
-                "/ea/sd-wan-configs",
-                vec![],
-                cli.output,
-                &render_opts,
-                Some(&["id", "name", "status", "hostId", "siteId"]),
-                cli.watch,
-            )?,
-            SdwanCommand::Get { id } => run_get(
-                &client,
-                &format!("/ea/sd-wan-configs/{id}"),
-                vec![],
-                cli.output,
-                &render_opts,
-                None,
-                cli.watch,
-            )?,
-            SdwanCommand::Status { id } => run_get(
-                &client,
-                &format!("/ea/sd-wan-configs/{id}/status"),
-                vec![],
-                cli.output,
-                &render_opts,
-                None,
-                cli.watch,
-            )?,
-        },
-        Commands::Local { site, command } => {
-            handle_local(command, site, &cwd, cli.output, &render_opts, cli.watch)?;
-        }
-        Commands::Validate {
-            cloud_only,
-            local_only,
+        Commands::Login {
+            command:
+                Some(LoginCommand::Validate {
+                    cloud_only,
+                    local_only,
+                }),
+            ..
         } => {
             if cloud_only && local_only {
                 return Err(anyhow!("Use only one of --cloud-only or --local-only"));
@@ -1467,7 +1488,10 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::ConfigShow => {
+        Commands::Login {
+            command: Some(LoginCommand::Show),
+            ..
+        } => {
             let merged = config::load(&cwd)?;
             let mut masked = merged.clone();
             if let Some(local) = masked.local.as_mut()
@@ -1479,6 +1503,9 @@ fn main() -> Result<()> {
                 masked.api_key = Some("*****".into());
             }
             println!("{}", serde_json::to_string_pretty(&masked)?);
+        }
+        Commands::Local { site, command } => {
+            handle_local(command, site, &cwd, cli.output, &render_opts, cli.watch)?;
         }
         Commands::Completion { shell } => {
             use clap_complete::{generate, shells};
@@ -1499,7 +1526,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Login { .. } => unreachable!("handled earlier"),
+        Commands::Login { command: None, .. } => unreachable!("handled earlier"),
     }
 
     Ok(())
@@ -4021,8 +4048,8 @@ fn handle_timeseries_command(
             format,
         } => {
             let query = json!({
-                "startTime": start,
-                "endTime": end,
+                "start": start,
+                "end": end,
                 "apMac": ap_mac.as_deref().unwrap_or("all"),
             });
             let stats = client.wifi_stats_details(&query)?;
@@ -4845,11 +4872,18 @@ fn print_table(
         table.sort_by(|a, b| a[idx].cmp(&b[idx]));
     }
 
+    let print_padded = |value: &str, width: usize| {
+        print!("{}", value);
+        if width > value.len() {
+            print!("{}", " ".repeat(width - value.len()));
+        }
+    };
+
     for (i, col) in columns.iter().enumerate() {
         if i > 0 {
             print!("  ");
         }
-        print!("{:width$}", col, width = widths[i]);
+        print_padded(col, widths[i]);
     }
     println!();
     // Separator
@@ -4857,7 +4891,7 @@ fn print_table(
         if i > 0 {
             print!("  ");
         }
-        print!("{:-<width$}", "", width = *width);
+        print!("{}", "-".repeat(*width));
     }
     println!();
     // Rows
@@ -4866,7 +4900,7 @@ fn print_table(
             if i > 0 {
                 print!("  ");
             }
-            print!("{:width$}", cell, width = widths[i]);
+            print_padded(cell, widths[i]);
         }
         println!();
     }

@@ -17,7 +17,7 @@
 use crate::client::ResponseData;
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, COOKIE, HeaderValue, SET_COOKIE, USER_AGENT};
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use std::sync::OnceLock;
@@ -33,6 +33,7 @@ pub struct LocalClient {
     logged_in: bool,
     is_legacy: bool,
     csrf: Option<String>,
+    session_cookie: Option<String>,
 }
 
 static UA: OnceLock<HeaderValue> = OnceLock::new();
@@ -65,6 +66,7 @@ impl LocalClient {
             logged_in: false,
             is_legacy: false,
             csrf: None,
+            session_cookie: None,
         })
     }
 
@@ -538,9 +540,14 @@ impl LocalClient {
         self.ensure_login()?;
         let urls = self.build_urls(site_scoped, fallback_global, path)?;
 
-        let send_once = |mut r: reqwest::blocking::RequestBuilder, csrf: &Option<String>| {
+        let send_once = |mut r: reqwest::blocking::RequestBuilder,
+                         csrf: &Option<String>,
+                         session_cookie: &Option<String>| {
             if let Some(token) = csrf {
                 r = r.header("X-CSRF-Token", token);
+            }
+            if let Some(cookie) = session_cookie {
+                r = r.header(COOKIE, cookie);
             }
             r.send()
         };
@@ -565,7 +572,11 @@ impl LocalClient {
                 req = req.json(b);
             }
 
-            let mut resp = send_once(req.try_clone().unwrap_or(req), &self.csrf);
+            let mut resp = send_once(
+                req.try_clone().unwrap_or(req),
+                &self.csrf,
+                &self.session_cookie,
+            );
 
             // If 401, relogin and retry once on same URL
             if let Ok(r) = &resp
@@ -587,7 +598,7 @@ impl LocalClient {
                 if let Some(b) = body {
                     retry = retry.json(b);
                 }
-                resp = send_once(retry, &self.csrf);
+                resp = send_once(retry, &self.csrf, &self.session_cookie);
             }
 
             match resp {
@@ -638,6 +649,7 @@ impl LocalClient {
     fn force_relogin(&mut self) -> Result<()> {
         self.logged_in = false;
         self.csrf = None;
+        self.session_cookie = None;
         self.login()
     }
 
@@ -680,15 +692,26 @@ impl LocalClient {
                 let os_resp = self.request_login(&url, &creds);
                 match os_resp {
                     Ok(resp) => {
+                        if !login_established(&resp) {
+                            last_err = Some(anyhow::anyhow!(
+                                "login succeeded at {} but no session cookie or CSRF token was returned",
+                                url
+                            ));
+                            continue;
+                        }
                         self.base_url = base.clone();
                         self.is_legacy = path.contains("api/login");
                         self.logged_in = true;
                         if let Some(token) = extract_csrf(&resp) {
                             self.csrf = Some(token);
                         }
+                        self.session_cookie = extract_session_cookie(&resp);
                         return Ok(());
                     }
                     Err(err) => {
+                        if err.to_string().contains("HTTP 429") {
+                            return Err(anyhow::anyhow!("login failed at {}: {}", url, err));
+                        }
                         last_err = Some(anyhow::anyhow!("login failed at {}: {}", url, err));
                         continue;
                     }
@@ -734,7 +757,25 @@ impl LocalClient {
             ));
         }
 
-        resp.error_for_status().context("sending login request")
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            let detail = format_login_error(&body);
+            return Err(anyhow!(
+                "HTTP {} {}",
+                status.as_u16(),
+                if detail.is_empty() {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("login request failed")
+                        .to_string()
+                } else {
+                    detail
+                }
+            ));
+        }
+
+        Ok(resp)
     }
 
     fn format_error_message(
@@ -984,6 +1025,47 @@ fn extract_csrf(resp: &reqwest::blocking::Response) -> Option<String> {
     None
 }
 
+fn login_established(resp: &reqwest::blocking::Response) -> bool {
+    extract_csrf(resp).is_some() || extract_session_cookie(resp).is_some()
+}
+
+fn extract_session_cookie(resp: &reqwest::blocking::Response) -> Option<String> {
+    if let Some(cookie) = resp.cookies().find(|c| c.name() != "csrf_token") {
+        return Some(format!("{}={}", cookie.name(), cookie.value()));
+    }
+
+    resp.headers().get_all(SET_COOKIE).iter().find_map(|value| {
+        let raw = value.to_str().ok()?;
+        let pair = raw.split(';').next()?.trim();
+        if pair.is_empty() || pair.starts_with("csrf_token=") || !pair.contains('=') {
+            return None;
+        }
+        Some(pair.to_string())
+    })
+}
+
+fn format_login_error(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            let message = json
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string);
+            let code = json
+                .get("code")
+                .and_then(|c| c.as_str())
+                .map(str::to_string);
+            match (message, code) {
+                (Some(message), Some(code)) => Some(format!("{message} ({code})")),
+                (Some(message), None) => Some(message),
+                (None, Some(code)) => Some(code),
+                (None, None) => None,
+            }
+        })
+        .unwrap_or_else(|| body.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,7 +1111,9 @@ mod tests {
                     json!({"username": "u", "password": "p", "remember": true, "strict": true}),
                 )
                 .header("X-Requested-With", "XMLHttpRequest");
-            then.status(200).json_body(json!({"logged_in": true}));
+            then.status(200)
+                .header("Set-Cookie", "unifises=legacy-session; Path=/; HttpOnly")
+                .json_body(json!({"logged_in": true}));
         });
         let sites = server.mock(|when, then| {
             when.method(GET).path("/api/self/sites");
@@ -1044,6 +1128,113 @@ mod tests {
         sites.assert();
         assert_eq!(resp.status, 200);
         assert!(resp.json.unwrap()["data"].is_array());
+    }
+
+    #[test]
+    fn login_requires_session_artifacts_and_falls_back() {
+        let server = MockServer::start();
+        let incomplete_login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login").json_body(
+                json!({"username": "u", "password": "p", "remember": true, "strict": true}),
+            );
+            then.status(200).json_body(json!({"ok": true}));
+        });
+        let fallback_login = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/api/auth/login")
+                .json_body(
+                    json!({"username": "u", "password": "p", "remember": true, "strict": true}),
+                );
+            then.status(200)
+                .header("Set-Cookie", "TOKEN=session-123; Path=/; HttpOnly")
+                .json_body(json!({"ok": true}));
+        });
+        let devices = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device")
+                .header("Cookie", "TOKEN=session-123");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.list_devices().unwrap();
+
+        incomplete_login.assert();
+        fallback_login.assert();
+        devices.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn format_login_error_uses_controller_message_and_code() {
+        let msg = format_login_error(
+            r#"{"message":"You've reached the login attempt limit","code":"AUTHENTICATION_FAILED_LIMIT_REACHED"}"#,
+        );
+        assert_eq!(
+            msg,
+            "You've reached the login attempt limit (AUTHENTICATION_FAILED_LIMIT_REACHED)"
+        );
+    }
+
+    #[test]
+    fn format_login_error_falls_back_to_plain_text() {
+        let msg = format_login_error("plain text failure");
+        assert_eq!(msg, "plain text failure");
+    }
+
+    #[test]
+    fn login_stops_on_rate_limit_instead_of_falling_back() {
+        let server = MockServer::start();
+        let limited = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(429).json_body(json!({
+                "message": "You've reached the login attempt limit",
+                "code": "AUTHENTICATION_FAILED_LIMIT_REACHED"
+            }));
+        });
+        let legacy = server.mock(|when, then| {
+            when.method(POST).path("/api/login");
+            then.status(401).json_body(json!({
+                "error": { "code": 401, "message": "Unauthorized" }
+            }));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let err = client.list_sites().unwrap_err().to_string();
+
+        limited.assert();
+        legacy.assert_hits(0);
+        assert!(err.contains("HTTP 429"));
+        assert!(err.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
+    }
+
+    #[test]
+    fn extract_session_cookie_reads_partitioned_token_header() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header(
+                    "Set-Cookie",
+                    "TOKEN=session-123; Path=/; Secure; HttpOnly; Partitioned",
+                )
+                .json_body(json!({"ok": true}));
+        });
+
+        let client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client
+            .http
+            .post(server.url("/api/auth/login"))
+            .header("X-Requested-With", "XMLHttpRequest")
+            .json(&json!({"username": "u", "password": "p"}))
+            .send()
+            .unwrap();
+
+        login.assert();
+        assert_eq!(
+            extract_session_cookie(&resp).as_deref(),
+            Some("TOKEN=session-123")
+        );
     }
 
     #[test]
