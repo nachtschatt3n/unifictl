@@ -95,7 +95,8 @@ unifictl local device list
 unifictl local device list --unadopted       # Show only pending/unadopted devices
 unifictl local device adopt-all             # Adopt all unadopted devices at once
 unifictl local device get <MAC> [--ports] [--config]  # device stats/config
-unifictl local device restart <MAC>          # Restart device
+unifictl local device restart <MAC>          # Restart device (reboots — ~1-2 min network blip)
+unifictl local device provision <MAC>        # Force-provision (reload config, no reboot; clears DNS cache)
 unifictl local device adopt <MAC>            # Adopt device
 unifictl local device upgrade <MAC>          # Upgrade device
 unifictl local client list
@@ -115,6 +116,35 @@ unifictl local wan get                       # WAN subset of health
 unifictl local dpi get
 unifictl local top-client list --limit 10
 unifictl local top-device list --limit 5
+```
+
+Static DNS records (Settings → Profiles → DNS Entries):
+```bash
+# List all static DNS records
+unifictl local dns list
+
+# Add an A record (hostname → IPv4); served immediately by the gateway dnsmasq
+unifictl local dns add sure.uhl.cool 192.168.55.100
+
+# Add an AAAA or CNAME record
+unifictl local dns add internal-v6.example sure::1 --record-type AAAA
+unifictl local dns add alias.uhl.cool real.uhl.cool --record-type CNAME
+
+# Update a record by id (partial — only provided fields change)
+unifictl local dns update <ID> --value 192.168.55.101
+unifictl local dns update <ID> --disabled
+
+# Delete a record
+unifictl local dns delete <ID>
+```
+
+Fixing stale negative DNS cache after a new internal service comes up (the `sure.uhl.cool` scenario):
+```bash
+# Option A — pin a static record so the gateway always serves it
+unifictl local dns add sure.uhl.cool 192.168.55.100
+
+# Option B — keep DNS in k8s-gateway; just tell the gateway to reload dnsmasq
+unifictl local device provision <gateway-MAC>
 ```
 
 System logs (v2 API):

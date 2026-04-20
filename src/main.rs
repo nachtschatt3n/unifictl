@@ -719,6 +719,9 @@ enum LocalCommands {
     /// Export time-series data for trend analysis
     #[command(subcommand)]
     TimeSeries(TimeSeriesCommand),
+    /// Static DNS record operations
+    #[command(subcommand)]
+    Dns(LocalDnsCommand),
 }
 
 #[derive(Subcommand)]
@@ -752,6 +755,13 @@ enum LocalDeviceCommand {
     },
     /// Restart the device
     Restart {
+        #[arg(value_name = "MAC")]
+        mac: String,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Force-provision the device (reload config without reboot)
+    Provision {
         #[arg(value_name = "MAC")]
         mac: String,
         #[arg(long)]
@@ -1118,6 +1128,61 @@ enum LocalStatCommand {
     },
     /// Get 5-minute AP report
     Report5min {
+        #[arg(long)]
+        site: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalDnsCommand {
+    /// List static DNS records
+    List {
+        #[arg(long)]
+        site: Option<String>,
+        /// Maximum number of results to return (default: 30)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Add a static DNS record
+    Add {
+        /// Hostname (key) for the record
+        #[arg(value_name = "HOST")]
+        host: String,
+        /// Value: IP address for A/AAAA, target hostname for CNAME
+        #[arg(value_name = "VALUE")]
+        value: String,
+        /// Record type (A, AAAA, CNAME, ...)
+        #[arg(long, default_value = "A")]
+        record_type: String,
+        /// Create the record in disabled state
+        #[arg(long)]
+        disabled: bool,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Update a static DNS record by id (partial; only provided fields change)
+    Update {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        value: Option<String>,
+        #[arg(long)]
+        record_type: Option<String>,
+        /// Enable the record
+        #[arg(long)]
+        enabled: bool,
+        /// Disable the record
+        #[arg(long, conflicts_with = "enabled")]
+        disabled: bool,
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Delete a static DNS record by id
+    Delete {
+        #[arg(value_name = "ID")]
+        id: String,
         #[arg(long)]
         site: Option<String>,
     },
@@ -1714,6 +1779,22 @@ fn handle_local(
             )?;
             render_response(
                 client.device_action(&mac, "restart")?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Device(LocalDeviceCommand::Provision { mac, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_response(
+                client.device_action(&mac, "force-provision")?,
                 output,
                 render_opts,
                 None,
@@ -3666,6 +3747,130 @@ fn handle_local(
             )?;
             handle_timeseries_command(&cmd, &mut client, output, global_site)?;
             Ok(())
+        }
+        LocalCommands::Dns(LocalDnsCommand::List { site: _, limit }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let mut resp = client.list_dns_records()?;
+            if let Some(mut json) = resp.json.clone() {
+                if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+                    && arr.len() > limit
+                {
+                    arr.truncate(limit);
+                }
+                resp.body = serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                resp.json = Some(json);
+            }
+            render_response(
+                resp,
+                output,
+                render_opts,
+                Some(&["_id", "key", "record_type", "value", "enabled"]),
+            )
+        }
+        LocalCommands::Dns(LocalDnsCommand::Add {
+            host,
+            value,
+            record_type,
+            disabled,
+            site: _,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let payload = serde_json::json!({
+                "key": host,
+                "record_type": record_type,
+                "value": value,
+                "enabled": !disabled,
+            });
+            render_response(
+                client.create_dns_record(&payload)?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Dns(LocalDnsCommand::Update {
+            id,
+            host,
+            value,
+            record_type,
+            enabled,
+            disabled,
+            site: _,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            if host.is_none() && value.is_none() && record_type.is_none() && !enabled && !disabled {
+                anyhow::bail!(
+                    "dns update requires at least one of --host, --value, --record-type, --enabled, --disabled"
+                );
+            }
+            // UniFi's static-dns PUT requires a full-object body; fetch the existing
+            // record and merge user-provided fields before sending.
+            let existing = client.list_dns_records()?;
+            let records = existing
+                .json
+                .as_ref()
+                .and_then(|j| j.as_array())
+                .ok_or_else(|| anyhow::anyhow!("unexpected list response shape"))?;
+            let mut record = records
+                .iter()
+                .find(|r| r.get("_id").and_then(|v| v.as_str()) == Some(id.as_str()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no DNS record with id {id}"))?;
+            let obj = record
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("record is not an object"))?;
+            if let Some(h) = host {
+                obj.insert("key".to_string(), serde_json::Value::String(h));
+            }
+            if let Some(v) = value {
+                obj.insert("value".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(rt) = record_type {
+                obj.insert("record_type".to_string(), serde_json::Value::String(rt));
+            }
+            if enabled {
+                obj.insert("enabled".to_string(), serde_json::Value::Bool(true));
+            } else if disabled {
+                obj.insert("enabled".to_string(), serde_json::Value::Bool(false));
+            }
+            render_response(
+                client.update_dns_record(&id, &record)?,
+                output,
+                render_opts,
+                None,
+            )
+        }
+        LocalCommands::Dns(LocalDnsCommand::Delete { id, site: _ }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_response(client.delete_dns_record(&id)?, output, render_opts, None)
         }
     }
 }
