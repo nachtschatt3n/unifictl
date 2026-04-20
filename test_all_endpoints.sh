@@ -224,6 +224,8 @@ echo "════════════════════════�
 test_command_outputs "Site List" "$BINARY local site list"
 test_command_outputs "Device List" "$BINARY local device list"
 test_command_outputs "Device List (Unadopted)" "$BINARY local device list --unadopted"
+test_command_outputs "DNS List" "$BINARY local dns list"
+# Device provision / dns mutations require a real MAC or record id; exercised manually, not in this script.
 test_command_outputs "Health Get" "$BINARY local health get"
 test_command_outputs "VPN Health Get" "$BINARY local vpn get"
 test_command_outputs "Security Get" "$BINARY local security get"

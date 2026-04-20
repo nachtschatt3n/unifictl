@@ -348,6 +348,26 @@ impl LocalClient {
         self.delete(true, &format!("rest/networkconf/{id}"))
     }
 
+    pub fn list_dns_records(&mut self) -> Result<ResponseData> {
+        self.get(true, false, "static-dns", Option::<&()>::None)
+    }
+
+    pub fn create_dns_record(&mut self, payload: &serde_json::Value) -> Result<ResponseData> {
+        self.post(true, "static-dns", Some(payload))
+    }
+
+    pub fn update_dns_record(
+        &mut self,
+        id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<ResponseData> {
+        self.put(true, &format!("static-dns/{id}"), Some(payload))
+    }
+
+    pub fn delete_dns_record(&mut self, id: &str) -> Result<ResponseData> {
+        self.delete(true, &format!("static-dns/{id}"))
+    }
+
     pub fn wlans(&mut self) -> Result<ResponseData> {
         self.get(true, true, "rest/wlanconf", Option::<&()>::None)
     }
@@ -1598,5 +1618,138 @@ mod tests {
         let data = resp.json.unwrap()["data"].as_array().unwrap().clone();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["subsystem"], "vpn");
+    }
+
+    #[test]
+    fn list_dns_records_calls_correct_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let records = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/v2/api/site/default/static-dns");
+            then.status(200).json_body(json!([]));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.list_dns_records().unwrap();
+
+        login.assert();
+        records.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn create_dns_record_posts_expected_body() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let create = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/static-dns")
+                .json_body(json!({
+                    "key": "sure.uhl.cool",
+                    "record_type": "A",
+                    "value": "192.168.55.100",
+                    "enabled": true
+                }));
+            then.status(200)
+                .json_body(json!({"_id": "abc123", "key": "sure.uhl.cool"}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let payload = json!({
+            "key": "sure.uhl.cool",
+            "record_type": "A",
+            "value": "192.168.55.100",
+            "enabled": true
+        });
+        let resp = client.create_dns_record(&payload).unwrap();
+
+        login.assert();
+        create.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn update_dns_record_puts_to_id_path() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let update = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/proxy/network/v2/api/site/default/static-dns/abc123")
+                .json_body(json!({"value": "192.168.55.101"}));
+            then.status(200).json_body(json!({"_id": "abc123"}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let payload = json!({"value": "192.168.55.101"});
+        let resp = client.update_dns_record("abc123", &payload).unwrap();
+
+        login.assert();
+        update.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn delete_dns_record_deletes_id_path() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let delete = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/proxy/network/v2/api/site/default/static-dns/abc123");
+            then.status(200).json_body(json!({"_id": "abc123"}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.delete_dns_record("abc123").unwrap();
+
+        login.assert();
+        delete.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn device_action_force_provision_sends_expected_body() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let provision = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/api/s/default/cmd/devmgr")
+                .json_body(json!({"cmd": "force-provision", "mac": "aa:bb:cc:dd:ee:ff"}));
+            then.status(200).json_body(json!({"ok": true}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client
+            .device_action("aa:bb:cc:dd:ee:ff", "force-provision")
+            .unwrap();
+
+        login.assert();
+        provision.assert();
+        assert_eq!(resp.status, 200);
     }
 }
