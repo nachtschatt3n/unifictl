@@ -158,6 +158,23 @@ unifictl local log critical                  # Get critical logs
 unifictl local log critical --limit 50       # Limit critical logs
 unifictl local log device-alert              # Get device alert logs
 unifictl local log device-alert --limit 20   # Limit device alerts
+unifictl local log admin-activity            # Audit log (ADMIN_ACCESS etc.)
+unifictl local log admin-activity --limit 20 # Limit audit entries
+```
+
+> **Note (modern UniFi OS):** On proxied UniFi-OS gateways (e.g. UDM/UDM-Pro)
+> the legacy `/api/s/{site}/stat/event` and `/api/s/{site}/system-log/*` routes
+> no longer exist. These commands now query the v2 endpoint
+> `POST /proxy/network/v2/api/site/{site}/system-log/{all|critical|device-alert|admin-activity}`.
+> `event list` is backed by `system-log/all`.
+
+Security / threat signals:
+```bash
+unifictl local stat alarm                    # Active threat / IPS-IDS alarms
+unifictl local stat alarm --archived         # Include acknowledged/archived alarms
+unifictl local stat alarm --limit 50         # Limit results
+unifictl local stat rogueap                  # Rogue AP detection
+unifictl local log admin-activity            # Admin access / audit trail
 ```
 
 WiFi/Radio operations (v2 API):

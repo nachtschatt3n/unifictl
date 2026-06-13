@@ -987,6 +987,13 @@ enum LocalLogCommand {
         #[arg(long, value_name = "LIMIT")]
         limit: Option<usize>,
     },
+    /// Get admin-activity / audit logs (ADMIN_ACCESS and other AUDIT events)
+    AdminActivity {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long, value_name = "LIMIT")]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1120,6 +1127,17 @@ enum LocalStatCommand {
     Rogueap {
         #[arg(long)]
         site: Option<String>,
+    },
+    /// Get threat-management / IPS-IDS alarms (and other system alarms)
+    Alarm {
+        #[arg(long)]
+        site: Option<String>,
+        /// Include archived/acknowledged alarms instead of only active ones
+        #[arg(long)]
+        archived: bool,
+        /// Maximum number of results to return (default: 30)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
     },
     /// Get SDN statistics
     Sdn {
@@ -2133,7 +2151,7 @@ fn handle_local(
                 },
                 output,
                 render_opts,
-                Some(&["time", "key", "msg", "subsystem"]),
+                Some(&["timestamp", "key", "category", "event", "message_raw"]),
                 watch,
             )
         }
@@ -2169,16 +2187,16 @@ fn handle_local(
             )?;
             let mut payload = serde_json::json!({});
             if let Some(lim) = limit {
-                payload["limit"] = serde_json::json!(lim);
+                payload["pageSize"] = serde_json::json!(lim);
             }
             if let Some(off) = offset {
-                payload["offset"] = serde_json::json!(off);
+                payload["pageNumber"] = serde_json::json!(off);
             }
             render_local(
                 || client.system_log_all(Some(&payload)),
                 output,
                 render_opts,
-                Some(&["time", "level", "msg", "subsystem", "key"]),
+                Some(&["timestamp", "key", "category", "subcategory", "message"]),
                 watch,
             )
         }
@@ -2208,12 +2226,12 @@ fn handle_local(
                 &effective.site,
                 effective.verify_tls,
             )?;
-            let payload = limit.map(|lim| serde_json::json!({ "limit": lim }));
+            let payload = limit.map(|lim| serde_json::json!({ "pageSize": lim }));
             render_local(
                 || client.system_log_critical(payload.as_ref()),
                 output,
                 render_opts,
-                Some(&["time", "level", "msg", "subsystem", "key"]),
+                Some(&["timestamp", "key", "category", "subcategory", "message"]),
                 watch,
             )
         }
@@ -2226,12 +2244,30 @@ fn handle_local(
                 &effective.site,
                 effective.verify_tls,
             )?;
-            let payload = limit.map(|lim| serde_json::json!({ "limit": lim }));
+            let payload = limit.map(|lim| serde_json::json!({ "pageSize": lim }));
             render_local(
                 || client.system_log_device_alert(payload.as_ref()),
                 output,
                 render_opts,
-                Some(&["time", "level", "msg", "subsystem", "key"]),
+                Some(&["timestamp", "key", "category", "subcategory", "message"]),
+                watch,
+            )
+        }
+        LocalCommands::Log(LocalLogCommand::AdminActivity { site: _, limit }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            let payload = limit.map(|lim| serde_json::json!({ "pageSize": lim }));
+            render_local(
+                || client.system_log_admin_activity(payload.as_ref()),
+                output,
+                render_opts,
+                Some(&["timestamp", "key", "category", "subcategory", "message"]),
                 watch,
             )
         }
@@ -2552,6 +2588,40 @@ fn handle_local(
                 effective.verify_tls,
             )?;
             render_local(|| client.stat_rogueap(), output, render_opts, None, watch)
+        }
+        LocalCommands::Stat(LocalStatCommand::Alarm {
+            site: _,
+            archived,
+            limit,
+        }) => {
+            let effective = resolve_local(cwd, site_override(global_site))?;
+            let mut client = LocalClient::new(
+                &effective.url,
+                &effective.username,
+                &effective.password,
+                &effective.site,
+                effective.verify_tls,
+            )?;
+            render_local(
+                || {
+                    let mut resp = client.list_alarms(archived)?;
+                    if let Some(mut json) = resp.json.clone() {
+                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+                            && arr.len() > limit
+                        {
+                            arr.truncate(limit);
+                        }
+                        resp.body =
+                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+                        resp.json = Some(json);
+                    }
+                    Ok(resp)
+                },
+                output,
+                render_opts,
+                Some(&["time", "key", "catname", "msg", "subsystem"]),
+                watch,
+            )
         }
         LocalCommands::Stat(LocalStatCommand::Sdn { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;

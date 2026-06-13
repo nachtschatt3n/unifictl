@@ -128,7 +128,14 @@ impl LocalClient {
     }
 
     pub fn system_log_all(&mut self, payload: Option<&serde_json::Value>) -> Result<ResponseData> {
-        self.post(true, "system-log/all", payload)
+        // Modern UniFi OS serves system-log queries at
+        // `/proxy/network/v2/api/site/{site}/system-log/{category}` (POST). The
+        // legacy `/api/s/{site}/system-log/...` route is gone, and the v2 route
+        // requires a JSON body, so always send at least `{}` (never None) — a
+        // body-less POST omits Content-Type and the v2 endpoint rejects it.
+        let empty = serde_json::json!({});
+        let payload = payload.unwrap_or(&empty);
+        self.post(true, "system-log/all", Some(payload))
     }
 
     pub fn system_log_count(
@@ -145,14 +152,30 @@ impl LocalClient {
         &mut self,
         payload: Option<&serde_json::Value>,
     ) -> Result<ResponseData> {
-        self.post(true, "system-log/critical", payload)
+        let empty = serde_json::json!({});
+        let payload = payload.unwrap_or(&empty);
+        self.post(true, "system-log/critical", Some(payload))
     }
 
     pub fn system_log_device_alert(
         &mut self,
         payload: Option<&serde_json::Value>,
     ) -> Result<ResponseData> {
-        self.post(true, "system-log/device-alert", payload)
+        let empty = serde_json::json!({});
+        let payload = payload.unwrap_or(&empty);
+        self.post(true, "system-log/device-alert", Some(payload))
+    }
+
+    /// Admin-activity / audit log (ADMIN_ACCESS and other AUDIT-category
+    /// events). On modern UniFi OS this lives at
+    /// `/proxy/network/v2/api/site/{site}/system-log/admin-activity` (POST).
+    pub fn system_log_admin_activity(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<ResponseData> {
+        let empty = serde_json::json!({});
+        let payload = payload.unwrap_or(&empty);
+        self.post(true, "system-log/admin-activity", Some(payload))
     }
 
     // WiFi/Radio (v2 API)
@@ -260,6 +283,17 @@ impl LocalClient {
         self.get(true, false, "stat/rogueap", Option::<&()>::None)
     }
 
+    /// Threat-management / IPS-IDS alarms (and other system alarms).
+    ///
+    /// On modern UniFi OS (proxied Network app) the legacy `stat/event` route
+    /// is gone, but the alarm list survives at `list/alarm` under the Network
+    /// API namespace. `archived=false` returns currently-active alarms;
+    /// `archived=true` returns historical/acknowledged ones.
+    pub fn list_alarms(&mut self, archived: bool) -> Result<ResponseData> {
+        let query = serde_json::json!({ "archived": archived });
+        self.get(true, false, "list/alarm", Some(&query))
+    }
+
     pub fn stat_sdn(&mut self) -> Result<ResponseData> {
         self.get(true, false, "stat/sdn", Option::<&()>::None)
     }
@@ -317,7 +351,11 @@ impl LocalClient {
     }
 
     pub fn list_events(&mut self) -> Result<ResponseData> {
-        self.get(true, false, "stat/event", Option::<&()>::None)
+        // Legacy `stat/event` is gone on modern UniFi OS. The general event feed
+        // now lives at `/proxy/network/v2/api/site/{site}/system-log/all` (POST,
+        // returns `{"data":[...]}`). Requires a JSON body — send `{}`.
+        let payload = serde_json::json!({});
+        self.post(true, "system-log/all", Some(&payload))
     }
 
     pub fn dpi(&mut self) -> Result<ResponseData> {
@@ -1493,6 +1531,128 @@ mod tests {
 
         login.assert();
         settings.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn system_log_critical_uses_v2_site_endpoint() {
+        // Regression: legacy `/api/s/{site}/system-log/critical` is gone on
+        // modern UniFi OS. The v1 proxy candidate 404s; the v2 site path serves
+        // it as a POST. Verify we fall through to the working v2 endpoint.
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let critical = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/critical");
+            then.status(200).json_body(json!([]));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.system_log_critical(None).unwrap();
+
+        login.assert();
+        critical.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn system_log_device_alert_uses_v2_site_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let alert = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/device-alert");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.system_log_device_alert(None).unwrap();
+
+        login.assert();
+        alert.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn system_log_admin_activity_uses_v2_site_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let audit = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/admin-activity");
+            then.status(200).json_body(json!([{"key": "ADMIN_ACCESS"}]));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.system_log_admin_activity(None).unwrap();
+
+        login.assert();
+        audit.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn list_events_uses_v2_system_log_all() {
+        // Regression: legacy `stat/event` (GET) is gone; events now come from
+        // the v2 `system-log/all` POST endpoint.
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let events = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all");
+            then.status(200)
+                .json_body(json!({"data": [{"key": "CLIENT_CONNECTED_WIRELESS_2"}]}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.list_events().unwrap();
+
+        login.assert();
+        events.assert();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn list_alarms_calls_list_alarm_endpoint() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let alarms = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/list/alarm")
+                .query_param("archived", "false");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = client.list_alarms(false).unwrap();
+
+        login.assert();
+        alarms.assert();
         assert_eq!(resp.status, 200);
     }
 

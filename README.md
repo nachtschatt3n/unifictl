@@ -424,7 +424,9 @@ unifictl local security get
 unifictl local wan get
 unifictl local dpi get
 unifictl local event list [--limit N]
-unifictl local log critical|all|count|device-alert
+unifictl local log critical|all|count|device-alert|admin-activity
+unifictl local stat alarm [--archived] [--limit N]   # threat / IPS-IDS alarms
+unifictl local stat rogueap
 unifictl local top-client list [--limit N]
 unifictl local top-device list [--limit N]
 ```

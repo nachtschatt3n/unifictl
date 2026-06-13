@@ -17,7 +17,7 @@ fn test_dry_run_flag_exists() {
 
 #[test]
 fn test_all_delete_commands_have_dry_run() {
-    let commands = vec![
+    let commands = [
         ("network", "delete"),
         ("wlan", "delete"),
         ("firewall-rule", "delete"),
