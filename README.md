@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-5.3.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
+[![Version](https://img.shields.io/badge/version-5.5.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
 [![Tests](https://img.shields.io/badge/tests-75%20passing-success.svg)](#testing)
 
 **A powerful CLI tool for UniFi networks with AI-first design**
