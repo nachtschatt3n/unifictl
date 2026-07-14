@@ -853,6 +853,21 @@ impl LocalClient {
             );
         }
 
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            // A 429 is rate limiting, NOT an expired session. Re-authenticating
+            // here would extend the controller's per-IP login lockout, so this
+            // must never be conflated with the 401 "session expired" path.
+            let detail = format_login_error(body);
+            let detail_line = if detail.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nController: {detail}")
+            };
+            return format!(
+                "Rate limited (429) at {url_str} - the controller is throttling requests, NOT a session expiry.{detail_line}\n\nWhat to do:\n  • Back off and retry after the rate-limit window; do NOT re-login on a 429 (it extends the per-IP lockout)\n  • Reads on a still-valid session can keep working - verify liveness with:\n      unifictl local health get"
+            );
+        }
+
         if status == StatusCode::BAD_REQUEST {
             let mut msg = format!("Failed to {}: HTTP 400", operation);
 
@@ -1264,6 +1279,37 @@ mod tests {
         legacy.assert_hits(0);
         assert!(err.contains("HTTP 429"));
         assert!(err.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
+    }
+
+    #[test]
+    fn format_error_message_classifies_429_as_rate_limit_not_session_expiry() {
+        let msg = LocalClient::format_error_message(
+            &Method::GET,
+            "stat/device",
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"message":"You've reached the login attempt limit","code":"AUTHENTICATION_FAILED_LIMIT_REACHED"}"#,
+            "https://controller.test/proxy/network/api/s/default/stat/device",
+        );
+        // Must be classified as rate limiting, never as an expired session.
+        assert!(msg.contains("Rate limited (429)"));
+        assert!(msg.contains("do NOT re-login"));
+        assert!(msg.contains("unifictl local health get"));
+        assert!(!msg.contains("Session expired"));
+        // Controller detail surfaced for triage.
+        assert!(msg.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
+    }
+
+    #[test]
+    fn format_error_message_401_still_reports_session_expiry() {
+        let msg = LocalClient::format_error_message(
+            &Method::GET,
+            "stat/device",
+            StatusCode::UNAUTHORIZED,
+            "",
+            "https://controller.test/proxy/network/api/s/default/stat/device",
+        );
+        assert!(msg.contains("Authentication failed (401)"));
+        assert!(msg.contains("Session expired"));
     }
 
     #[test]
