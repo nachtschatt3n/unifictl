@@ -18,6 +18,7 @@ mod client;
 mod config;
 mod local;
 mod schema;
+mod session;
 
 use crate::client::{ApiClient, ResponseData};
 use crate::config::{LocalConfig, Scope, resolve, resolve_local, save};
@@ -110,6 +111,13 @@ struct Cli {
         help = "Watch mode: refresh every SECONDS (tables only)"
     )]
     watch: Option<u64>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Do not reuse or persist the cached local-controller session (re-auth every command)"
+    )]
+    no_session_cache: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -1277,6 +1285,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().context("reading current directory")?;
     FULL_IDS.get_or_init(|| cli.full_ids);
+    session::set_disabled(cli.no_session_cache);
 
     if let Commands::Login {
         command: None,

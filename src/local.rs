@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::client::ResponseData;
+use crate::session;
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, COOKIE, HeaderValue, SET_COOKIE, USER_AGENT};
@@ -23,9 +24,11 @@ use serde::Serialize;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-#[derive(Debug)]
 pub struct LocalClient {
     base_url: Url,
+    /// The controller URL exactly as configured (cache key; may differ from
+    /// `base_url` when login falls back from `:8443` to `:443`).
+    configured_url: String,
     http: Client,
     username: String,
     password: String,
@@ -36,7 +39,40 @@ pub struct LocalClient {
     session_cookie: Option<String>,
 }
 
+// Hand-written Debug so credentials and session tokens never leak into logs,
+// panic messages, or error chains.
+impl std::fmt::Debug for LocalClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let present = |o: &Option<String>| if o.is_some() { "<redacted>" } else { "<none>" };
+        f.debug_struct("LocalClient")
+            .field("base_url", &self.base_url.as_str())
+            .field("configured_url", &self.configured_url)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("site", &self.site)
+            .field("logged_in", &self.logged_in)
+            .field("is_legacy", &self.is_legacy)
+            .field("csrf", &present(&self.csrf))
+            .field("session_cookie", &present(&self.session_cookie))
+            .finish()
+    }
+}
+
 static UA: OnceLock<HeaderValue> = OnceLock::new();
+
+/// Upper bound on how long we will sleep to honor a `Retry-After` on a 429
+/// read before giving up and surfacing the rate-limit error. Keeps the CLI
+/// responsive rather than blocking on a multi-minute lockout window.
+const RETRY_AFTER_CAP_SECS: u64 = 30;
+
+/// Parse a `Retry-After` header expressed in delta-seconds. HTTP-date form is
+/// intentionally not handled (UniFi controllers emit delta-seconds).
+fn parse_retry_after(resp: &reqwest::blocking::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
 
 impl LocalClient {
     pub fn new(
@@ -57,8 +93,9 @@ impl LocalClient {
             .build()
             .context("building local HTTP client")?;
 
-        Ok(Self {
+        let mut client = Self {
             base_url,
+            configured_url: url.to_string(),
             http,
             username: username.to_string(),
             password: password.to_string(),
@@ -67,7 +104,53 @@ impl LocalClient {
             is_legacy: false,
             csrf: None,
             session_cookie: None,
-        })
+        };
+        client.restore_cached_session();
+        Ok(client)
+    }
+
+    /// Adopt a persisted session, if one is cached for this controller. The
+    /// session is used optimistically: its validity is only confirmed on the
+    /// first request (a genuine 401/403 triggers exactly one re-login).
+    fn restore_cached_session(&mut self) {
+        if let Some(sess) = session::load(&self.configured_url, &self.username, &self.site) {
+            // Only adopt the cached resolved URL if it shares the configured
+            // controller's scheme and host. A tampered cache must not be able to
+            // redirect requests — or, via the 401 re-login path, the credential
+            // POST — to an attacker-controlled host. The port may legitimately
+            // differ (8443 -> 443 fallback), so it is not compared.
+            let resolved = match Url::parse(&sess.resolved_url) {
+                Ok(u)
+                    if u.scheme() == self.base_url.scheme()
+                        && u.host_str() == self.base_url.host_str() =>
+                {
+                    u
+                }
+                // Untrusted or mismatched cache entry: ignore it and fall back
+                // to a fresh login against the configured URL.
+                _ => return,
+            };
+            self.base_url = resolved;
+            self.csrf = sess.csrf;
+            self.session_cookie = sess.session_cookie;
+            self.is_legacy = sess.is_legacy;
+            self.logged_in = true;
+        }
+    }
+
+    /// Persist the current authenticated session to the on-disk cache
+    /// (best-effort; a cache-write failure never fails the command).
+    fn persist_session(&self) {
+        let _ = session::save(&session::CachedSession {
+            key_url: self.configured_url.clone(),
+            resolved_url: self.base_url.to_string(),
+            username: self.username.clone(),
+            site: self.site.clone(),
+            is_legacy: self.is_legacy,
+            csrf: self.csrf.clone(),
+            session_cookie: self.session_cookie.clone(),
+            created_at: session::now_secs(),
+        });
     }
 
     pub fn list_sites(&mut self) -> Result<ResponseData> {
@@ -586,6 +669,33 @@ impl LocalClient {
         self.request::<(), ()>(Method::DELETE, site_scoped, false, path, None, None::<&()>)
     }
 
+    /// Build a fully-formed request (headers + optional query/body). The CSRF
+    /// token and session cookie are added per-send by the caller's `send_once`.
+    fn build_request<Q: Serialize + ?Sized, B: Serialize + ?Sized>(
+        &self,
+        method: &Method,
+        url: &Url,
+        query: Option<&Q>,
+        body: Option<&B>,
+    ) -> reqwest::blocking::RequestBuilder {
+        let mut req = self
+            .http
+            .request(method.clone(), url.clone())
+            .header(ACCEPT, HeaderValue::from_static("application/json"))
+            .header(
+                USER_AGENT,
+                UA.get_or_init(|| HeaderValue::from_static("unifictl-local/0.1"))
+                    .clone(),
+            );
+        if let Some(q) = query {
+            req = req.query(q);
+        }
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        req
+    }
+
     fn request<Q: Serialize + ?Sized, B: Serialize + ?Sized>(
         &mut self,
         method: Method,
@@ -613,50 +723,40 @@ impl LocalClient {
         let mut last_err: Option<anyhow::Error> = None;
 
         for url in urls {
-            let mut req = self
-                .http
-                .request(method.clone(), url.clone())
-                .header(ACCEPT, HeaderValue::from_static("application/json"))
-                .header(
-                    USER_AGENT,
-                    UA.get_or_init(|| HeaderValue::from_static("unifictl-local/0.1"))
-                        .clone(),
-                );
-
-            if let Some(q) = query {
-                req = req.query(q);
-            }
-            if let Some(b) = body {
-                req = req.json(b);
-            }
-
             let mut resp = send_once(
-                req.try_clone().unwrap_or(req),
+                self.build_request(&method, &url, query, body),
                 &self.csrf,
                 &self.session_cookie,
             );
 
-            // If 401, relogin and retry once on same URL
+            // Genuine session expiry (401/403): re-login exactly once and retry.
+            // A 429 (rate limit) or a network timeout must NEVER reach this
+            // branch — re-authenticating on a 429 extends the per-IP lockout.
             if let Ok(r) = &resp
-                && r.status() == StatusCode::UNAUTHORIZED
+                && matches!(r.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
             {
                 self.force_relogin()?;
-                let mut retry = self
-                    .http
-                    .request(method.clone(), url.clone())
-                    .header(ACCEPT, HeaderValue::from_static("application/json"))
-                    .header(
-                        USER_AGENT,
-                        UA.get_or_init(|| HeaderValue::from_static("unifictl-local/0.1"))
-                            .clone(),
-                    );
-                if let Some(q) = query {
-                    retry = retry.query(q);
-                }
-                if let Some(b) = body {
-                    retry = retry.json(b);
-                }
-                resp = send_once(retry, &self.csrf, &self.session_cookie);
+                resp = send_once(
+                    self.build_request(&method, &url, query, body),
+                    &self.csrf,
+                    &self.session_cookie,
+                );
+            }
+
+            // Rate limited (429) on an idempotent read: honor Retry-After by
+            // backing off once and retrying WITHOUT re-authenticating.
+            if method == Method::GET
+                && let Ok(r) = &resp
+                && r.status() == StatusCode::TOO_MANY_REQUESTS
+                && let Some(wait) = parse_retry_after(r)
+                && wait <= RETRY_AFTER_CAP_SECS
+            {
+                std::thread::sleep(Duration::from_secs(wait));
+                resp = send_once(
+                    self.build_request(&method, &url, query, body),
+                    &self.csrf,
+                    &self.session_cookie,
+                );
             }
 
             match resp {
@@ -688,7 +788,21 @@ impl LocalClient {
                     });
                 }
                 Err(err) => {
-                    last_err = Some(anyhow!("{} at {}", err, url));
+                    // Classify transport failures distinctly from auth failures:
+                    // a timeout/connection error is not an expired session and
+                    // must never trigger a re-login.
+                    let msg = if err.is_timeout() {
+                        format!(
+                            "Network timeout talking to the controller at {url} — not an authentication problem; the session was not re-authenticated"
+                        )
+                    } else if err.is_connect() {
+                        format!(
+                            "Connection error reaching the controller at {url} — not an authentication problem; the session was not re-authenticated"
+                        )
+                    } else {
+                        format!("{err} at {url}")
+                    };
+                    last_err = Some(anyhow!(msg));
                     continue;
                 }
             }
@@ -708,6 +822,8 @@ impl LocalClient {
         self.logged_in = false;
         self.csrf = None;
         self.session_cookie = None;
+        // Invalidate the stale on-disk session; login() rewrites it on success.
+        session::clear();
         self.login()
     }
 
@@ -764,6 +880,7 @@ impl LocalClient {
                             self.csrf = Some(token);
                         }
                         self.session_cookie = extract_session_cookie(&resp);
+                        self.persist_session();
                         return Ok(());
                     }
                     Err(err) => {
@@ -1310,6 +1427,169 @@ mod tests {
         );
         assert!(msg.contains("Authentication failed (401)"));
         assert!(msg.contains("Session expired"));
+    }
+
+    #[test]
+    fn cached_session_is_reused_without_relogin() {
+        let dir = tempfile::tempdir().unwrap();
+        session::test_set_dir(dir.path());
+
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        });
+        let devices = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device")
+                .header("X-CSRF-Token", "abc123");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        // First invocation authenticates and persists the session.
+        let mut c1 = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        c1.list_devices().unwrap();
+
+        // Second invocation restores the cached session — no second login.
+        let mut c2 = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        c2.list_devices().unwrap();
+
+        login.assert_hits(1);
+        devices.assert_hits(2);
+    }
+
+    #[test]
+    fn genuine_401_triggers_exactly_one_reauth() {
+        let dir = tempfile::tempdir().unwrap();
+        session::test_set_dir(dir.path());
+
+        let server = MockServer::start();
+        // Seed a stale cached session.
+        session::save(&session::CachedSession {
+            key_url: server.base_url(),
+            resolved_url: server.base_url(),
+            username: "u".into(),
+            site: "default".into(),
+            is_legacy: false,
+            csrf: Some("stale".into()),
+            session_cookie: None,
+            created_at: session::now_secs(),
+        })
+        .unwrap();
+
+        let stale = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device")
+                .header("X-CSRF-Token", "stale");
+            then.status(401).json_body(json!({"error": "unauthorized"}));
+        });
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "fresh")
+                .json_body(json!({"ok": true}));
+        });
+        let fresh = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device")
+                .header("X-CSRF-Token", "fresh");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut c = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = c.list_devices().unwrap();
+
+        stale.assert_hits(1);
+        login.assert_hits(1); // exactly one re-auth
+        fresh.assert_hits(1);
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn rate_limited_429_never_reauths() {
+        let dir = tempfile::tempdir().unwrap();
+        session::test_set_dir(dir.path());
+
+        let server = MockServer::start();
+        session::save(&session::CachedSession {
+            key_url: server.base_url(),
+            resolved_url: server.base_url(),
+            username: "u".into(),
+            site: "default".into(),
+            is_legacy: false,
+            csrf: Some("abc".into()),
+            session_cookie: None,
+            created_at: session::now_secs(),
+        })
+        .unwrap();
+
+        // Every candidate device URL is rate limited (no Retry-After header).
+        let devices = server.mock(|when, then| {
+            when.method(GET).path_contains("stat/device");
+            then.status(429).json_body(json!({
+                "message": "You've reached the login attempt limit",
+                "code": "AUTHENTICATION_FAILED_LIMIT_REACHED"
+            }));
+        });
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "x")
+                .json_body(json!({"ok": true}));
+        });
+
+        let mut c = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let err = c.list_devices().unwrap_err().to_string();
+
+        login.assert_hits(0); // a 429 must NEVER trigger a re-login
+        assert!(devices.hits() >= 1);
+        assert!(err.contains("Rate limited (429)"));
+        assert!(!err.contains("Session expired"));
+    }
+
+    #[test]
+    fn poisoned_resolved_url_falls_back_to_fresh_login() {
+        let dir = tempfile::tempdir().unwrap();
+        session::test_set_dir(dir.path());
+
+        let server = MockServer::start();
+        // A tampered cache entry whose resolved_url points at a DIFFERENT host
+        // than the configured controller, with an attacker-supplied token.
+        session::save(&session::CachedSession {
+            key_url: server.base_url(),
+            resolved_url: "http://attacker.example:9".into(),
+            username: "u".into(),
+            site: "default".into(),
+            is_legacy: false,
+            csrf: Some("evil".into()),
+            session_cookie: Some("TOKEN=evil".into()),
+            created_at: session::now_secs(),
+        })
+        .unwrap();
+
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "good")
+                .json_body(json!({"ok": true}));
+        });
+        let devices = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device")
+                .header("X-CSRF-Token", "good");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let mut c = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let resp = c.list_devices().unwrap();
+
+        // The tampered host is ignored: we log in fresh against the configured
+        // controller and never send the "evil" token to attacker.example.
+        login.assert_hits(1);
+        devices.assert_hits(1);
+        assert_eq!(resp.status, 200);
     }
 
     #[test]
