@@ -22,7 +22,7 @@ mod session;
 
 use crate::client::{ApiClient, ResponseData};
 use crate::config::{LocalConfig, Scope, resolve, resolve_local, save};
-use crate::local::LocalClient;
+use crate::local::{LocalClient, list_payload_mut, mac_matches};
 use crate::schema::{SchemaRegistry, estimate_tokens, summarize_response};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -827,7 +827,9 @@ enum LocalClientCommand {
         wireless: bool,
         #[arg(long, help = "Only blocked clients")]
         blocked: bool,
-        /// Maximum number of results to return (default: 30)
+        /// Maximum number of clients to return. Defaults to 30, so larger
+        /// networks ARE cut short — a warning naming the full count is printed
+        /// on stderr whenever that happens
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
@@ -856,7 +858,8 @@ enum LocalClientCommand {
     Active {
         #[arg(long)]
         site: Option<String>,
-        /// Maximum number of results to return (default: 30)
+        /// Maximum number of clients to return. Defaults to 30; a warning
+        /// naming the full count is printed on stderr when results are cut
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
@@ -864,9 +867,13 @@ enum LocalClientCommand {
     History {
         #[arg(long)]
         site: Option<String>,
+        /// Only history for this client. Matching is case-insensitive and
+        /// accepts colon, dash or bare-hex MAC forms
         #[arg(long, value_name = "MAC")]
         mac: Option<String>,
-        /// Maximum number of results to return (default: 30)
+        /// Maximum number of history entries to return. Defaults to 30; a
+        /// warning naming the full count is printed on stderr when results are
+        /// cut
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
@@ -887,7 +894,9 @@ enum LocalEventCommand {
     List {
         #[arg(long)]
         site: Option<String>,
-        /// Maximum number of results to return (default: 30)
+        /// Maximum number of events to return. Values above the controller's
+        /// 50-per-page default are served by paginating; a warning is printed
+        /// on stderr if fewer than requested could be retrieved
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
@@ -1930,7 +1939,7 @@ fn handle_local(
                 || {
                     let mut resp = client.list_clients()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                        if let Some(arr) = list_payload_mut(&mut json) {
                             arr.retain(|item| {
                                 let is_wired = item
                                     .get("is_wired")
@@ -1947,9 +1956,7 @@ fn handle_local(
                                     || (blocked && is_blocked)
                                     || (!wired && !wireless && !blocked)
                             });
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
+                            truncate_with_warning(arr, limit, "clients");
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
@@ -2033,10 +2040,10 @@ fn handle_local(
                 || {
                     let mut resp = client.clients_v2_active()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
-                            && arr.len() > limit
-                        {
-                            arr.truncate(limit);
+                        // v2 endpoint: bare array, no `data` envelope — see the
+                        // note in `client history`.
+                        if let Some(arr) = list_payload_mut(&mut json) {
+                            truncate_with_warning(arr, limit, "active clients");
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
@@ -2068,18 +2075,22 @@ fn handle_local(
                 move || {
                     let mut resp = client.clients_v2_history()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            if let Some(ref mac_val) = mac_filter {
-                                arr.retain(|item| {
-                                    item.get("mac")
-                                        .and_then(|m| m.as_str())
-                                        .map(|m| m.eq_ignore_ascii_case(mac_val))
-                                        .unwrap_or(false)
-                                });
+                        // `clients/history` is a v2 endpoint: it answers with a
+                        // bare array, not a `{"data": …}` envelope. Reaching
+                        // straight for `data` found nothing, so both --mac and
+                        // --limit were silently ignored here.
+                        if let Some(arr) = list_payload_mut(&mut json) {
+                            if let Some(ref mac_val) = mac_filter
+                                && !retain_clients_with_mac(arr, mac_val)
+                            {
+                                eprintln!(
+                                    "No matching client: no entry in the connection history has \
+                                     MAC {mac_val}. (History covers clients the controller still \
+                                     remembers; try `client active` or `client list` for \
+                                     currently known clients.)"
+                                );
                             }
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
+                            truncate_with_warning(arr, limit, "history entries");
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
@@ -2145,16 +2156,24 @@ fn handle_local(
             )?;
             render_local(
                 || {
-                    let mut resp = client.list_events()?;
-                    if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
-                            && arr.len() > limit
-                        {
-                            arr.truncate(limit);
+                    // The v2 event feed pages at 50 records unless `pageSize`
+                    // is sent, so truncating a single default response could
+                    // never honor a --limit above 50. Paginate instead, and say
+                    // so out loud when the controller runs dry early.
+                    let (resp, stats) = client.list_events_paged(limit)?;
+                    if stats.truncated {
+                        match stats.total_available {
+                            Some(total) => eprintln!(
+                                "Warning: requested {} events but only {} could be retrieved \
+                                 ({} exist on the controller). Results are incomplete.",
+                                stats.requested, stats.returned, total
+                            ),
+                            None => eprintln!(
+                                "Warning: requested {} events but only {} could be retrieved. \
+                                 Results are incomplete.",
+                                stats.requested, stats.returned
+                            ),
                         }
-                        resp.body =
-                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                        resp.json = Some(json);
                     }
                     Ok(resp)
                 },
@@ -4467,6 +4486,37 @@ fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()>
     Ok(())
 }
 
+/// Retain only the client records whose `mac` field matches `mac`.
+///
+/// Returns `true` when at least one record survived, so callers can report a
+/// clean "no matching client" instead of rendering an empty table.
+fn retain_clients_with_mac(arr: &mut Vec<serde_json::Value>, mac: &str) -> bool {
+    arr.retain(|item| {
+        item.get("mac")
+            .and_then(|m| m.as_str())
+            .map(|m| mac_matches(m, mac))
+            .unwrap_or(false)
+    });
+    !arr.is_empty()
+}
+
+/// Truncate a list payload to `limit`, telling the user on stderr when rows
+/// were dropped.
+///
+/// Silent truncation is indistinguishable from "that is all there is", which
+/// is exactly how a capped result set turns into a wrong conclusion. The
+/// notice goes to stderr so `-o json` output stays machine-parseable.
+fn truncate_with_warning(arr: &mut Vec<serde_json::Value>, limit: usize, resource: &str) {
+    let total = arr.len();
+    if total > limit {
+        arr.truncate(limit);
+        eprintln!(
+            "Warning: showing {limit} of {total} {resource} — output truncated by --limit. \
+             Re-run with --limit {total} (or higher) to see them all."
+        );
+    }
+}
+
 fn render_local<F>(
     mut fetch: F,
     output: OutputFormat,
@@ -5414,6 +5464,81 @@ fn parse_body(
         }
         (None, None) => Ok(None),
         (Some(_), Some(_)) => Err(anyhow!("use only one of --body or --body-file")),
+    }
+}
+
+#[cfg(test)]
+mod client_filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn history_payload() -> serde_json::Value {
+        // `clients/history` answers with a bare array, not a `data` envelope.
+        json!([
+            {"mac": "d4:8a:fc:44:0c:48", "hostname": "smoke-detector"},
+            {"mac": "aa:bb:cc:dd:ee:ff", "hostname": "laptop"},
+            {"mac": "11:22:33:44:55:66", "hostname": "printer"},
+        ])
+    }
+
+    #[test]
+    fn mac_filter_keeps_only_the_matching_client() {
+        // Regression: --mac was accepted but never applied, so a lookup for one
+        // client returned the entire offline set.
+        let mut json = history_payload();
+        let arr = list_payload_mut(&mut json).expect("bare v2 array is a list payload");
+        assert!(retain_clients_with_mac(arr, "d4:8a:fc:44:0c:48"));
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["hostname"], json!("smoke-detector"));
+    }
+
+    #[test]
+    fn mac_filter_is_case_insensitive_and_separator_agnostic() {
+        for probe in ["D4:8A:FC:44:0C:48", "d48afc440c48", "D4-8A-FC-44-0C-48"] {
+            let mut json = history_payload();
+            let arr = list_payload_mut(&mut json).expect("list payload");
+            assert!(
+                retain_clients_with_mac(arr, probe),
+                "probe {probe} should match"
+            );
+            assert_eq!(arr.len(), 1, "probe {probe} matched the wrong count");
+        }
+    }
+
+    #[test]
+    fn mac_filter_reports_no_match_instead_of_dumping_everything() {
+        let mut json = history_payload();
+        let arr = list_payload_mut(&mut json).expect("list payload");
+        assert!(
+            !retain_clients_with_mac(arr, "de:ad:be:ef:00:01"),
+            "an unmatched MAC must be reported as no-match"
+        );
+        assert!(
+            arr.is_empty(),
+            "a failed filter must never fall back to the full set"
+        );
+    }
+
+    #[test]
+    fn mac_filter_skips_records_without_a_mac_field() {
+        let mut json = json!([{"hostname": "ghost"}, {"mac": "d4:8a:fc:44:0c:48"}]);
+        let arr = list_payload_mut(&mut json).expect("list payload");
+        assert!(retain_clients_with_mac(arr, "d4:8a:fc:44:0c:48"));
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[test]
+    fn truncate_with_warning_caps_at_limit() {
+        let mut arr: Vec<serde_json::Value> = (0..50).map(|i| json!({"n": i})).collect();
+        truncate_with_warning(&mut arr, 30, "clients");
+        assert_eq!(arr.len(), 30);
+    }
+
+    #[test]
+    fn truncate_with_warning_leaves_short_lists_alone() {
+        let mut arr: Vec<serde_json::Value> = (0..5).map(|i| json!({"n": i})).collect();
+        truncate_with_warning(&mut arr, 30, "clients");
+        assert_eq!(arr.len(), 5);
     }
 }
 

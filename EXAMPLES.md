@@ -107,8 +107,11 @@ unifictl local client reconnect <MAC>        # Force reconnect (kick)
 unifictl local client active                 # Get active clients (v2 API)
 unifictl local client history                # Get client connection history
 unifictl local client history --mac <MAC>    # Filter history by MAC address
+unifictl local client history --mac D48AFC440C48   # case/separator-insensitive
+unifictl local client list --limit 200       # raise the default 30-row cap
 unifictl local client update-metadata <MAC> --metadata '{"name": "My Device"}'
 unifictl local event list
+unifictl local event list --limit 3000       # paginates; 50/page is the API default
 unifictl local health get
 unifictl local vpn get                       # VPN health with packet-loss reasons
 unifictl local security get
@@ -167,6 +170,11 @@ unifictl local log admin-activity --limit 20 # Limit audit entries
 > no longer exist. These commands now query the v2 endpoint
 > `POST /proxy/network/v2/api/site/{site}/system-log/{all|critical|device-alert|admin-activity}`.
 > `event list` is backed by `system-log/all`.
+>
+> That endpoint pages at **50 records** unless `pageSize` is sent, and its
+> `pageNumber` is **0-based** (page 0 is the newest slice). `event list`
+> paginates for you to satisfy `--limit`; if the controller cannot supply the
+> full amount it warns on stderr rather than returning a short answer silently.
 
 Security / threat signals:
 ```bash

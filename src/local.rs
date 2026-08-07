@@ -74,6 +74,72 @@ fn parse_retry_after(resp: &reqwest::blocking::Response) -> Option<u64> {
         .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
+/// Largest `pageSize` we will ask the controller for in a single request.
+/// (Omitting `pageSize` entirely makes the controller fall back to 50 — the
+/// default that silently capped `event list --limit 3000` at 50 rows.)
+/// Bigger requests are served by paginating rather than by one huge fetch.
+pub const SYSTEM_LOG_MAX_PAGE_SIZE: usize = 1000;
+
+/// Safety stop so a controller that keeps handing back full pages can never
+/// spin this into an unbounded request loop.
+pub const SYSTEM_LOG_MAX_PAGES: usize = 500;
+
+/// Mutable access to the list payload of a UniFi controller response.
+///
+/// The two API generations disagree on shape: v1 (`/api/s/{site}/...`) wraps
+/// results in `{"meta": …, "data": [...]}`, while v2
+/// (`/proxy/network/v2/api/site/{site}/...`, e.g. `clients/history` and
+/// `clients/active`) returns a **bare array**. Code that reached only for
+/// `data` therefore found nothing on every v2 list endpoint and silently
+/// skipped both filtering and `--limit`.
+pub fn list_payload_mut(json: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
+    if json.is_array() {
+        return json.as_array_mut();
+    }
+    json.get_mut("data").and_then(|d| d.as_array_mut())
+}
+
+/// Read-only counterpart to [`list_payload_mut`].
+pub fn list_payload(json: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    if json.is_array() {
+        return json.as_array();
+    }
+    json.get("data").and_then(|d| d.as_array())
+}
+
+/// Strip the separators UniFi and users mix freely (`:`, `-`, `.`, spaces) so
+/// `d4:8a:fc:44:0c:48`, `D4-8A-FC-44-0C-48` and `d48afc440c48` all compare
+/// equal.
+fn normalize_mac(mac: &str) -> String {
+    mac.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Compare two MAC addresses case-insensitively and independently of
+/// separator style.
+pub fn mac_matches(a: &str, b: &str) -> bool {
+    let (a, b) = (normalize_mac(a), normalize_mac(b));
+    !a.is_empty() && a == b
+}
+
+/// Outcome of a paginated fetch, so callers can tell "that is all there is"
+/// apart from "we could not deliver everything you asked for".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedFetch {
+    /// Number of records the caller asked for.
+    pub requested: usize,
+    /// Number of records actually returned.
+    pub returned: usize,
+    /// Total records the controller reports as available, when it says so.
+    pub total_available: Option<usize>,
+    /// True when the controller holds more records than we returned *and* the
+    /// caller asked for more than we could deliver. Callers must surface this
+    /// — a silent short read reads as "that is all there is".
+    pub truncated: bool,
+}
+
 impl LocalClient {
     pub fn new(
         url: &str,
@@ -437,8 +503,112 @@ impl LocalClient {
         // Legacy `stat/event` is gone on modern UniFi OS. The general event feed
         // now lives at `/proxy/network/v2/api/site/{site}/system-log/all` (POST,
         // returns `{"data":[...]}`). Requires a JSON body — send `{}`.
+        //
+        // NOTE: an empty body means the controller applies its own default
+        // page size (50). Callers that honor a user-supplied `--limit` must use
+        // [`LocalClient::list_events_paged`] instead.
         let payload = serde_json::json!({});
         self.post(true, "system-log/all", Some(&payload))
+    }
+
+    /// Fetch up to `limit` events, paginating `system-log/all` as needed.
+    ///
+    /// The v2 endpoint pages at 50 records when `pageSize` is omitted, so the
+    /// old "fetch once, truncate client-side" approach could never return more
+    /// than 50 events no matter what `--limit` asked for. We request
+    /// `pageSize` explicitly and walk `pageNumber` (**0-based** — page 0 is the
+    /// newest slice; starting at 1 silently drops the most recent page) until
+    /// the limit is
+    /// met or the controller runs out of records, then report — via
+    /// [`PagedFetch`] — whether anything was left behind.
+    pub fn list_events_paged(&mut self, limit: usize) -> Result<(ResponseData, PagedFetch)> {
+        let mut collected: Vec<serde_json::Value> = Vec::new();
+        let mut total_available: Option<usize> = None;
+        let mut page_size = limit.clamp(1, SYSTEM_LOG_MAX_PAGE_SIZE);
+        // Page numbering is 0-based: page 0 holds the newest records.
+        let mut page_number = 0usize;
+        let mut last_resp: Option<ResponseData> = None;
+        let mut hit_page_cap = false;
+
+        while collected.len() < limit {
+            if page_number >= SYSTEM_LOG_MAX_PAGES {
+                hit_page_cap = true;
+                break;
+            }
+
+            let payload = serde_json::json!({
+                "pageSize": page_size,
+                "pageNumber": page_number,
+            });
+            // A non-success status is turned into an `Err` by `request`, so any
+            // API failure propagates here rather than being masked behind a
+            // half-filled page.
+            let resp = self.system_log_all(Some(&payload))?;
+
+            let json = match resp.json.clone() {
+                Some(j) => j,
+                None => {
+                    last_resp = Some(resp);
+                    break;
+                }
+            };
+            if let Some(total) = json
+                .get("total_element_count")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+            {
+                total_available = Some(total);
+            }
+            let page_items = list_payload(&json).cloned().unwrap_or_default();
+            let got = page_items.len();
+            collected.extend(page_items);
+            last_resp = Some(resp);
+
+            if got == 0 {
+                break;
+            }
+            if let Some(total) = total_available
+                && collected.len() >= total
+            {
+                break;
+            }
+            // A controller that clamps `pageSize` below what we asked for would
+            // otherwise leave holes in the next page's offset window — adopt
+            // the size it actually honored so paging stays contiguous.
+            if got < page_size {
+                page_size = got;
+            }
+            page_number += 1;
+        }
+
+        let mut resp = last_resp.unwrap_or(ResponseData {
+            status: 200,
+            body: "{\"data\":[]}".to_string(),
+            json: Some(serde_json::json!({ "data": [] })),
+        });
+
+        collected.truncate(limit);
+        let returned = collected.len();
+
+        let mut json = resp.json.clone().unwrap_or_else(|| serde_json::json!({}));
+        if !json.is_object() {
+            json = serde_json::json!({});
+        }
+        json["data"] = serde_json::Value::Array(collected);
+        json["page_number"] = serde_json::json!(0);
+        json["page_size"] = serde_json::json!(returned);
+        resp.body = serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
+        resp.json = Some(json);
+
+        let truncated = hit_page_cap
+            || (returned < limit && total_available.map(|t| t > returned).unwrap_or(false));
+        let stats = PagedFetch {
+            requested: limit,
+            returned,
+            total_available,
+            truncated,
+        };
+        Ok((resp, stats))
     }
 
     pub fn dpi(&mut self) -> Result<ResponseData> {
@@ -2237,5 +2407,246 @@ mod tests {
         login.assert();
         provision.assert();
         assert_eq!(resp.status, 200);
+    }
+
+    // ---- Regression: v1/v2 response-envelope handling (bug: --mac and
+    // --limit silently ignored on every v2 list endpoint) ----
+
+    #[test]
+    fn list_payload_mut_reads_v1_data_envelope() {
+        let mut json = json!({"meta": {"rc": "ok"}, "data": [{"mac": "a"}, {"mac": "b"}]});
+        let arr = list_payload_mut(&mut json).expect("v1 envelope yields array");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn list_payload_mut_reads_bare_v2_array() {
+        // `clients/history` and `clients/active` answer with a bare array.
+        // Reaching only for `data` found nothing here, so filters and limits
+        // were dropped on the floor.
+        let mut json = json!([{"mac": "a"}, {"mac": "b"}, {"mac": "c"}]);
+        let arr = list_payload_mut(&mut json).expect("bare array yields array");
+        assert_eq!(arr.len(), 3);
+        arr.truncate(1);
+        assert_eq!(json.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_payload_mut_returns_none_for_non_list() {
+        let mut json = json!({"meta": {"rc": "ok"}});
+        assert!(list_payload_mut(&mut json).is_none());
+    }
+
+    // ---- Regression: MAC matching ----
+
+    #[test]
+    fn mac_matches_is_case_insensitive() {
+        assert!(mac_matches("d4:8a:fc:44:0c:48", "D4:8A:FC:44:0C:48"));
+        assert!(mac_matches("D4:8A:FC:44:0C:48", "d4:8a:fc:44:0c:48"));
+    }
+
+    #[test]
+    fn mac_matches_tolerates_separator_styles() {
+        assert!(mac_matches("d4:8a:fc:44:0c:48", "d48afc440c48"));
+        assert!(mac_matches("d4-8a-fc-44-0c-48", "d4:8a:fc:44:0c:48"));
+        assert!(mac_matches("d48a.fc44.0c48", "D4:8A:FC:44:0C:48"));
+    }
+
+    #[test]
+    fn mac_matches_rejects_different_macs() {
+        assert!(!mac_matches("d4:8a:fc:44:0c:48", "d4:8a:fc:44:0c:49"));
+        assert!(!mac_matches("", "d4:8a:fc:44:0c:48"));
+        assert!(!mac_matches("", ""));
+    }
+
+    // ---- Regression: `event list --limit N` was capped at the controller's
+    // 50-per-page default because `pageSize` was never sent ----
+
+    fn login_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "abc123")
+                .json_body(json!({"ok": true}));
+        })
+    }
+
+    /// Build `n` synthetic event records starting at `start`.
+    fn events(start: usize, n: usize) -> serde_json::Value {
+        serde_json::Value::Array(
+            (start..start + n)
+                .map(|i| json!({"key": format!("EVT_{i}"), "timestamp": i}))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn list_events_paged_sends_explicit_page_size() {
+        // The core of the bug: an empty body let the controller apply its own
+        // 50-record default. We must ask for what the user requested.
+        //
+        // The `pageNumber: 0` in the matcher is load-bearing: page numbering is
+        // 0-based, so starting the walk at page 1 silently drops the newest
+        // slice of events — the exact window a "what happened just now?" query
+        // cares about.
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let page = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all")
+                .json_body(json!({"pageSize": 120, "pageNumber": 0}));
+            then.status(200).json_body(json!({
+                "data": events(0, 120),
+                "total_element_count": 120,
+            }));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let (resp, stats) = client.list_events_paged(120).unwrap();
+
+        login.assert();
+        page.assert();
+        assert_eq!(resp.status, 200);
+        assert_eq!(stats.returned, 120);
+        assert!(!stats.truncated);
+        assert_eq!(
+            resp.json.unwrap()["data"].as_array().unwrap().len(),
+            120,
+            "all requested events survive into the rendered payload"
+        );
+    }
+
+    #[test]
+    fn list_events_paged_walks_pages_until_limit_is_met() {
+        // limit > SYSTEM_LOG_MAX_PAGE_SIZE must paginate rather than truncate.
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let page1 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all")
+                .json_body(json!({"pageSize": 1000, "pageNumber": 0}));
+            then.status(200).json_body(json!({
+                "data": events(0, 1000),
+                "total_element_count": 2500,
+            }));
+        });
+        let page2 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all")
+                .json_body(json!({"pageSize": 1000, "pageNumber": 1}));
+            then.status(200).json_body(json!({
+                "data": events(1000, 1000),
+                "total_element_count": 2500,
+            }));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let (resp, stats) = client.list_events_paged(1500).unwrap();
+
+        login.assert();
+        page1.assert();
+        page2.assert();
+        assert_eq!(stats.returned, 1500, "limit honored across page boundaries");
+        assert!(!stats.truncated);
+        let data = resp.json.unwrap();
+        let arr = data["data"].as_array().unwrap();
+        assert_eq!(arr.len(), 1500);
+        // Pages must be stitched in order, without gaps or repeats.
+        assert_eq!(arr[0]["key"], json!("EVT_0"));
+        assert_eq!(arr[999]["key"], json!("EVT_999"));
+        assert_eq!(arr[1000]["key"], json!("EVT_1000"));
+        assert_eq!(arr[1499]["key"], json!("EVT_1499"));
+    }
+
+    #[test]
+    fn list_events_paged_stops_when_controller_runs_out() {
+        // Fewer events exist than requested: that is not truncation, it is the
+        // whole dataset. No warning should be raised.
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let page = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all")
+                .json_body(json!({"pageSize": 500, "pageNumber": 0}));
+            then.status(200).json_body(json!({
+                "data": events(0, 12),
+                "total_element_count": 12,
+            }));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let (_resp, stats) = client.list_events_paged(500).unwrap();
+
+        login.assert();
+        page.assert();
+        assert_eq!(stats.returned, 12);
+        assert_eq!(stats.total_available, Some(12));
+        assert!(
+            !stats.truncated,
+            "exhausting the dataset is not a truncated result"
+        );
+    }
+
+    #[test]
+    fn list_events_paged_flags_truncation_when_more_exist() {
+        // Controller clamps the page and then reports an empty follow-up page
+        // while claiming more records exist. The caller MUST be told the answer
+        // is incomplete rather than reading 40 as "that is all there is".
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let page1 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all")
+                .json_body(json!({"pageSize": 200, "pageNumber": 0}));
+            then.status(200).json_body(json!({
+                "data": events(0, 40),
+                "total_element_count": 9000,
+            }));
+        });
+        // After the clamp we adopt the honored size (40) to keep offsets aligned.
+        let page2 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all")
+                .json_body(json!({"pageSize": 40, "pageNumber": 1}));
+            then.status(200).json_body(json!({
+                "data": [],
+                "total_element_count": 9000,
+            }));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let (_resp, stats) = client.list_events_paged(200).unwrap();
+
+        login.assert();
+        page2.assert();
+        page1.assert();
+        assert_eq!(stats.requested, 200);
+        assert_eq!(stats.returned, 40);
+        assert_eq!(stats.total_available, Some(9000));
+        assert!(
+            stats.truncated,
+            "short read while records remain must be reported, never silent"
+        );
+    }
+
+    #[test]
+    fn list_events_paged_surfaces_api_errors() {
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let page = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all");
+            then.status(500).json_body(json!({"error": "boom"}));
+        });
+
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let result = client.list_events_paged(100);
+
+        login.assert();
+        page.assert();
+        assert!(
+            result.is_err(),
+            "an API failure must propagate, not silently return a short page"
+        );
     }
 }

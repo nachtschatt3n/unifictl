@@ -349,8 +349,14 @@ unifictl local client block <MAC>
 unifictl local client unblock <MAC>
 unifictl local client reconnect <MAC>
 unifictl local client active [--limit N]
-unifictl local client history [--limit N]
+unifictl local client history [--mac <MAC>] [--limit N]
 ```
+
+> **Result limits are explicit.** List commands default to `--limit 30`. When a
+> result set is cut short, a warning naming the full count is printed to
+> stderr (stdout stays valid JSON/CSV), so a truncated answer is never mistaken
+> for the whole picture. `client history --mac` matches case-insensitively and
+> accepts colon, dash or bare-hex MAC forms.
 </details>
 
 <details>
@@ -423,7 +429,7 @@ unifictl local health get
 unifictl local security get
 unifictl local wan get
 unifictl local dpi get
-unifictl local event list [--limit N]
+unifictl local event list [--limit N]   # paginates past the controller's 50/page default
 unifictl local log critical|all|count|device-alert|admin-activity
 unifictl local stat alarm [--archived] [--limit N]   # threat / IPS-IDS alarms
 unifictl local stat rogueap

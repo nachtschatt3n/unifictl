@@ -246,6 +246,10 @@ test_command_outputs "Client List (Wired)" "$BINARY local client list --wired"
 test_command_outputs "Client List (Wireless)" "$BINARY local client list --wireless"
 test_command_outputs "Client Active (v2)" "$BINARY local client active"
 test_command_outputs "Client History" "$BINARY local client history"
+# Regression: --mac must actually filter, and an unmatched MAC must exit
+# cleanly with an empty set rather than dumping the whole history.
+test_command_outputs "Client History (unmatched MAC)" "$BINARY local client history --mac de:ad:be:ef:00:01"
+test_command_outputs "Client Active (limit honored)" "$BINARY local client active --limit 5"
 test_command_outputs "Top Client List" "$BINARY local top-client list --limit 10"
 test_command_outputs "Top Device List" "$BINARY local top-device list --limit 10"
 
@@ -381,6 +385,8 @@ echo "LOCAL CONTROLLER - EVENTS"
 echo "════════════════════════════════════════════════════════════════════════════════════"
 
 test_command_outputs "Event List" "$BINARY local event list"
+# Regression: --limit above the API's 50/page default must paginate, not cap.
+test_command_outputs "Event List (paginated limit)" "$BINARY local event list --limit 120"
 
 # ============================================================================
 # Local Controller - AI-Powered Features (Correlation, Diagnostics, Time-Series)
