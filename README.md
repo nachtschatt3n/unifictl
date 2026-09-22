@@ -471,6 +471,8 @@ unifictl cloud config-show  # View current config (passwords masked)
 
 Omitting `--password` causes an interactive prompt with hidden input — this is the recommended approach to avoid exposing credentials in shell history.
 
+**File permissions**: `config.yaml` holds the controller password and API key, so `unifictl` creates and rewrites it owner-only (mode `0600`, the same way it writes `session.json`) and keeps the user config directory at `0700`. A config file left world-readable by an older release is tightened to `0600` the first time it is read, with a one-line notice on stderr. This applies on Unix (Linux/macOS); on Windows the file inherits the directory's ACL as before.
+
 **Note**: TLS verification is disabled by default for self-signed certificates. Use `--verify-tls` if your controller has a valid certificate.
 
 ## Troubleshooting

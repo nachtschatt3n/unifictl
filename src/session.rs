@@ -33,6 +33,7 @@
 //! - Token values are never logged or printed; `Debug` is redacted.
 //! - Opt out with `--no-session-cache` or `UNIFICTL_NO_SESSION_CACHE=1`.
 
+use crate::config::{tighten_dir, write_private};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -170,17 +171,10 @@ pub fn save(sess: &CachedSession) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {:?}", parent))?;
         // Tighten the config dir to owner-only; it also holds the plaintext
         // credentials file, so world-listability is undesirable. Best-effort.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = fs::metadata(parent) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o700);
-                let _ = fs::set_permissions(parent, perms);
-            }
-        }
+        tighten_dir(parent);
     }
     let data = serde_json::to_string(sess).context("serializing session")?;
+    // Same owner-only (0600) writer as config.yaml; see config::write_private.
     write_private(&path, data.as_bytes())?;
     Ok(())
 }
@@ -198,51 +192,6 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Write `bytes` to `path` so the token file always ends up mode 0600, with no
-/// window in which the secret is world-readable.
-///
-/// On Unix the secret is written to a fresh sibling temp file created with
-/// `create_new` + mode 0600 (so it can never follow a pre-planted symlink and
-/// is never briefly group/world-readable), then atomically `rename`d over the
-/// target. This closes the overwrite-TOCTOU and symlink-follow windows and
-/// makes the write crash-atomic.
-fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let tmp = path.with_file_name(format!(
-            ".session.{}.{}.tmp",
-            std::process::id(),
-            now_secs()
-        ));
-        // Refuse to follow an existing file/symlink at the temp path.
-        let _ = fs::remove_file(&tmp);
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true).mode(0o600);
-        let write_res = (|| -> Result<()> {
-            let mut f = opts
-                .open(&tmp)
-                .with_context(|| format!("creating {:?}", tmp))?;
-            f.write_all(bytes)
-                .with_context(|| format!("writing {:?}", tmp))?;
-            f.flush().ok();
-            fs::rename(&tmp, path).with_context(|| format!("renaming {:?} -> {:?}", tmp, path))?;
-            Ok(())
-        })();
-        if write_res.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        write_res?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes).with_context(|| format!("writing {:?}", path))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
