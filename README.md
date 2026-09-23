@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-5.6.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
+[![Version](https://img.shields.io/badge/version-5.7.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
 [![Tests](https://img.shields.io/badge/tests-75%20passing-success.svg)](#testing)
 
 **A powerful CLI tool for UniFi networks with AI-first design**
@@ -262,6 +262,9 @@ unifictl local device adopt-all
 
 # Restart a device
 unifictl local device restart <MAC>
+
+# Power-cycle a single PoE port on a switch (only affects that port)
+unifictl local device power-cycle <SWITCH-MAC> <PORT>
 ```
 
 ### 🎨 Custom Output
@@ -331,6 +334,7 @@ unifictl cloud sdwan get <CONFIG_ID>
 unifictl local device list [--unadopted] [--limit N]
 unifictl local device get <MAC> [--ports] [--config]
 unifictl local device restart <MAC>
+unifictl local device power-cycle <MAC> <PORT>
 unifictl local device adopt <MAC>
 unifictl local device adopt-all
 unifictl local device upgrade <MAC>
