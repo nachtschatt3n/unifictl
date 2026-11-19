@@ -1,6 +1,6 @@
 # unifictl examples
 
-Quick command examples for both UniFi Site Manager (cloud, API key) and local UniFi controllers (username/password). Default output is a kubectl-style table; add `-o json` for raw JSON, `-o csv` for CSV export, or `-o raw` for the exact body.
+Quick command examples for both UniFi Site Manager (cloud, API key) and local UniFi controllers (username/password). Default output is a kubectl-style table; add `-o json` for JSON, `-o csv` for CSV export, or `-o raw` for JSON without terminal-safety escaping. Raw output still applies command filters, limits and metadata; it is not the original HTTP body. Empty HTTP 204 responses remain empty in raw mode.
 
 ## Cloud (Site Manager API v1/EA)
 
@@ -39,7 +39,7 @@ Output formats:
 ```bash
 unifictl cloud host list -o json     # JSON output
 unifictl cloud device list -o csv    # CSV output (great for reporting)
-unifictl cloud device list -o raw    # Raw response body
+unifictl cloud device list -o raw    # JSON with CLI metadata; unescaped for terminals
 unifictl cloud device list           # Pretty table (default)
 ```
 
@@ -383,3 +383,34 @@ unifictl local network list -o json | jq -r '.data[] | select(.name | contains("
     unifictl local network delete "$network_id" --dry-run
   done
 ```
+
+
+## Observable collection and deliberate changes
+
+These commands illustrate syntax; replace the synthetic IDs with independently verified authorized targets. Validate each operation against the supported controller version in a disposable environment before unattended use.
+
+```bash
+# Local commands do not require a cloud API key. Ignore working-directory config.
+unifictl --no-project-config local device list --limit 1000 -o json
+
+# Check stored credentials by fresh authentication; failure returns nonzero.
+unifictl --no-project-config login validate --local-only -o json
+
+# One complete JSON record per successful iteration; exits nonzero on errors.
+unifictl --no-project-config local health get --watch 30 -o json
+
+# Both formats honor --limit and retain current event timestamps/messages.
+unifictl --no-project-config local time-series events --limit 500 --format json
+unifictl --no-project-config local time-series events --limit 500 --format csv
+
+# Preview DNS deletion, or explicitly authorize a noninteractive deletion.
+unifictl local dns delete synthetic-record-id --dry-run -o json
+unifictl local dns delete synthetic-record-id --yes -o json
+
+# An unsecured WLAN requires an explicit choice.
+unifictl local wlan create --name SyntheticGuest --open
+```
+
+Read `_unifictl.collection` before treating any result as a complete inventory. JSON arrays are wrapped in `data` with metadata; LLM output preserves upstream truncation. `complete` is relative to the reported collection and does not promise snapshot isolation. CSV list metadata is a JSON stderr record; other stderr warnings may precede it. CSV text is escaped for spreadsheet safety, so use JSON for lossless values. Diagnostic failures and unconfirmed `adopt-all` targets return nonzero. A supervisor must handle bounded retries/backoff, missing-sample alerts and retention. Do not automatically replay ambiguous writes or infer adoption completion from API acceptance. See [the automation contract](AI_AGENT_GUIDE.md#automation-and-safety-contract).
+
+Legacy login compatibility is unverified. The client reaches `/api/login` only after earlier login routes return HTTP 404 or 405. HTTP 401, 403 and 429 are terminal; no additional credential attempts or automatic port changes follow. A legacy Network Application that returns 401 on `/api/auth/login` will therefore fail to log in, even if `/api/login` would accept its credentials. Confirm the controller family's behavior in a disposable environment before deployment; retrying will not resolve this limitation.

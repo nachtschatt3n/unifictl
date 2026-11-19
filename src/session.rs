@@ -25,7 +25,7 @@
 //! This module caches the authenticated session (CSRF token + session cookie)
 //! on disk so subsequent invocations reuse it instead of re-authenticating.
 //! The cached session's validity is confirmed lazily: the first request that
-//! receives a genuine 401/403 triggers exactly one re-login. A 429 never
+//! receives a genuine 401 during a safe read triggers at most one re-login. A 429 never
 //! triggers a re-login (that would extend the lockout).
 //!
 //! Security posture:
@@ -33,9 +33,10 @@
 //! - Token values are never logged or printed; `Debug` is redacted.
 //! - Opt out with `--no-session-cache` or `UNIFICTL_NO_SESSION_CACHE=1`.
 
-use crate::config::{tighten_dir, write_private};
+use crate::config::{read_private, tighten_dir, write_private};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -109,6 +110,9 @@ pub struct CachedSession {
     pub session_cookie: Option<String>,
     #[serde(default)]
     pub created_at: u64,
+    /// Cache reuse is bound to the verification mode and CA bundle.
+    #[serde(default)]
+    pub trust_profile: Option<String>,
 }
 
 impl std::fmt::Debug for CachedSession {
@@ -133,56 +137,157 @@ impl std::fmt::Debug for CachedSession {
 pub fn session_path() -> Result<PathBuf> {
     #[cfg(test)]
     {
-        if let Some(p) = TEST_OVERRIDE.with(|c| c.borrow().clone()) {
-            return Ok(p);
-        }
+        TEST_OVERRIDE
+            .with(|c| c.borrow().clone())
+            .ok_or_else(|| anyhow!("session cache has no isolated test directory"))
     }
+    #[cfg(not(test))]
     if let Ok(custom) = std::env::var("UNIFICTL_CONFIG_DIR") {
         return Ok(PathBuf::from(custom).join("session.json"));
     }
-    let base = dirs::config_dir().ok_or_else(|| anyhow!("could not locate a config directory"))?;
-    Ok(base.join("unifictl").join("session.json"))
+    #[cfg(not(test))]
+    {
+        let base =
+            dirs::config_dir().ok_or_else(|| anyhow!("could not locate a config directory"))?;
+        Ok(base.join("unifictl").join("session.json"))
+    }
 }
 
-/// Load a cached session iff caching is enabled and the cached entry matches
-/// the given controller URL / username / site and carries a credential.
+/// A policy identifier, not a password digest. Changing trust cannot borrow
+/// a session established under a different TLS policy.
+pub fn trust_profile(verify_tls: bool, ca_pem: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update([u8::from(verify_tls)]);
+    digest.update(ca_pem);
+    format!("{:x}", digest.finalize())
+}
+
+const MAX_SESSIONS: usize = 64;
+
+fn identity_path(key_url: &str, username: &str, site: &str) -> Result<PathBuf> {
+    let canonical_url = crate::client::validate_base_url(key_url, true)?;
+    let encoded = serde_json::to_vec(&(canonical_url.as_str(), username, site))?;
+    let digest = Sha256::digest(encoded);
+    let filename = format!("{digest:x}.json");
+    Ok(session_path()?.with_file_name("sessions").join(filename))
+}
+
+fn matches_identity(sess: &CachedSession, url: &str, username: &str, site: &str) -> bool {
+    same_controller(&sess.key_url, url) && sess.username == username && sess.site == site
+}
+
+// URL spelling (host case, implicit default port, empty root path) does not
+// create another principal. Preserve distinct schemes, ports and paths.
+fn same_controller(left: &str, right: &str) -> bool {
+    match (
+        crate::client::validate_base_url(left, true),
+        crate::client::validate_base_url(right, true),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Separate atomic files prevent alternating controllers/sites from evicting
+/// each other's sessions and avoid a shared read/modify/write race.
 pub fn load(key_url: &str, username: &str, site: &str) -> Option<CachedSession> {
     if is_disabled() {
         return None;
     }
-    let path = session_path().ok()?;
-    let data = fs::read_to_string(&path).ok()?;
+    let path = identity_path(key_url, username, site).ok()?;
+    let data = read_private(&path, true).ok().flatten();
+    // Read the old single-entry format for migration, with the same identity
+    // and ownership checks. The first successful save removes that entry.
+    let data = data.or_else(|| read_private(&session_path().ok()?, true).ok().flatten())?;
     let sess: CachedSession = serde_json::from_str(&data).ok()?;
-    let matches = sess.key_url == key_url
-        && sess.username == username
-        && sess.site == site
-        && (sess.csrf.is_some() || sess.session_cookie.is_some());
-    if matches { Some(sess) } else { None }
+    if matches_identity(&sess, key_url, username, site)
+        && (sess.csrf.is_some() || sess.session_cookie.is_some())
+    {
+        Some(sess)
+    } else {
+        None
+    }
 }
 
-/// Persist a session to disk with owner-only (0600) permissions. Best-effort:
-/// returns an error the caller may ignore rather than fail the command.
 pub fn save(sess: &CachedSession) -> Result<()> {
     if is_disabled() {
         return Ok(());
     }
-    let path = session_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {:?}", parent))?;
-        // Tighten the config dir to owner-only; it also holds the plaintext
-        // credentials file, so world-listability is undesirable. Best-effort.
-        tighten_dir(parent);
+    let path = identity_path(&sess.key_url, &sess.username, &sess.site)?;
+    let parent = path.parent().expect("session file has a parent");
+    fs::create_dir_all(parent).context("creating session cache directory")?;
+    if fs::symlink_metadata(parent)?.file_type().is_symlink() {
+        return Err(anyhow!("session cache directory must not be a symlink"));
     }
-    let data = serde_json::to_string(sess).context("serializing session")?;
-    // Same owner-only (0600) writer as config.yaml; see config::write_private.
-    write_private(&path, data.as_bytes())?;
+    tighten_dir(parent);
+    if let Some(base) = parent.parent() {
+        tighten_dir(base);
+    }
+    write_private(&path, serde_json::to_string(sess)?.as_bytes())?;
+    remove_legacy(&sess.key_url, &sess.username, &sess.site);
+    // Bound disk use. Pruning can lose a cache hit but cannot mix identities.
+    let mut entries: Vec<_> = fs::read_dir(parent)?
+        .filter_map(Result::ok)
+        .filter(|e| valid_cache_filename(&e.file_name().to_string_lossy()))
+        .filter_map(|e| e.metadata().ok().map(|m| (m.modified().ok(), e.path())))
+        .collect();
+    entries.sort_by_key(|entry| entry.0);
+    let excess = entries.len().saturating_sub(MAX_SESSIONS);
+    for (_, old) in entries
+        .into_iter()
+        .filter(|(_, old)| old != &path)
+        .take(excess)
+    {
+        let _ = fs::remove_file(old);
+    }
     Ok(())
 }
 
-/// Remove any cached session (e.g. after a genuine 401 invalidation).
-pub fn clear() {
-    if let Ok(path) = session_path() {
+fn valid_cache_filename(name: &str) -> bool {
+    name.len() == 69
+        && name.ends_with(".json")
+        && name.as_bytes()[..64].iter().all(|b| b.is_ascii_hexdigit())
+}
+
+fn remove_legacy(url: &str, username: &str, site: &str) {
+    if let Ok(path) = session_path()
+        && let Ok(Some(data)) = read_private(&path, true)
+        && let Ok(sess) = serde_json::from_str::<CachedSession>(&data)
+        && matches_identity(&sess, url, username, site)
+    {
         let _ = fs::remove_file(path);
+    }
+}
+
+/// Invalidate only the affected identity, including after a password change.
+/// This deliberately works when cache use is disabled for this invocation.
+pub fn clear_identity(url: &str, username: &str, site: &str) {
+    if let Ok(path) = identity_path(url, username, site) {
+        let _ = fs::remove_file(path);
+    }
+    remove_legacy(url, username, site);
+}
+
+/// Credential rotation invalidates every cached site for that principal.
+pub fn clear_principal(url: &str, username: &str) {
+    let Ok(base) = session_path() else { return };
+    let mut paths = vec![base.clone()];
+    if let Ok(entries) = fs::read_dir(base.with_file_name("sessions")) {
+        paths.extend(
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| valid_cache_filename(&e.file_name().to_string_lossy()))
+                .map(|e| e.path()),
+        );
+    }
+    for path in paths {
+        if let Ok(Some(data)) = read_private(&path, true)
+            && let Ok(sess) = serde_json::from_str::<CachedSession>(&data)
+            && same_controller(&sess.key_url, url)
+            && sess.username == username
+        {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -209,6 +314,7 @@ mod tests {
             csrf: Some("supersecret-csrf".into()),
             session_cookie: Some("TOKEN=supersecret-cookie".into()),
             created_at: 123,
+            trust_profile: None,
         };
         let rendered = format!("{sess:?}");
         assert!(!rendered.contains("supersecret-csrf"));
@@ -239,6 +345,7 @@ mod tests {
             csrf: Some("csrf-1".into()),
             session_cookie: Some("TOKEN=cookie-1".into()),
             created_at: now_secs(),
+            trust_profile: None,
         };
         save(&sess).unwrap();
 
@@ -252,11 +359,12 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(session_path().unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
+            let mode =
+                fs::metadata(identity_path("https://c.test:8443", "admin", "default").unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
             assert_eq!(mode, 0o600, "session file must be owner-only 0600");
         }
     }
@@ -274,10 +382,98 @@ mod tests {
             csrf: Some("csrf-1".into()),
             session_cookie: None,
             created_at: 0,
+            trust_profile: None,
         };
         save(&sess).unwrap();
         assert!(load("https://c.test:8443", "admin", "default").is_some());
-        clear();
+        clear_identity("https://c.test:8443", "admin", "default");
         assert!(load("https://c.test:8443", "admin", "default").is_none());
+    }
+
+    #[test]
+    fn alternating_identities_are_preserved_and_invalidation_is_targeted() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_dir(dir.path());
+        let mut sess = CachedSession {
+            key_url: "https://controller.test".into(),
+            resolved_url: "https://controller.test".into(),
+            username: "admin".into(),
+            site: "A".into(),
+            is_legacy: false,
+            csrf: Some("token-a".into()),
+            session_cookie: None,
+            created_at: now_secs(),
+            trust_profile: None,
+        };
+        save(&sess).unwrap();
+        sess.site = "B".into();
+        sess.csrf = Some("token-b".into());
+        save(&sess).unwrap();
+        assert_eq!(
+            load(&sess.key_url, "admin", "A").unwrap().csrf.as_deref(),
+            Some("token-a")
+        );
+        clear_identity(&sess.key_url, "admin", "A");
+        assert!(load(&sess.key_url, "admin", "A").is_none());
+        assert_eq!(
+            load(&sess.key_url, "admin", "B").unwrap().csrf.as_deref(),
+            Some("token-b")
+        );
+    }
+
+    #[test]
+    fn equivalent_urls_share_cache_and_rotation_invalidates_all_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_dir(dir.path());
+        let mut sess = CachedSession {
+            key_url: "https://CONTROLLER.test:443".into(),
+            resolved_url: "https://controller.test/".into(),
+            username: "admin".into(),
+            site: "A".into(),
+            is_legacy: false,
+            csrf: Some("synthetic-token".into()),
+            session_cookie: None,
+            created_at: now_secs(),
+            trust_profile: None,
+        };
+        save(&sess).unwrap();
+        assert!(load("https://controller.test/", "admin", "A").is_some());
+        clear_identity("https://controller.test", "admin", "A");
+        assert!(load(&sess.key_url, "admin", "A").is_none());
+        save(&sess).unwrap();
+        sess.site = "B".into();
+        save(&sess).unwrap();
+        sess.username = "other-user".into();
+        save(&sess).unwrap();
+        clear_principal("https://controller.test/", "admin");
+        assert!(load(&sess.key_url, "admin", "A").is_none());
+        assert!(load(&sess.key_url, "admin", "B").is_none());
+        assert!(load(&sess.key_url, "other-user", "B").is_some());
+        for distinct in [
+            "http://controller.test/",
+            "https://controller.test:8443/",
+            "https://controller.test/path/",
+            "https://other.test/",
+        ] {
+            assert!(!same_controller(&sess.key_url, distinct));
+        }
+        assert!(!same_controller("invalid", "invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cache_is_not_read_or_chmodded() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        test_set_dir(dir.path());
+        let target = dir.path().join("other");
+        fs::write(&target, "private unrelated text").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, session_path().unwrap()).unwrap();
+        assert!(load("https://controller.test", "admin", "A").is_none());
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 }

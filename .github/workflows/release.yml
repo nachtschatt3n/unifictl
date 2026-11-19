@@ -2,20 +2,70 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    tags: ['v*.*.*']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v0.3.0)'
+        description: 'Existing version tag at the selected commit (e.g., v5.7.0)'
         required: true
         type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate:
+    name: Validate exact release source
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Match existing tag, source commit and package version
+        id: identity
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
+        run: python3 .github/workflows/release_contract.py identity
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --locked --all-targets
+      - name: Verify failing audit and incomplete release gates
+        run: python3 .github/workflows/test_supply_chain.py
+      - name: Run pinned security audit
+        run: bash .github/workflows/audit.sh "$RUNNER_TEMP/audit.json"
+      - name: Retain audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-audit
+          path: ${{ runner.temp }}/audit.json
+          if-no-files-found: error
+      - name: Validate crates.io package without publication
+        run: cargo publish --dry-run --locked
+
   build-release:
+    needs: validate
     name: Build Release
     runs-on: ${{ matrix.os }}
     strategy:
@@ -41,18 +91,20 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -64,18 +116,12 @@ jobs:
 
       - name: Build release binary
         run: |
-          cargo build --release --target ${{ matrix.target }}
-          strip target/${{ matrix.target }}/release/unifictl || true
+          cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Create release archive (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          if [ -z "$VERSION" ]; then
-            VERSION=${{ github.event.inputs.version }}
-          fi
-          
           mkdir -p release
           cp target/${{ matrix.target }}/release/unifictl release/
           cp README.md LICENSE release/
@@ -86,11 +132,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $VERSION = "${{ github.ref }}".Replace("refs/tags/", "")
-          if ([string]::IsNullOrEmpty($VERSION)) {
-            $VERSION = "${{ github.event.inputs.version }}"
-          }
-          
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/unifictl.exe" "release/unifictl.exe"
           Copy-Item README.md "release/"
@@ -99,13 +140,15 @@ jobs:
           Remove-Item -Recurse -Force release
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.asset_name }}
           retention-days: 30
+          if-no-files-found: error
 
   build-deb-packages:
+    needs: validate
     name: Build DEB Packages
     runs-on: ubuntu-latest
     strategy:
@@ -120,15 +163,18 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        run: cargo install cargo-deb --version 3.8.0 --locked
 
       - name: Install cross-compilation dependencies (arm64)
         if: matrix.arch == 'arm64'
@@ -142,8 +188,7 @@ jobs:
       - name: Build release binary (x86_64)
         if: matrix.arch == 'amd64'
         run: |
-          cargo build --release --target ${{ matrix.target }} --verbose
-          strip target/${{ matrix.target }}/release/unifictl || true
+          cargo build --locked --release --target ${{ matrix.target }} --verbose
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
           OPENSSL_STATIC: 1
@@ -152,8 +197,7 @@ jobs:
       - name: Build release binary (aarch64)
         if: matrix.arch == 'arm64'
         run: |
-          CARGO_BUILD_JOBS=1 cargo build --release --target ${{ matrix.target }} --verbose
-          strip target/${{ matrix.target }}/release/unifictl || true
+          CARGO_BUILD_JOBS=1 cargo build --locked --release --target ${{ matrix.target }} --verbose
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
           OPENSSL_STATIC: 1
@@ -166,34 +210,23 @@ jobs:
           OPENSSL_BUILD_JOBS: 1
           MAKEFLAGS: "-j1"
 
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION=${GITHUB_REF#refs/tags/}
-          fi
-          VERSION=${VERSION#v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
-
       - name: Build DEB package
         run: |
-          cargo deb --target ${{ matrix.target }} --no-build
-          VERSION=${{ steps.version.outputs.version }}
+          cargo deb --locked --target ${{ matrix.target }} --no-build
+          VERSION=${{ needs.validate.outputs.version }}
           mv target/${{ matrix.target }}/debian/unifictl_*.deb \
              unifictl_${VERSION}_${{ matrix.arch }}.deb
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unifictl-deb-${{ matrix.arch }}
           path: unifictl_*_${{ matrix.arch }}.deb
           retention-days: 30
+          if-no-files-found: error
 
   build-arch-packages:
+    needs: validate
     name: Build Arch Linux Packages
     runs-on: ubuntu-latest
     strategy:
@@ -208,10 +241,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -232,8 +268,7 @@ jobs:
       - name: Build release binary (x86_64)
         if: matrix.arch == 'x86_64'
         run: |
-          cargo build --release --target ${{ matrix.target }} --verbose
-          strip target/${{ matrix.target }}/release/unifictl || true
+          cargo build --locked --release --target ${{ matrix.target }} --verbose
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
           OPENSSL_STATIC: 1
@@ -243,8 +278,7 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           # Use single job to avoid OpenSSL make jobserver issues
-          CARGO_BUILD_JOBS=1 cargo build --release --target ${{ matrix.target }} --verbose
-          strip target/${{ matrix.target }}/release/unifictl || true
+          CARGO_BUILD_JOBS=1 cargo build --locked --release --target ${{ matrix.target }} --verbose
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
           OPENSSL_STATIC: 1
@@ -258,22 +292,9 @@ jobs:
           OPENSSL_BUILD_JOBS: 1
           MAKEFLAGS: "-j1"
 
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION=${GITHUB_REF#refs/tags/}
-          fi
-          VERSION=${VERSION#v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
-
       - name: Update PKGBUILD
         run: |
-          sed -i "s/^pkgver=.*/pkgver=${{ steps.version.outputs.version }}/" packaging/arch/PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=${{ needs.validate.outputs.version }}/" packaging/arch/PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/arch/PKGBUILD
 
       - name: Create package directory
@@ -292,7 +313,7 @@ jobs:
         run: |
           cat > pkg/.PKGINFO <<EOF
           pkgname = unifictl
-          pkgver = ${{ steps.version.outputs.version }}-1
+          pkgver = ${{ needs.validate.outputs.version }}-1
           pkgdesc = CLI for UniFi Site Manager (API v1/EA)
           url = https://github.com/nachtschatt3n/unifictl
           builddate = $(date +%s)
@@ -321,208 +342,123 @@ jobs:
       - name: Create package archive
         run: |
           cd pkg
-          tar cf - .PKGINFO .MTREE usr/ | zstd -o ../unifictl-${{ steps.version.outputs.version }}-1-${{ matrix.arch }}.pkg.tar.zst
+          tar cf - .PKGINFO .MTREE usr/ | zstd -o ../unifictl-${{ needs.validate.outputs.version }}-1-${{ matrix.arch }}.pkg.tar.zst
           cd ..
-          mv unifictl-${{ steps.version.outputs.version }}-1-${{ matrix.arch }}.pkg.tar.zst unifictl-${{ matrix.arch }}.pkg.tar.zst
+          mv unifictl-${{ needs.validate.outputs.version }}-1-${{ matrix.arch }}.pkg.tar.zst unifictl-${{ matrix.arch }}.pkg.tar.zst
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unifictl-arch-${{ matrix.arch }}
           path: unifictl-${{ matrix.arch }}.pkg.tar.zst
           retention-days: 30
+          if-no-files-found: error
+
+  verify-artifacts:
+    name: Verify complete release artifacts
+    needs: [validate, build-release, build-arch-packages, build-deb-packages]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: unifictl-*
+          path: artifacts
+      - name: Require every expected asset and generate checksums
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+        run: python3 .github/workflows/release_contract.py assets
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check checksums.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-release
+          path: dist/*
+          if-no-files-found: error
 
   publish-crates-io:
-    name: Publish to crates.io
+    name: Publish to crates.io when configured
+    needs: [validate, create-release]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION=${GITHUB_REF#refs/tags/}
-          fi
-          VERSION=${VERSION#v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
-
-      - name: Verify version matches Cargo.toml
-        run: |
-          CARGO_VERSION=$(grep '^version =' Cargo.toml | cut -d'"' -f2)
-          TAG_VERSION="${{ steps.version.outputs.version }}"
-          # Remove 'v' prefix from tag version if present for comparison
-          TAG_VERSION=${TAG_VERSION#v}
-          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "Error: Cargo.toml version ($CARGO_VERSION) doesn't match tag version ($TAG_VERSION)"
-            exit 1
-          fi
-          echo "✓ Version matches: $CARGO_VERSION"
-
-      - name: Run tests
-        run: cargo test --all-targets
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -W clippy::all
-
-      - name: Dry-run publish
-        run: cargo publish --dry-run --allow-dirty
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "⚠️  CRATES_IO_TOKEN secret not set. Skipping crates.io publish."
-            echo "   To enable automated publishing, add CRATES_IO_TOKEN to repository secrets."
+            echo "::notice::CRATES_IO_TOKEN is absent; crates.io publication is disabled."
             exit 0
           fi
-          cargo publish --allow-dirty
+          cargo publish --locked
 
   create-release:
-    name: Create Release
-    needs: [build-release, build-arch-packages, build-deb-packages]
+    name: Create complete validated GitHub Release
+    needs: [validate, verify-artifacts]
     runs-on: ubuntu-latest
-    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
-    
+    permissions:
+      contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          path: artifacts
-        continue-on-error: true
-
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION=${GITHUB_REF#refs/tags/}
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
-
-      - name: Generate checksums
-        shell: bash
-        run: |
-          if [ -d artifacts ] && [ "$(ls -A artifacts 2>/dev/null)" ]; then
-            cd artifacts
-            find . -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.pkg.tar.zst" \) -exec sha256sum {} \; > checksums.txt || touch checksums.txt
-            cd ..
-          else
-            echo "No artifacts found, creating empty checksums file"
-            mkdir -p artifacts
-            touch artifacts/checksums.txt
-          fi
-
-      - name: Read checksums
-        id: checksums
-        shell: bash
-        run: |
-          if [ -f artifacts/checksums.txt ] && [ -s artifacts/checksums.txt ]; then
-            # Use multiline output delimiter
-            {
-              echo 'content<<CHECKSUMS_EOF'
-              cat artifacts/checksums.txt
-              echo 'CHECKSUMS_EOF'
-            } >> $GITHUB_OUTPUT
-          else
-            echo "content=No checksums available" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: Release ${{ steps.version.outputs.version }}
-          generate_release_notes: false
-          make_latest: true
-          body: |
-            ## Release ${{ steps.version.outputs.version }}
-
-            ### Downloads
-
-            **Linux:**
-            - [x86_64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl-x86_64-unknown-linux-gnu.tar.gz)
-
-            **macOS:**
-            - [x86_64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl-x86_64-apple-darwin.tar.gz)
-            - [aarch64 (Apple Silicon)](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl-aarch64-apple-darwin.tar.gz)
-            
-            **Windows:**
-            - [x86_64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl-x86_64-pc-windows-msvc.zip)
-
-            ### Installation
-
-            **Linux:**
-            ```bash
-            tar xzf unifictl-*-unknown-linux-gnu.tar.gz
-            sudo mv unifictl /usr/local/bin/
-            ```
-
-            **macOS:**
-            ```bash
-            tar xzf unifictl-*-apple-darwin.tar.gz
-            sudo mv unifictl /usr/local/bin/
-            ```
-            
-            **Windows:**
-            ```powershell
-            Expand-Archive unifictl-*-windows-msvc.zip
-            # Add to PATH or copy unifictl.exe to desired location
-            ```
-
-            **Debian/Ubuntu (.deb):**
-            - [amd64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl_${{ steps.version.outputs.version }}_amd64.deb)
-            - [arm64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl_${{ steps.version.outputs.version }}_arm64.deb)
-            
-            Install with:
-            ```bash
-            sudo dpkg -i unifictl_*_amd64.deb
-            ```
-
-            **Arch Linux:**
-            - [x86_64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl-x86_64.pkg.tar.zst)
-            - [aarch64](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/unifictl-aarch64.pkg.tar.zst)
-            
-            Install with:
-            ```bash
-            sudo pacman -U unifictl-*.pkg.tar.zst
-            ```
-
-            ### Checksums
-            ```
-            ${{ steps.checksums.outputs.content }}
-            ```
-
-            ### Install from crates.io
-
-            ```bash
-            cargo install unifictl
-            ```
-          files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
-            artifacts/**/*.deb
-            artifacts/**/*.pkg.tar.zst
-            artifacts/**/checksums.txt
-          draft: false
-          prerelease: false
+          python-version: '3.11'
+      - name: Refuse changes to an already-public release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: python3 .github/workflows/release_contract.py preflight
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-release
+          path: dist
+      - name: Verify downloaded assets before publication
+        working-directory: dist
+        run: sha256sum --check checksums.txt
+      - name: Upload assets to a draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          target_commitish: ${{ needs.validate.outputs.sha }}
+          name: Release ${{ needs.validate.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Built and validated from commit `${{ needs.validate.outputs.sha }}`.
+            Download the archive or package for your platform together with `checksums.txt`.
+            Verify its SHA-256 checksum before installing. `release-source.json` records
+            the source commit and lockfile digest. Checksums detect corruption; they are
+            not independent signatures or a claim of reproducible builds.
+            crates.io publication follows this release and runs only when its token is configured.
+          files: |
+            dist/unifictl-*.tar.gz
+            dist/unifictl-*.zip
+            dist/unifictl_*.deb
+            dist/unifictl-*.pkg.tar.zst
+            dist/checksums.txt
+            dist/release-source.json
+          draft: true
+          prerelease: false
+      - name: Verify uploaded bytes before making the release public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir published
+          python3 .github/workflows/release_contract.py uploaded
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

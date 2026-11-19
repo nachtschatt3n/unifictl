@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use dirs::config_dir;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -39,7 +39,11 @@ pub struct LocalConfig {
     pub password: Option<String>,
     pub site: Option<String>,
     #[serde(default)]
-    pub verify_tls: bool,
+    pub verify_tls: Option<bool>,
+    pub ca_file: Option<PathBuf>,
+    /// Opt in to retrying login on `:443` when a `:8443` controller is unreachable.
+    #[serde(default)]
+    pub port_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +78,8 @@ pub struct LocalEffectiveConfig {
     pub password: String,
     pub site: String,
     pub verify_tls: bool,
+    pub ca_file: Option<PathBuf>,
+    pub port_fallback: bool,
 }
 
 pub fn config_path(scope: Scope, cwd: &Path) -> Result<PathBuf> {
@@ -89,18 +95,29 @@ pub fn config_path(scope: Scope, cwd: &Path) -> Result<PathBuf> {
     }
 }
 
+static NO_PROJECT_CONFIG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn set_no_project_config(disabled: bool) {
+    let _ = NO_PROJECT_CONFIG.set(disabled);
+}
+
 pub fn load(cwd: &Path) -> Result<Config> {
-    let user = read_if_exists(&config_path(Scope::User, cwd)?)?.unwrap_or_default();
-    let local = read_if_exists(&config_path(Scope::Local, cwd)?)?.unwrap_or_default();
+    let user = load_scope(Scope::User, cwd)?;
+    let local = if NO_PROJECT_CONFIG.get().copied().unwrap_or(false) {
+        Config::default()
+    } else {
+        load_scope(Scope::Local, cwd)?
+    };
     Ok(merge(user, local))
 }
 
 pub fn load_scope(scope: Scope, cwd: &Path) -> Result<Config> {
-    Ok(read_if_exists(&config_path(scope, cwd)?)?.unwrap_or_default())
+    Ok(read_if_exists(&config_path(scope, cwd)?, scope == Scope::User)?.unwrap_or_default())
 }
 
 pub fn save(scope: Scope, config: &Config, cwd: &Path) -> Result<PathBuf> {
     let path = config_path(scope, cwd)?;
+    let previous = read_if_exists(&path, scope == Scope::User)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {:?}", parent))?;
         // The user config dir is ours alone, so keep it owner-only exactly as
@@ -114,6 +131,19 @@ pub fn save(scope: Scope, config: &Config, cwd: &Path) -> Result<PathBuf> {
     // The file holds the controller password and API key: it is created 0600
     // on a fresh inode, never through the process umask (see `write_private`).
     write_private(&path, serialized.as_bytes())?;
+    if previous.as_ref().and_then(|c| c.local.as_ref()) != config.local.as_ref() {
+        for local in [
+            previous.as_ref().and_then(|c| c.local.as_ref()),
+            config.local.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let (Some(url), Some(username)) = (&local.url, &local.username) {
+                crate::session::clear_principal(url, username);
+            }
+        }
+    }
     Ok(path)
 }
 
@@ -159,28 +189,45 @@ pub fn resolve_local(cwd: &Path, overrides: Option<LocalConfig>) -> Result<Local
         username,
         password,
         site,
-        verify_tls: local.verify_tls,
+        verify_tls: local.verify_tls.unwrap_or(true),
+        ca_file: local.ca_file,
+        port_fallback: local.port_fallback.unwrap_or(false),
     })
 }
 
-fn read_if_exists(path: &Path) -> Result<Option<Config>> {
-    if !path.exists() {
+fn read_if_exists(path: &Path, repair_permissions: bool) -> Result<Option<Config>> {
+    let Some(contents) = read_private(path, repair_permissions)? else {
         return Ok(None);
+    };
+    // Avoid echoing malformed YAML: it can contain passwords or terminal controls.
+    let mut config: Config = serde_yaml::from_str(&contents)
+        .map_err(|_| anyhow::anyhow!("invalid configuration YAML"))?;
+    if let Some(local) = config.local.as_mut()
+        && let Some(ca) = local.ca_file.as_mut()
+        && ca.is_relative()
+    {
+        *ca = path.parent().unwrap_or(Path::new(".")).join(&*ca);
     }
-
-    // Releases before 5.7 created this file through the process umask
-    // (typically 0644) although it holds credentials. Repair that once, before
-    // the first read; later reads find 0600 and stay silent.
-    tighten_if_exposed(path);
-
-    let contents = fs::read_to_string(path).with_context(|| format!("reading {:?}", path))?;
-    let config = serde_yaml::from_str(&contents).with_context(|| format!("parsing {:?}", path))?;
     Ok(Some(config))
 }
 
+fn same_destination(left: &str, right: &str) -> bool {
+    match (reqwest::Url::parse(left), reqwest::Url::parse(right)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn merge(user: Config, local: Config) -> Config {
+    let changed_target = local.base_url.as_deref().is_some_and(|url| {
+        !same_destination(url, user.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL))
+    });
     Config {
-        api_key: local.api_key.or(user.api_key),
+        // A project may select another target, but cannot take the user's key
+        // along to it. Explicit CLI overrides are handled after this boundary.
+        api_key: local
+            .api_key
+            .or(if changed_target { None } else { user.api_key }),
         base_url: local.base_url.or(user.base_url),
         local: match (user.local, local.local) {
             (Some(u), Some(l)) => Some(merge_local(u, l)),
@@ -192,13 +239,88 @@ fn merge(user: Config, local: Config) -> Config {
 }
 
 fn merge_local(user: LocalConfig, local: LocalConfig) -> LocalConfig {
+    let changed_target = local.url.as_deref().is_some_and(|url| {
+        !user
+            .url
+            .as_deref()
+            .is_some_and(|u| same_destination(u, url))
+    });
+    let changed_user = local
+        .username
+        .as_ref()
+        .is_some_and(|u| Some(u) != user.username.as_ref());
+    let inherit_password = !changed_target && !changed_user && local.password.is_none();
     LocalConfig {
         url: local.url.or(user.url),
-        username: local.username.or(user.username),
-        password: local.password.or(user.password),
+        username: local
+            .username
+            .or(if changed_target { None } else { user.username }),
+        password: local.password.or(if changed_target || changed_user {
+            None
+        } else {
+            user.password
+        }),
         site: local.site.or(user.site),
-        verify_tls: local.verify_tls || user.verify_tls,
+        // Trust settings belong to the origin of the inherited secret. A
+        // checkout cannot turn verification off or install another root CA.
+        verify_tls: if inherit_password {
+            user.verify_tls
+        } else {
+            local.verify_tls.or(user.verify_tls)
+        },
+        ca_file: if inherit_password {
+            user.ca_file
+        } else {
+            local.ca_file.or(user.ca_file)
+        },
+        // Fallback re-sends the secret to another authority: same trust rule.
+        port_fallback: if inherit_password {
+            user.port_fallback
+        } else {
+            local.port_fallback.or(user.port_fallback)
+        },
     }
+}
+
+/// Read one regular, owned file through a stable handle. Never follow a symlink
+/// or chmod a project file merely because the current directory contains it.
+pub(crate) fn read_private(path: &Path, repair_permissions: bool) -> Result<Option<String>> {
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("cannot open configuration/cache file safely"),
+    };
+    let meta = file
+        .metadata()
+        .context("checking configuration/cache file")?;
+    if !meta.is_file() {
+        bail!("configuration/cache must be a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.uid() != unsafe { libc::geteuid() } {
+            bail!("configuration/cache must be owned by the current user");
+        }
+        if repair_permissions && meta.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .context("securing configuration/cache permissions")?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = repair_permissions;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .context("reading configuration/cache file")?;
+    Ok(Some(contents))
 }
 
 // ---- Owner-only files -------------------------------------------------------
@@ -232,16 +354,14 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
             .unwrap_or(0);
         let tmp = path.with_file_name(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
         // Refuse to follow an existing file/symlink at the temp path.
-        let _ = fs::remove_file(&tmp);
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true).mode(0o600);
+        let mut f = opts.open(&tmp).context("creating private temporary file")?;
         let write_res = (|| -> Result<()> {
-            let mut f = opts
-                .open(&tmp)
-                .with_context(|| format!("creating {:?}", tmp))?;
             f.write_all(bytes)
                 .with_context(|| format!("writing {:?}", tmp))?;
-            f.flush().ok();
+            f.flush().context("flushing private file")?;
+            f.sync_all().context("syncing private file")?;
             fs::rename(&tmp, path).with_context(|| format!("renaming {:?} -> {:?}", tmp, path))?;
             Ok(())
         })();
@@ -262,52 +382,21 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 pub(crate) fn tighten_dir(dir: &Path) {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(dir) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o700);
-            let _ = fs::set_permissions(dir, perms);
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        if let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir)
+            && let Ok(meta) = file.metadata()
+            && meta.is_dir()
+            && meta.uid() == unsafe { libc::geteuid() }
+        {
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o700));
         }
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
-    }
-}
-
-/// If `path` is a regular file readable by group or others, tighten it to
-/// 0600 and say so in one line on stderr. Returns whether the mode changed.
-/// Best-effort: a file we cannot stat or chmod is left alone, and an
-/// already-tight file produces no output.
-pub(crate) fn tighten_if_exposed(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let Ok(meta) = fs::metadata(path) else {
-            return false;
-        };
-        if !meta.is_file() {
-            return false;
-        }
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 == 0 {
-            return false;
-        }
-        let mut perms = meta.permissions();
-        perms.set_mode(0o600);
-        if fs::set_permissions(path, perms).is_err() {
-            return false;
-        }
-        eprintln!(
-            "unifictl: tightened {} from {mode:04o} to 0600 (it holds credentials)",
-            path.display()
-        );
-        true
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
     }
 }
 
@@ -342,7 +431,9 @@ mod tests {
                 username: Some("user".into()),
                 password: Some("pass-user".into()),
                 site: Some("site1".into()),
-                verify_tls: false,
+                verify_tls: Some(false),
+                ca_file: None,
+                port_fallback: None,
             }),
         };
         save(Scope::User, &user_cfg, cwd.path()).unwrap();
@@ -355,7 +446,9 @@ mod tests {
                 username: Some("localuser".into()),
                 password: Some("localpass".into()),
                 site: Some("localsite".into()),
-                verify_tls: true,
+                verify_tls: Some(true),
+                ca_file: None,
+                port_fallback: None,
             }),
         };
         save(Scope::Local, &local_cfg, cwd.path()).unwrap();
@@ -422,7 +515,9 @@ mod tests {
                 username: Some("cli-adm".into()),
                 password: Some("hunter2".into()),
                 site: Some("default".into()),
-                verify_tls: false,
+                verify_tls: Some(false),
+                ca_file: None,
+                port_fallback: None,
             }),
         }
     }
@@ -461,7 +556,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn first_read_tightens_a_world_readable_config_once() {
+    fn reading_project_config_does_not_change_permissions() {
         let cwd = tempdir().unwrap();
         let path = cwd.path().join(".unifictl.yaml");
         // Simulate the pre-fix writer: plain fs::write, then force 0644 so the
@@ -475,11 +570,18 @@ mod tests {
             secret_config(),
             "tightening must not alter the contents"
         );
-        assert_eq!(mode_of(&path), 0o600, "first read must repair the mode");
+        assert_eq!(
+            mode_of(&path),
+            0o644,
+            "reading a project file must not chmod it"
+        );
 
-        // An already-tight file is left alone (and produces no notice).
-        assert!(!tighten_if_exposed(&path));
-        assert_eq!(mode_of(&path), 0o600);
+        read_private(&path, true).unwrap();
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "trusted user cache repair uses the open handle"
+        );
     }
 
     #[cfg(unix)]
@@ -538,5 +640,84 @@ mod tests {
                 "fs::write must not be owner-only under umask 022"
             );
         }
+    }
+
+    #[test]
+    fn project_destination_cannot_inherit_user_credentials() {
+        let user = secret_config();
+        let changed = Config {
+            base_url: Some("https://other.test".into()),
+            local: Some(LocalConfig {
+                url: Some("https://other.test".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = merge(user.clone(), changed);
+        assert!(merged.api_key.is_none());
+        let local = merged.local.unwrap();
+        assert!(local.username.is_none());
+        assert!(local.password.is_none());
+        let username_change = Config {
+            local: Some(LocalConfig {
+                username: Some("other".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            merge(user, username_change)
+                .local
+                .unwrap()
+                .password
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inherited_secret_preserves_trust_but_allows_nonsecret_site_precedence() {
+        let mut user = secret_config();
+        let local = user.local.as_mut().unwrap();
+        local.verify_tls = Some(true);
+        local.ca_file = Some("trusted.pem".into());
+        let project = Config {
+            local: Some(LocalConfig {
+                site: Some("branch".into()),
+                verify_tls: Some(false),
+                ca_file: Some("untrusted.pem".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = merge(user, project).local.unwrap();
+        assert_eq!(result.site.as_deref(), Some("branch"));
+        assert_eq!(result.verify_tls, Some(true));
+        assert_eq!(result.ca_file.as_deref(), Some(Path::new("trusted.pem")));
+        assert!(LocalConfig::default().verify_tls.unwrap_or(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_config_is_rejected_without_chmod() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, "api_key: synthetic").unwrap();
+        chmod(&target, 0o644);
+        symlink(&target, dir.path().join(".unifictl.yaml")).unwrap();
+        assert!(load_scope(Scope::Local, dir.path()).is_err());
+        assert_eq!(mode_of(&target), 0o644);
+    }
+
+    #[test]
+    fn malformed_yaml_error_does_not_echo_secret() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(".unifictl.yaml"),
+            "password: [synthetic-secret",
+        )
+        .unwrap();
+        let error = format!("{:?}", load_scope(Scope::Local, dir.path()).unwrap_err());
+        assert!(!error.contains("synthetic-secret"));
     }
 }

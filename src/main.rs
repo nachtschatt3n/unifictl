@@ -17,12 +17,14 @@
 mod client;
 mod config;
 mod local;
+mod output;
 mod schema;
 mod session;
 
 use crate::client::{ApiClient, ResponseData};
 use crate::config::{LocalConfig, Scope, resolve, resolve_local, save};
 use crate::local::{LocalClient, list_payload_mut, mac_matches};
+use crate::output::{capture_collection, finish_collection, spreadsheet_safe, terminal_safe};
 use crate::schema::{SchemaRegistry, estimate_tokens, summarize_response};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -108,7 +110,8 @@ struct Cli {
         long,
         value_name = "SECONDS",
         global = true,
-        help = "Watch mode: refresh every SECONDS (tables only)"
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Watch mode: refresh after at least SECONDS (positive; exits on error)"
     )]
     watch: Option<u64>,
 
@@ -118,6 +121,13 @@ struct Cli {
         help = "Do not reuse or persist the cached local-controller session (re-auth every command)"
     )]
     no_session_cache: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Ignore configuration from the current working directory"
+    )]
+    no_project_config: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -198,6 +208,29 @@ struct LoginSetArgs {
         help = "Enable TLS certificate verification for the local controller"
     )]
     verify_tls: bool,
+    #[arg(
+        long,
+        conflicts_with = "verify_tls",
+        help = "Explicitly disable controller TLS verification (unsafe)"
+    )]
+    insecure: bool,
+    #[arg(
+        long,
+        value_name = "PEM",
+        help = "Additional trusted controller CA certificate"
+    )]
+    ca_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Opt in to retrying login on :443 when a :8443 controller is unreachable"
+    )]
+    port_fallback: bool,
+    #[arg(
+        long,
+        conflicts_with = "port_fallback",
+        help = "Disable the :8443 -> :443 login fallback (default)"
+    )]
+    no_port_fallback: bool,
     #[arg(
         long,
         value_enum,
@@ -349,8 +382,10 @@ enum WlanCommand {
     Create {
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        #[arg(long, required_unless_present = "open", conflicts_with = "open")]
         password: Option<String>,
+        #[arg(long, help = "Explicitly create an unsecured open WLAN")]
+        open: bool,
         #[arg(long, default_value_t = true)]
         enabled: bool,
     },
@@ -619,7 +654,7 @@ enum TimeSeriesCommand {
         end: u64,
         #[arg(long)]
         site: Option<String>,
-        #[arg(long, default_value = "csv", help = "Export format (csv, json)")]
+        #[arg(long, default_value = "csv", value_parser = ["csv", "json"], help = "Export format (csv, json)")]
         format: String,
     },
     /// Export WiFi statistics as time-series data
@@ -632,7 +667,7 @@ enum TimeSeriesCommand {
         ap_mac: Option<String>,
         #[arg(long)]
         site: Option<String>,
-        #[arg(long, default_value = "csv", help = "Export format (csv, json)")]
+        #[arg(long, default_value = "csv", value_parser = ["csv", "json"], help = "Export format (csv, json)")]
         format: String,
     },
     /// Export event log as time-series data
@@ -641,7 +676,7 @@ enum TimeSeriesCommand {
         limit: Option<usize>,
         #[arg(long)]
         site: Option<String>,
-        #[arg(long, default_value = "csv", help = "Export format (csv, json)")]
+        #[arg(long, default_value = "csv", value_parser = ["csv", "json"], help = "Export format (csv, json)")]
         format: String,
     },
 }
@@ -1220,6 +1255,10 @@ enum LocalDnsCommand {
         id: String,
         #[arg(long)]
         site: Option<String>,
+        #[arg(long, help = "Show what would be deleted without actually deleting")]
+        dry_run: bool,
+        #[arg(long, help = "Skip confirmation prompt")]
+        yes: bool,
     },
 }
 
@@ -1268,30 +1307,130 @@ struct RenderOpts {
     sort_by: Option<String>,
     filter: Option<String>,
     filter_regex: Option<String>,
+    schema: Option<&'static str>,
+    target: Option<String>,
+    site: Option<String>,
+}
+
+fn command_schema(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Local { command, .. } => match command {
+            LocalCommands::Device(LocalDeviceCommand::List { .. })
+            | LocalCommands::TopDevice(_) => Some("device.list"),
+            LocalCommands::Client(
+                LocalClientCommand::List { .. }
+                | LocalClientCommand::Active { .. }
+                | LocalClientCommand::History { .. },
+            )
+            | LocalCommands::TopClient(_) => Some("client.list"),
+            LocalCommands::Event(_) => Some("event.list"),
+            LocalCommands::Health(_) => Some("health.get"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn local_target_id(command: &LocalCommands) -> Option<&str> {
+    match command {
+        LocalCommands::Network(
+            NetworkCommand::Update { id, .. } | NetworkCommand::Delete { id, .. },
+        )
+        | LocalCommands::Wlan(WlanCommand::Update { id, .. } | WlanCommand::Delete { id, .. })
+        | LocalCommands::FirewallRule(
+            FirewallRuleCommand::Update { id, .. } | FirewallRuleCommand::Delete { id, .. },
+        )
+        | LocalCommands::FirewallGroup(
+            FirewallGroupCommand::Update { id, .. } | FirewallGroupCommand::Delete { id, .. },
+        )
+        | LocalCommands::PolicyTable(
+            PolicyTableCommand::Update { id, .. } | PolicyTableCommand::Delete { id, .. },
+        )
+        | LocalCommands::Zone(ZoneCommand::Update { id, .. } | ZoneCommand::Delete { id, .. })
+        | LocalCommands::Object(
+            ObjectCommand::Update { id, .. } | ObjectCommand::Delete { id, .. },
+        )
+        | LocalCommands::Dns(
+            LocalDnsCommand::Update { id, .. } | LocalDnsCommand::Delete { id, .. },
+        ) => Some(id),
+        LocalCommands::Device(
+            LocalDeviceCommand::Get { mac, .. }
+            | LocalDeviceCommand::Restart { mac, .. }
+            | LocalDeviceCommand::Provision { mac, .. }
+            | LocalDeviceCommand::Adopt { mac, .. }
+            | LocalDeviceCommand::Upgrade { mac, .. }
+            | LocalDeviceCommand::SpectrumScan { mac, .. },
+        ) => Some(mac),
+        _ => None,
+    }
+}
+
+fn response_rows(response: &ResponseData) -> Result<Vec<serde_json::Value>> {
+    response
+        .json
+        .as_ref()
+        .and_then(output::rows)
+        .cloned()
+        .ok_or_else(|| anyhow!("Invalid collection response: expected an array or data array"))
+}
+
+fn validation_check(name: &str, result: Result<ResponseData>) -> serde_json::Value {
+    match result {
+        Ok(_) => json!({"name": name, "status": "pass"}),
+        Err(error) => {
+            json!({"name": name, "status": "error", "error": terminal_safe(&format!("{error:#}"))})
+        }
+    }
+}
+
+fn render_value(value: serde_json::Value, output: OutputFormat, opts: &RenderOpts) -> Result<()> {
+    render_response(
+        ResponseData {
+            status: 200,
+            body: serde_json::to_string(&value)?,
+            json: Some(value),
+        },
+        output,
+        opts,
+        None,
+    )
 }
 
 fn validate_controller_url(url: &str) -> Result<String> {
-    let url = url.trim();
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(anyhow!(
-            "controller URL must start with http:// or https://, got: {url}"
-        ));
-    }
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap();
-    let host = after_scheme.split('/').next().unwrap_or("");
-    if host.is_empty() {
-        return Err(anyhow!(
-            "controller URL must contain a valid host, got: {url}"
-        ));
-    }
-    Ok(url.trim_end_matches('/').to_string())
+    Ok(crate::client::validate_base_url(url.trim(), true)?.to_string())
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    let output = cli.output;
+    match run(cli) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            let message = terminal_safe(&format!("{error:#}"));
+            if matches!(
+                output,
+                OutputFormat::Json | OutputFormat::Llm | OutputFormat::Csv
+            ) {
+                eprintln!(
+                    "{}",
+                    json!({"error": {"message": message}, "collected_at": chrono::Utc::now().to_rfc3339(), "outcome": "error"})
+                );
+            } else {
+                eprintln!("Error: {message}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    config::set_no_project_config(cli.no_project_config);
+    if let Some(pattern) = &cli.filter_regex {
+        RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .context("Invalid filter regular expression")?;
+    }
     let cwd = std::env::current_dir().context("reading current directory")?;
     FULL_IDS.get_or_init(|| cli.full_ids);
     session::set_disabled(cli.no_session_cache);
@@ -1315,6 +1454,46 @@ fn main() -> Result<()> {
 
         if let Some(url) = &args.controller_url {
             let validated_url = validate_controller_url(url)?;
+            let mut local_cfg = existing.local.take().unwrap_or_default();
+            let same_target = local_cfg
+                .url
+                .as_deref()
+                .and_then(|previous| validate_controller_url(previous).ok())
+                .is_some_and(|previous| previous == validated_url);
+            if !same_target {
+                // A trust exception belongs to its controller, not the next login.
+                local_cfg.verify_tls = None;
+                local_cfg.ca_file = None;
+                local_cfg.port_fallback = None;
+            }
+            if args.port_fallback {
+                local_cfg.port_fallback = Some(true);
+            }
+            if args.no_port_fallback {
+                local_cfg.port_fallback = Some(false);
+            }
+            if args.verify_tls {
+                local_cfg.verify_tls = Some(true);
+            }
+            if args.insecure {
+                local_cfg.verify_tls = Some(false);
+            }
+            if let Some(ca_file) = &args.ca_file {
+                local_cfg.ca_file = Some(
+                    fs::canonicalize(cwd.join(ca_file)).context("Resolving controller CA file")?,
+                );
+            }
+            let verify_tls = local_cfg.verify_tls.unwrap_or(true);
+            if !verify_tls && local_cfg.ca_file.is_some() {
+                return Err(anyhow!(
+                    "A controller CA requires TLS verification; use --verify-tls or remove the stored CA before selecting --insecure"
+                ));
+            }
+            if verify_tls && validated_url.starts_with("http:") {
+                return Err(anyhow!(
+                    "HTTPS is required; explicitly select --insecure to save an HTTP controller"
+                ));
+            }
             let u = args.username.clone().ok_or_else(|| {
                 anyhow!("--username is required when setting a local controller URL")
             })?;
@@ -1331,12 +1510,10 @@ fn main() -> Result<()> {
                 None => rpassword::prompt_password("Local controller password: ")
                     .context("reading password from terminal")?,
             };
-            let mut local_cfg = existing.local.unwrap_or_default();
             local_cfg.url = Some(validated_url);
             local_cfg.username = Some(u);
             local_cfg.password = Some(p);
             local_cfg.site = Some(args.site.clone());
-            local_cfg.verify_tls = args.verify_tls;
             existing.local = Some(local_cfg);
         }
 
@@ -1345,8 +1522,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let effective = resolve(&cwd, cli.api_key.clone(), cli.base_url.clone())?;
-    let client = ApiClient::new(&effective.base_url, &effective.api_key)?;
     let render_opts = RenderOpts {
         columns_override: cli.columns.as_ref().map(|c| {
             c.split(',')
@@ -1357,201 +1532,210 @@ fn main() -> Result<()> {
         sort_by: cli.sort_by.clone(),
         filter: cli.filter.clone(),
         filter_regex: cli.filter_regex.clone(),
+        schema: command_schema(&cli.command),
+        target: None,
+        site: None,
     };
 
     match cli.command {
-        Commands::Cloud { command } => match command {
-            CloudCommands::Host(command) => match command {
-                HostCommand::List => run_get(
-                    &client,
-                    "/v1/hosts",
-                    vec![],
-                    cli.output,
-                    &render_opts,
-                    Some(&[
-                        "name",
-                        "displayName",
-                        "type",
-                        "hostType",
-                        "status",
-                        "publicIp",
-                        "id",
-                    ]),
-                    cli.watch,
-                )?,
-                HostCommand::Get { id } => run_get(
-                    &client,
-                    &format!("/v1/hosts/{id}"),
-                    vec![],
-                    cli.output,
-                    &render_opts,
-                    None,
-                    cli.watch,
-                )?,
-            },
-            CloudCommands::Site(command) => match command {
-                SiteCommand::List { host_id } => {
-                    let mut query = Vec::new();
-                    if let Some(host) = host_id {
-                        query.push(("hostId", host));
-                    }
-                    run_get(
+        Commands::Cloud { command } => {
+            let effective = resolve(&cwd, cli.api_key.clone(), cli.base_url.clone())?;
+            let client = ApiClient::new(&effective.base_url, &effective.api_key)?;
+            let mut render_opts = render_opts.clone();
+            render_opts.target = Some(effective.base_url);
+            match command {
+                CloudCommands::Host(command) => match command {
+                    HostCommand::List => run_get(
                         &client,
-                        "/v1/sites",
-                        query,
-                        cli.output,
-                        &render_opts,
-                        Some(&["name", "displayName", "hostId", "siteId", "id"]),
-                        cli.watch,
-                    )?
-                }
-            },
-            CloudCommands::Device(command) => match command {
-                DeviceCommand::List { host_id, site_id } => {
-                    let mut query = Vec::new();
-                    if let Some(host) = host_id {
-                        query.push(("hostId", host));
-                    }
-                    if let Some(site) = site_id {
-                        query.push(("siteId", site));
-                    }
-                    run_get(
-                        &client,
-                        "/v1/devices",
-                        query,
-                        cli.output,
-                        &render_opts,
-                        Some(&[
-                            "name",
-                            "displayName",
-                            "hostname",
-                            "model",
-                            "type",
-                            "siteId",
-                            "hostId",
-                            "ip",
-                            "mac",
-                            "version",
-                            "status",
-                        ]),
-                        cli.watch,
-                    )?
-                }
-                DeviceCommand::Get {
-                    id,
-                    host_id,
-                    site_id,
-                } => {
-                    let mut query = Vec::new();
-                    if let Some(host) = host_id {
-                        query.push(("hostId", host));
-                    }
-                    if let Some(site) = site_id {
-                        query.push(("siteId", site));
-                    }
-                    run_get(
-                        &client,
-                        &format!("/v1/devices/{id}"),
-                        query,
-                        cli.output,
-                        &render_opts,
-                        Some(&[
-                            "name",
-                            "displayName",
-                            "hostname",
-                            "model",
-                            "type",
-                            "ip",
-                            "mac",
-                            "siteId",
-                            "hostId",
-                            "version",
-                            "status",
-                        ]),
-                        cli.watch,
-                    )?
-                }
-            },
-            CloudCommands::Isp(command) => match command {
-                IspCommand::Get {
-                    metric_type,
-                    host_id,
-                    site_id,
-                    start,
-                    end,
-                } => {
-                    let mut query = Vec::new();
-                    if let Some(host) = host_id {
-                        query.push(("hostId", host));
-                    }
-                    if let Some(site) = site_id {
-                        query.push(("siteId", site));
-                    }
-                    if let Some(start) = start {
-                        query.push(("start", start));
-                    }
-                    if let Some(end) = end {
-                        query.push(("end", end));
-                    }
-                    run_get(
-                        &client,
-                        &format!("/ea/isp-metrics/{metric_type}"),
-                        query,
-                        cli.output,
-                        &render_opts,
-                        None,
-                        cli.watch,
-                    )?
-                }
-                IspCommand::Query {
-                    metric_type,
-                    body,
-                    body_file,
-                } => {
-                    let payload = parse_body(&body, &body_file)?.ok_or_else(|| {
-                        anyhow!("Provide --body or --body-file with JSON content")
-                    })?;
-                    run_post(
-                        &client,
-                        &format!("/ea/isp-metrics/{metric_type}/query"),
+                        "/v1/hosts",
                         vec![],
-                        payload,
+                        cli.output,
+                        &render_opts,
+                        Some(&[
+                            "name",
+                            "displayName",
+                            "type",
+                            "hostType",
+                            "status",
+                            "publicIp",
+                            "id",
+                        ]),
+                        cli.watch,
+                    )?,
+                    HostCommand::Get { id } => run_get(
+                        &client,
+                        &format!("/v1/hosts/{id}"),
+                        vec![],
                         cli.output,
                         &render_opts,
                         None,
-                    )?
-                }
-            },
-            CloudCommands::Sdwan(command) => match command {
-                SdwanCommand::List => run_get(
-                    &client,
-                    "/ea/sd-wan-configs",
-                    vec![],
-                    cli.output,
-                    &render_opts,
-                    Some(&["id", "name", "status", "hostId", "siteId"]),
-                    cli.watch,
-                )?,
-                SdwanCommand::Get { id } => run_get(
-                    &client,
-                    &format!("/ea/sd-wan-configs/{id}"),
-                    vec![],
-                    cli.output,
-                    &render_opts,
-                    None,
-                    cli.watch,
-                )?,
-                SdwanCommand::Status { id } => run_get(
-                    &client,
-                    &format!("/ea/sd-wan-configs/{id}/status"),
-                    vec![],
-                    cli.output,
-                    &render_opts,
-                    None,
-                    cli.watch,
-                )?,
-            },
-        },
+                        cli.watch,
+                    )?,
+                },
+                CloudCommands::Site(command) => match command {
+                    SiteCommand::List { host_id } => {
+                        let mut query = Vec::new();
+                        if let Some(host) = host_id {
+                            query.push(("hostId", host));
+                        }
+                        run_get(
+                            &client,
+                            "/v1/sites",
+                            query,
+                            cli.output,
+                            &render_opts,
+                            Some(&["name", "displayName", "hostId", "siteId", "id"]),
+                            cli.watch,
+                        )?
+                    }
+                },
+                CloudCommands::Device(command) => match command {
+                    DeviceCommand::List { host_id, site_id } => {
+                        let mut query = Vec::new();
+                        if let Some(host) = host_id {
+                            query.push(("hostId", host));
+                        }
+                        if let Some(site) = site_id {
+                            query.push(("siteId", site));
+                        }
+                        run_get(
+                            &client,
+                            "/v1/devices",
+                            query,
+                            cli.output,
+                            &render_opts,
+                            Some(&[
+                                "name",
+                                "displayName",
+                                "hostname",
+                                "model",
+                                "type",
+                                "siteId",
+                                "hostId",
+                                "ip",
+                                "mac",
+                                "version",
+                                "status",
+                            ]),
+                            cli.watch,
+                        )?
+                    }
+                    DeviceCommand::Get {
+                        id,
+                        host_id,
+                        site_id,
+                    } => {
+                        let mut query = Vec::new();
+                        if let Some(host) = host_id {
+                            query.push(("hostId", host));
+                        }
+                        if let Some(site) = site_id {
+                            query.push(("siteId", site));
+                        }
+                        run_get(
+                            &client,
+                            &format!("/v1/devices/{id}"),
+                            query,
+                            cli.output,
+                            &render_opts,
+                            Some(&[
+                                "name",
+                                "displayName",
+                                "hostname",
+                                "model",
+                                "type",
+                                "ip",
+                                "mac",
+                                "siteId",
+                                "hostId",
+                                "version",
+                                "status",
+                            ]),
+                            cli.watch,
+                        )?
+                    }
+                },
+                CloudCommands::Isp(command) => match command {
+                    IspCommand::Get {
+                        metric_type,
+                        host_id,
+                        site_id,
+                        start,
+                        end,
+                    } => {
+                        let mut query = Vec::new();
+                        if let Some(host) = host_id {
+                            query.push(("hostId", host));
+                        }
+                        if let Some(site) = site_id {
+                            query.push(("siteId", site));
+                        }
+                        if let Some(start) = start {
+                            query.push(("start", start));
+                        }
+                        if let Some(end) = end {
+                            query.push(("end", end));
+                        }
+                        run_get(
+                            &client,
+                            &format!("/ea/isp-metrics/{metric_type}"),
+                            query,
+                            cli.output,
+                            &render_opts,
+                            None,
+                            cli.watch,
+                        )?
+                    }
+                    IspCommand::Query {
+                        metric_type,
+                        body,
+                        body_file,
+                    } => {
+                        let payload = parse_body(&body, &body_file)?.ok_or_else(|| {
+                            anyhow!("Provide --body or --body-file with JSON content")
+                        })?;
+                        run_post(
+                            &client,
+                            &format!("/ea/isp-metrics/{metric_type}/query"),
+                            vec![],
+                            payload,
+                            cli.output,
+                            &render_opts,
+                            None,
+                        )?
+                    }
+                },
+                CloudCommands::Sdwan(command) => match command {
+                    SdwanCommand::List => run_get(
+                        &client,
+                        "/ea/sd-wan-configs",
+                        vec![],
+                        cli.output,
+                        &render_opts,
+                        Some(&["id", "name", "status", "hostId", "siteId"]),
+                        cli.watch,
+                    )?,
+                    SdwanCommand::Get { id } => run_get(
+                        &client,
+                        &format!("/ea/sd-wan-configs/{id}"),
+                        vec![],
+                        cli.output,
+                        &render_opts,
+                        None,
+                        cli.watch,
+                    )?,
+                    SdwanCommand::Status { id } => run_get(
+                        &client,
+                        &format!("/ea/sd-wan-configs/{id}/status"),
+                        vec![],
+                        cli.output,
+                        &render_opts,
+                        None,
+                        cli.watch,
+                    )?,
+                },
+            }
+        }
         Commands::Login {
             command:
                 Some(LoginCommand::Validate {
@@ -1564,29 +1748,25 @@ fn main() -> Result<()> {
                 return Err(anyhow!("Use only one of --cloud-only or --local-only"));
             }
 
+            let mut checks = Vec::new();
             if !local_only {
-                println!("Validating cloud (Site Manager) credentials...");
-                match client.get("/v1/hosts", &[]) {
-                    Ok(_) => println!("Cloud API: ok"),
-                    Err(e) => println!("Cloud API: FAILED ({})", e),
-                }
+                let result =
+                    resolve(&cwd, cli.api_key.clone(), cli.base_url.clone()).and_then(|cfg| {
+                        ApiClient::new(&cfg.base_url, &cfg.api_key)?.get("/v1/hosts", &[])
+                    });
+                checks.push(validation_check("cloud", result));
             }
-
             if !cloud_only {
-                println!("Validating local controller credentials...");
-                match resolve_local(&cwd, None).and_then(|cfg| {
-                    let mut local = LocalClient::new(
-                        &cfg.url,
-                        &cfg.username,
-                        &cfg.password,
-                        &cfg.site,
-                        cfg.verify_tls,
-                    )?;
-                    local.list_sites()
-                }) {
-                    Ok(_) => println!("Local controller: ok"),
-                    Err(e) => println!("Local controller: FAILED ({})", e),
-                }
+                let result = resolve_local(&cwd, None)
+                    .and_then(|cfg| LocalClient::from_config(&cfg)?.validate_credentials());
+                checks.push(validation_check("local", result));
+            }
+            let failed = checks.iter().any(|check| check["status"] != "pass");
+            let result =
+                json!({"validation": checks, "outcome": if failed { "failed" } else { "success" }});
+            render_value(result, cli.output, &render_opts)?;
+            if failed {
+                return Err(anyhow!("Credential validation failed"));
             }
         }
         Commands::Login {
@@ -1641,16 +1821,18 @@ fn handle_local(
     render_opts: &RenderOpts,
     watch: Option<u64>,
 ) -> Result<()> {
+    if let Some(id) = local_target_id(&cmd) {
+        local::validate_target_id(id)?;
+    }
+    let cfg = resolve_local(cwd, site_override(global_site.clone()))?;
+    let mut opts = render_opts.clone();
+    opts.target = Some(cfg.url);
+    opts.site = Some(cfg.site);
+    let render_opts = &opts;
     match cmd {
         LocalCommands::Site(LocalSiteCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.list_sites(),
                 output,
@@ -1665,17 +1847,12 @@ fn handle_local(
             limit,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.list_devices()?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
                             if unadopted {
                                 arr.retain(|item| {
@@ -1704,64 +1881,62 @@ fn handle_local(
         }
         LocalCommands::Device(LocalDeviceCommand::AdoptAll { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
-            // Get all devices and adopt unadopted ones
+            let mut client = LocalClient::from_config(&effective)?;
             let devices = client.list_devices()?;
-            if let Some(json) = devices.json {
-                if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                    let mut adopted_count = 0;
-                    let mut failed_count = 0;
-
-                    for device in data {
-                        let state = device.get("state").and_then(|s| s.as_str());
-                        let adopted = device.get("adopted").and_then(|a| a.as_bool());
-                        let is_unadopted = state == Some("pending") || adopted == Some(false);
-
-                        if is_unadopted
-                            && let Some(mac) = device.get("mac").and_then(|m| m.as_str())
-                        {
-                            match client.device_action(mac, "adopt") {
-                                Ok(_) => {
-                                    adopted_count += 1;
-                                    if let Some(name) = device.get("name").and_then(|n| n.as_str())
-                                    {
-                                        println!("Adopted: {} ({})", name, mac);
-                                    } else {
-                                        println!("Adopted device: {}", mac);
-                                    }
-                                }
-                                Err(e) => {
-                                    failed_count += 1;
-                                    if let Some(name) = device.get("name").and_then(|n| n.as_str())
-                                    {
-                                        eprintln!("Failed to adopt {} ({}): {}", name, mac, e);
-                                    } else {
-                                        eprintln!("Failed to adopt device {}: {}", mac, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    println!(
-                        "\nAdoption complete: {} adopted, {} failed",
-                        adopted_count, failed_count
-                    );
-                    Ok(())
-                } else {
-                    println!("No devices found");
-                    Ok(())
+            let data = response_rows(&devices)?;
+            let mut results = Vec::new();
+            let mut stop_remaining = false;
+            for device in data {
+                let unadopted = device.get("state").and_then(|v| v.as_str()) == Some("pending")
+                    || device.get("adopted").and_then(|v| v.as_bool()) == Some(false);
+                if !unadopted {
+                    continue;
                 }
-            } else {
-                println!("No devices found");
-                Ok(())
+                let mac = device.get("mac").and_then(|v| v.as_str());
+                let mut result = json!({"mac": mac, "name": device.get("name")});
+                if stop_remaining {
+                    result["status"] = json!("not_attempted");
+                    result["error"] = json!(
+                        "Batch stopped after an ambiguous write outcome, authentication/permission denial or rate limiting; inspect prior results and read back state before retrying"
+                    );
+                    results.push(result);
+                    continue;
+                }
+                match mac {
+                    Some(mac) => match client.device_action(mac, "adopt") {
+                        Ok(_) => result["status"] = json!("accepted"),
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            stop_remaining = local::should_stop_batch(&error)
+                                || message.contains("outcome=unknown");
+                            result["status"] = json!("not_confirmed");
+                            result["error"] = json!(terminal_safe(&message));
+                        }
+                    },
+                    None => {
+                        result["status"] = json!("not_attempted");
+                        result["error"] =
+                            json!("Unadopted device has no MAC; target cannot be identified");
+                    }
+                }
+                results.push(result);
             }
+            let accepted = results.iter().filter(|r| r["status"] == "accepted").count();
+            let unconfirmed = results.len() - accepted;
+            let report = json!({
+                "action": "adopt", "outcome": if unconfirmed == 0 { "accepted" } else { "partial_or_failed" },
+                "accepted_count": accepted, "unconfirmed_count": unconfirmed,
+                "batch_stopped": stop_remaining,
+                "results": results,
+                "verification": "Acceptance is not completed adoption; read back each device before further actions"
+            });
+            render_value(report, output, render_opts)?;
+            if unconfirmed > 0 {
+                return Err(anyhow!(
+                    "Adoption has {unconfirmed} unconfirmed or unattempted targets; inspect results before retrying"
+                ));
+            }
+            Ok(())
         }
         LocalCommands::Device(LocalDeviceCommand::Get {
             mac,
@@ -1770,18 +1945,13 @@ fn handle_local(
             ports,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     // stats/config/ports are derived from device listing
                     let mut resp = client.device_stats(&mac)?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
                             && let Some(first) = arr.get_mut(0)
                         {
@@ -1806,13 +1976,7 @@ fn handle_local(
         }
         LocalCommands::Device(LocalDeviceCommand::Restart { mac, site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_response(
                 client.device_action(&mac, "restart")?,
                 output,
@@ -1822,13 +1986,7 @@ fn handle_local(
         }
         LocalCommands::Device(LocalDeviceCommand::Provision { mac, site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_response(
                 client.device_action(&mac, "force-provision")?,
                 output,
@@ -1838,13 +1996,7 @@ fn handle_local(
         }
         LocalCommands::Device(LocalDeviceCommand::Adopt { mac, site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_response(
                 client.device_action(&mac, "adopt")?,
                 output,
@@ -1854,13 +2006,7 @@ fn handle_local(
         }
         LocalCommands::Device(LocalDeviceCommand::Upgrade { mac, site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_response(
                 client.device_action(&mac, "upgrade")?,
                 output,
@@ -1870,13 +2016,7 @@ fn handle_local(
         }
         LocalCommands::Device(LocalDeviceCommand::SpectrumScan { mac, site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.stat_spectrum_scan(&mac),
                 output,
@@ -1887,13 +2027,7 @@ fn handle_local(
         }
         LocalCommands::Device(LocalDeviceCommand::PortAnomalies { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.ports_anomalies(),
                 output,
@@ -1904,13 +2038,7 @@ fn handle_local(
         }
         LocalCommands::Device(LocalDeviceCommand::MacTables { site: _, device }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let payload = device.map(|d| serde_json::json!({ "device": d }));
             render_local(
                 || client.ports_mac_tables(payload.as_ref()),
@@ -1928,17 +2056,12 @@ fn handle_local(
             limit,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.list_clients()?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         if let Some(arr) = list_payload_mut(&mut json) {
                             arr.retain(|item| {
                                 let is_wired = item
@@ -1981,13 +2104,7 @@ fn handle_local(
         }
         LocalCommands::Client(LocalClientCommand::Block { mac, site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_response(
                 client.client_action(&mac, "block")?,
                 output,
@@ -1997,13 +2114,7 @@ fn handle_local(
         }
         LocalCommands::Client(LocalClientCommand::Unblock { mac, site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_response(
                 client.client_action(&mac, "unblock")?,
                 output,
@@ -2013,13 +2124,7 @@ fn handle_local(
         }
         LocalCommands::Client(LocalClientCommand::Reconnect { mac, site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_response(
                 client.client_action(&mac, "reconnect")?,
                 output,
@@ -2029,17 +2134,12 @@ fn handle_local(
         }
         LocalCommands::Client(LocalClientCommand::Active { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.clients_v2_active()?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         // v2 endpoint: bare array, no `data` envelope — see the
                         // note in `client history`.
                         if let Some(arr) = list_payload_mut(&mut json) {
@@ -2063,18 +2163,13 @@ fn handle_local(
             limit,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mac_filter = mac.clone();
             render_local(
                 move || {
                     let mut resp = client.clients_v2_history()?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         // `clients/history` is a v2 endpoint: it answers with a
                         // bare array, not a `{"data": …}` envelope. Reaching
                         // straight for `data` found nothing, so both --mac and
@@ -2117,13 +2212,7 @@ fn handle_local(
             metadata,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mac_clone = mac.clone();
             let mut payload = if let Some(meta_json) = metadata {
                 serde_json::from_str::<serde_json::Value>(&meta_json)
@@ -2147,20 +2236,15 @@ fn handle_local(
         }
         LocalCommands::Event(LocalEventCommand::List { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     // The v2 event feed pages at 50 records unless `pageSize`
                     // is sent, so truncating a single default response could
                     // never honor a --limit above 50. Paginate instead, and say
                     // so out loud when the controller runs dry early.
-                    let (resp, stats) = client.list_events_paged(limit)?;
+                    let (mut resp, stats) = client.list_events_paged(limit)?;
+                    attach_paged_metadata(&mut resp, stats)?;
                     if stats.truncated {
                         match stats.total_available {
                             Some(total) => eprintln!(
@@ -2185,13 +2269,7 @@ fn handle_local(
         }
         LocalCommands::Log(LocalLogCommand::Settings { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.system_log_settings(),
                 output,
@@ -2206,13 +2284,7 @@ fn handle_local(
             offset,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::json!({});
             if let Some(lim) = limit {
                 payload["pageSize"] = serde_json::json!(lim);
@@ -2230,13 +2302,7 @@ fn handle_local(
         }
         LocalCommands::Log(LocalLogCommand::Count { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.system_log_count(None),
                 output,
@@ -2247,13 +2313,7 @@ fn handle_local(
         }
         LocalCommands::Log(LocalLogCommand::Critical { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let payload = limit.map(|lim| serde_json::json!({ "pageSize": lim }));
             render_local(
                 || client.system_log_critical(payload.as_ref()),
@@ -2265,13 +2325,7 @@ fn handle_local(
         }
         LocalCommands::Log(LocalLogCommand::DeviceAlert { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let payload = limit.map(|lim| serde_json::json!({ "pageSize": lim }));
             render_local(
                 || client.system_log_device_alert(payload.as_ref()),
@@ -2283,13 +2337,7 @@ fn handle_local(
         }
         LocalCommands::Log(LocalLogCommand::AdminActivity { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let payload = limit.map(|lim| serde_json::json!({ "pageSize": lim }));
             render_local(
                 || client.system_log_admin_activity(payload.as_ref()),
@@ -2301,13 +2349,7 @@ fn handle_local(
         }
         LocalCommands::Wifi(LocalWifiCommand::Connectivity { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.wifi_connectivity(),
                 output,
@@ -2324,13 +2366,7 @@ fn handle_local(
             ap_mac,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if radios {
                 let query = serde_json::json!({
                     "start": start,
@@ -2364,13 +2400,7 @@ fn handle_local(
         }
         LocalCommands::Wifi(LocalWifiCommand::RadioAi { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.radio_ai_isolation_matrix(),
                 output,
@@ -2381,24 +2411,12 @@ fn handle_local(
         }
         LocalCommands::Wifi(LocalWifiCommand::Management { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(|| client.wifiman(), output, render_opts, None, watch)
         }
         LocalCommands::Wifi(LocalWifiCommand::Config { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.wlan_enriched_config(),
                 output,
@@ -2414,13 +2432,7 @@ fn handle_local(
             include_unidentified,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let query = serde_json::json!({
                 "start": start,
                 "end": end,
@@ -2440,13 +2452,7 @@ fn handle_local(
             top,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let period_str = match period {
                 FlowPeriod::Day => "DAY",
                 FlowPeriod::Month => "MONTH",
@@ -2465,13 +2471,7 @@ fn handle_local(
         }
         LocalCommands::Traffic(LocalTrafficCommand::FilterData { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.traffic_flows_filter_data(),
                 output,
@@ -2482,24 +2482,12 @@ fn handle_local(
         }
         LocalCommands::Traffic(LocalTrafficCommand::Routes { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(|| client.traffic_routes(), output, render_opts, None, watch)
         }
         LocalCommands::Traffic(LocalTrafficCommand::Rules { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(|| client.traffic_rules(), output, render_opts, None, watch)
         }
         LocalCommands::Traffic(LocalTrafficCommand::AppRate {
@@ -2509,13 +2497,7 @@ fn handle_local(
             include_unidentified,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let query = serde_json::json!({
                 "start": start,
                 "end": end,
@@ -2532,13 +2514,7 @@ fn handle_local(
         }
         LocalCommands::Traffic(LocalTrafficCommand::Flows { site: _, query }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let payload = query
                 .map(|q| serde_json::from_str(&q).context("parsing query JSON"))
                 .transpose()?;
@@ -2552,24 +2528,12 @@ fn handle_local(
         }
         LocalCommands::Stat(LocalStatCommand::Ccode { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(|| client.stat_ccode(), output, render_opts, None, watch)
         }
         LocalCommands::Stat(LocalStatCommand::CurrentChannel { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.stat_current_channel(),
                 output,
@@ -2580,13 +2544,7 @@ fn handle_local(
         }
         LocalCommands::Stat(LocalStatCommand::DeviceBasic { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.stat_device_basic(),
                 output,
@@ -2597,24 +2555,12 @@ fn handle_local(
         }
         LocalCommands::Stat(LocalStatCommand::Guest { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(|| client.stat_guest(), output, render_opts, None, watch)
         }
         LocalCommands::Stat(LocalStatCommand::Rogueap { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(|| client.stat_rogueap(), output, render_opts, None, watch)
         }
         LocalCommands::Stat(LocalStatCommand::Alarm {
@@ -2623,17 +2569,12 @@ fn handle_local(
             limit,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.list_alarms(archived)?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
                             && arr.len() > limit
                         {
@@ -2653,24 +2594,12 @@ fn handle_local(
         }
         LocalCommands::Stat(LocalStatCommand::Sdn { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(|| client.stat_sdn(), output, render_opts, None, watch)
         }
         LocalCommands::Stat(LocalStatCommand::Report5min { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.stat_report_5min_ap(None),
                 output,
@@ -2681,17 +2610,12 @@ fn handle_local(
         }
         LocalCommands::Health(LocalHealthCommand::Get { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.list_health()?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         enrich_health_status_messages(&mut json);
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
@@ -2707,17 +2631,12 @@ fn handle_local(
         }
         LocalCommands::Vpn(LocalVpnCommand::Get { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.vpn_health()?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         enrich_health_status_messages(&mut json);
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
@@ -2733,13 +2652,7 @@ fn handle_local(
         }
         LocalCommands::Security(LocalSecurityCommand::Get { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.security_settings(),
                 output,
@@ -2750,13 +2663,7 @@ fn handle_local(
         }
         LocalCommands::Wan(LocalWanCommand::Get { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.list_health()?;
@@ -2784,13 +2691,7 @@ fn handle_local(
         }
         LocalCommands::Network(NetworkCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.networks(),
                 output,
@@ -2809,13 +2710,7 @@ fn handle_local(
         }
         LocalCommands::Wlan(WlanCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.wlans(),
                 output,
@@ -2833,13 +2728,7 @@ fn handle_local(
         }
         LocalCommands::PortProfile(PortProfileCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.port_profiles(),
                 output,
@@ -2850,13 +2739,7 @@ fn handle_local(
         }
         LocalCommands::FirewallRule(FirewallRuleCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.firewall_rules(),
                 output,
@@ -2875,13 +2758,7 @@ fn handle_local(
         }
         LocalCommands::FirewallGroup(FirewallGroupCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.firewall_groups(),
                 output,
@@ -2897,13 +2774,7 @@ fn handle_local(
             dhcp,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             payload.insert("name".into(), json!(name));
             payload.insert("purpose".into(), json!("corporate"));
@@ -2930,13 +2801,7 @@ fn handle_local(
             dhcp,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             if let Some(name) = name {
                 payload.insert("name".into(), json!(name));
@@ -2963,13 +2828,7 @@ fn handle_local(
         }
         LocalCommands::Network(NetworkCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if dry_run {
                 // Fetch the network to show what would be deleted
                 let networks = client.networks()?;
@@ -2981,7 +2840,7 @@ fn handle_local(
                     })
                 {
                     println!("Would delete network:");
-                    println!("{}", serde_json::to_string_pretty(network)?);
+                    println!("{}", output::pretty_json(network)?);
                     return Ok(());
                 }
                 println!("Would delete network with ID: {}", id);
@@ -3015,16 +2874,16 @@ fn handle_local(
         LocalCommands::Wlan(WlanCommand::Create {
             name,
             password,
+            open,
             enabled,
         }) => {
+            if !open && password.as_ref().is_none_or(|p| p.is_empty()) {
+                return Err(anyhow!(
+                    "Provide a nonempty --password or explicitly choose --open"
+                ));
+            }
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             payload.insert("name".into(), json!(name));
             payload.insert("enabled".into(), json!(enabled));
@@ -3051,13 +2910,7 @@ fn handle_local(
             enabled,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             if let Some(name) = name {
                 payload.insert("name".into(), json!(name));
@@ -3081,13 +2934,7 @@ fn handle_local(
         }
         LocalCommands::Wlan(WlanCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if dry_run {
                 // Fetch the WLAN to show what would be deleted
                 let wlans = client.wlans()?;
@@ -3099,7 +2946,7 @@ fn handle_local(
                     })
                 {
                     println!("Would delete WLAN:");
-                    println!("{}", serde_json::to_string_pretty(wlan)?);
+                    println!("{}", output::pretty_json(wlan)?);
                     return Ok(());
                 }
                 println!("Would delete WLAN with ID: {}", id);
@@ -3141,13 +2988,7 @@ fn handle_local(
             dst_group,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             payload.insert("name".into(), json!(name));
             payload.insert("enabled".into(), json!(true));
@@ -3174,13 +3015,7 @@ fn handle_local(
             dst_group,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             if let Some(name) = name {
                 payload.insert("name".into(), json!(name));
@@ -3207,13 +3042,7 @@ fn handle_local(
         }
         LocalCommands::FirewallRule(FirewallRuleCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if dry_run {
                 // Fetch the firewall rule to show what would be deleted
                 let rules = client.firewall_rules()?;
@@ -3225,7 +3054,7 @@ fn handle_local(
                     })
                 {
                     println!("Would delete firewall rule:");
-                    println!("{}", serde_json::to_string_pretty(rule)?);
+                    println!("{}", output::pretty_json(rule)?);
                     return Ok(());
                 }
                 println!("Would delete firewall rule with ID: {}", id);
@@ -3262,13 +3091,7 @@ fn handle_local(
             members,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             payload.insert("name".into(), json!(name));
             payload.insert("group_type".into(), json!(group_type));
@@ -3282,13 +3105,7 @@ fn handle_local(
         }
         LocalCommands::FirewallGroup(FirewallGroupCommand::Update { id, name, members }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             if let Some(name) = name {
                 payload.insert("name".into(), json!(name));
@@ -3308,13 +3125,7 @@ fn handle_local(
         }
         LocalCommands::FirewallGroup(FirewallGroupCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if dry_run {
                 // Fetch the firewall group to show what would be deleted
                 let groups = client.firewall_groups()?;
@@ -3326,7 +3137,7 @@ fn handle_local(
                     })
                 {
                     println!("Would delete firewall group:");
-                    println!("{}", serde_json::to_string_pretty(group)?);
+                    println!("{}", output::pretty_json(group)?);
                     return Ok(());
                 }
                 println!("Would delete firewall group with ID: {}", id);
@@ -3364,17 +3175,12 @@ fn handle_local(
         }
         LocalCommands::TopClient(LocalTopClientCommand::List { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.list_clients()?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
                             let score = |item: &serde_json::Value| -> u128 {
                                 let tx = item.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -3402,17 +3208,12 @@ fn handle_local(
         }
         LocalCommands::TopDevice(LocalTopDeviceCommand::List { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || {
                     let mut resp = client.list_devices()?;
                     if let Some(mut json) = resp.json.clone() {
+                        capture_collection(&mut json);
                         if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
                             let score = |item: &serde_json::Value| -> i64 {
                                 item.get("num_sta")
@@ -3441,13 +3242,7 @@ fn handle_local(
         }
         LocalCommands::Dpi(LocalDpiCommand::Get { site: _ }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.dpi(),
                 output,
@@ -3458,13 +3253,7 @@ fn handle_local(
         }
         LocalCommands::PolicyTable(PolicyTableCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.policy_tables(),
                 output,
@@ -3475,13 +3264,7 @@ fn handle_local(
         }
         LocalCommands::PolicyTable(PolicyTableCommand::Create { name, description }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             payload.insert("name".into(), json!(name));
             payload.insert("enabled".into(), json!(true));
@@ -3501,13 +3284,7 @@ fn handle_local(
             description,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             if let Some(name) = name {
                 payload.insert("name".into(), json!(name));
@@ -3527,13 +3304,7 @@ fn handle_local(
         }
         LocalCommands::PolicyTable(PolicyTableCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if dry_run {
                 let tables = client.policy_tables()?;
                 if let Some(json) = tables.json
@@ -3544,7 +3315,7 @@ fn handle_local(
                     })
                 {
                     println!("Would delete policy table:");
-                    println!("{}", serde_json::to_string_pretty(table)?);
+                    println!("{}", output::pretty_json(table)?);
                     return Ok(());
                 }
                 println!("Would delete policy table with ID: {}", id);
@@ -3576,13 +3347,7 @@ fn handle_local(
         }
         LocalCommands::Zone(ZoneCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.zones(),
                 output,
@@ -3593,13 +3358,7 @@ fn handle_local(
         }
         LocalCommands::Zone(ZoneCommand::Create { name, description }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             payload.insert("name".into(), json!(name));
             payload.insert("enabled".into(), json!(true));
@@ -3619,13 +3378,7 @@ fn handle_local(
             description,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             if let Some(name) = name {
                 payload.insert("name".into(), json!(name));
@@ -3645,13 +3398,7 @@ fn handle_local(
         }
         LocalCommands::Zone(ZoneCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if dry_run {
                 let zones = client.zones()?;
                 if let Some(json) = zones.json
@@ -3662,7 +3409,7 @@ fn handle_local(
                     })
                 {
                     println!("Would delete zone:");
-                    println!("{}", serde_json::to_string_pretty(zone)?);
+                    println!("{}", output::pretty_json(zone)?);
                     return Ok(());
                 }
                 println!("Would delete zone with ID: {}", id);
@@ -3694,13 +3441,7 @@ fn handle_local(
         }
         LocalCommands::Object(ObjectCommand::List) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             render_local(
                 || client.objects(),
                 output,
@@ -3715,13 +3456,7 @@ fn handle_local(
             value,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             payload.insert("name".into(), json!(name));
             payload.insert("type".into(), json!(object_type));
@@ -3737,13 +3472,7 @@ fn handle_local(
         }
         LocalCommands::Object(ObjectCommand::Update { id, name, value }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut payload = serde_json::Map::new();
             if let Some(name) = name {
                 payload.insert("name".into(), json!(name));
@@ -3763,13 +3492,7 @@ fn handle_local(
         }
         LocalCommands::Object(ObjectCommand::Delete { id, dry_run, yes }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if dry_run {
                 let objects = client.objects()?;
                 if let Some(json) = objects.json
@@ -3780,7 +3503,7 @@ fn handle_local(
                     })
                 {
                     println!("Would delete object:");
-                    println!("{}", serde_json::to_string_pretty(obj)?);
+                    println!("{}", output::pretty_json(obj)?);
                     return Ok(());
                 }
                 println!("Would delete object with ID: {}", id);
@@ -3812,51 +3535,28 @@ fn handle_local(
         }
         LocalCommands::Correlate(cmd) => {
             let effective = resolve_local(cwd, site_override(global_site.clone()))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             handle_correlate_command(&cmd, &mut client, output, render_opts, global_site)?;
             Ok(())
         }
         LocalCommands::Diagnose(cmd) => {
             let effective = resolve_local(cwd, site_override(global_site.clone()))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             handle_diagnose_command(&cmd, &mut client, output, render_opts, global_site)?;
             Ok(())
         }
         LocalCommands::TimeSeries(cmd) => {
             let effective = resolve_local(cwd, site_override(global_site.clone()))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
-            handle_timeseries_command(&cmd, &mut client, output, global_site)?;
+            let mut client = LocalClient::from_config(&effective)?;
+            handle_timeseries_command(&cmd, &mut client, output, render_opts, global_site)?;
             Ok(())
         }
         LocalCommands::Dns(LocalDnsCommand::List { site: _, limit }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let mut resp = client.list_dns_records()?;
             if let Some(mut json) = resp.json.clone() {
+                capture_collection(&mut json);
                 if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
                     && arr.len() > limit
                 {
@@ -3880,13 +3580,7 @@ fn handle_local(
             site: _,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             let payload = serde_json::json!({
                 "key": host,
                 "record_type": record_type,
@@ -3910,13 +3604,7 @@ fn handle_local(
             site: _,
         }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
             if host.is_none() && value.is_none() && record_type.is_none() && !enabled && !disabled {
                 anyhow::bail!(
                     "dns update requires at least one of --host, --value, --record-type, --enabled, --disabled"
@@ -3959,15 +3647,31 @@ fn handle_local(
                 None,
             )
         }
-        LocalCommands::Dns(LocalDnsCommand::Delete { id, site: _ }) => {
+        LocalCommands::Dns(LocalDnsCommand::Delete {
+            id,
+            site: _,
+            dry_run,
+            yes,
+        }) => {
             let effective = resolve_local(cwd, site_override(global_site))?;
-            let mut client = LocalClient::new(
-                &effective.url,
-                &effective.username,
-                &effective.password,
-                &effective.site,
-                effective.verify_tls,
-            )?;
+            let mut client = LocalClient::from_config(&effective)?;
+            let records = response_rows(&client.list_dns_records()?)?;
+            let record = records.iter().find(|r| r["_id"] == id || r["id"] == id);
+            if dry_run {
+                return render_value(
+                    json!({"action":"delete_dns_record", "dry_run":true, "id":id, "record":record}),
+                    output,
+                    render_opts,
+                );
+            }
+            let name = record.and_then(|r| r.get("key")).and_then(|v| v.as_str());
+            if !confirm_deletion("DNS record", &id, name, yes)? {
+                return render_value(
+                    json!({"action":"delete_dns_record", "id":id, "outcome":"cancelled"}),
+                    output,
+                    render_opts,
+                );
+            }
             render_response(client.delete_dns_record(&id)?, output, render_opts, None)
         }
     }
@@ -3994,46 +3698,52 @@ fn handle_correlate_command(
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             });
 
-            // Get client details
-            let clients = client.list_clients()?;
-            if let Some(ref json) = clients.json
-                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-            {
-                let client_data = arr
-                    .iter()
-                    .find(|c| c.get("mac").and_then(|m| m.as_str()) == Some(mac));
-                correlated["client"] = client_data.cloned().unwrap_or(json!(null));
-            }
-
-            // Get connected AP info (if wireless)
+            let clients = response_rows(&client.list_clients()?)?;
+            correlated["client"] = clients
+                .iter()
+                .find(|c| {
+                    c.get("mac")
+                        .and_then(|m| m.as_str())
+                        .is_some_and(|m| mac_matches(m, mac))
+                })
+                .cloned()
+                .unwrap_or(json!(null));
             if let Some(ap_mac) = correlated["client"]["ap_mac"].as_str() {
-                let devices = client.list_devices()?;
-                if let Some(ref json) = devices.json
-                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-                {
-                    let ap_data = arr
-                        .iter()
-                        .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(ap_mac));
-                    correlated["connected_ap"] = ap_data.cloned().unwrap_or(json!(null));
-                }
+                let devices = response_rows(&client.list_devices()?)?;
+                correlated["connected_ap"] = devices
+                    .iter()
+                    .find(|d| {
+                        d.get("mac")
+                            .and_then(|m| m.as_str())
+                            .is_some_and(|m| mac_matches(m, ap_mac))
+                    })
+                    .cloned()
+                    .unwrap_or(json!(null));
             }
 
-            // Get events if requested
-            if *include_events
-                && let Ok(events_resp) = client.list_events()
-                && let Some(ref json) = events_resp.json
-                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-            {
-                let client_events: Vec<_> = arr
-                    .iter()
-                    .filter(|e| {
-                        e.get("user").and_then(|u| u.as_str()) == Some(mac)
-                            || e.get("client_mac").and_then(|m| m.as_str()) == Some(mac)
-                    })
-                    .take(20)
-                    .cloned()
-                    .collect();
-                correlated["recent_events"] = json!(client_events);
+            // Optional collection is still observable when explicitly requested.
+            if *include_events {
+                match client.list_events_paged(50) {
+                    Ok((response, stats)) => {
+                        let events = response_rows(&response)?;
+                        let relevant: Vec<_> = events
+                            .into_iter()
+                            .filter(|e| {
+                                e.get("user").and_then(|v| v.as_str()) == Some(mac)
+                                    || e.get("client_mac").and_then(|v| v.as_str()) == Some(mac)
+                            })
+                            .collect();
+                        correlated["recent_events"] = json!(relevant);
+                        correlated["events_collection"] = json!({"requested":50,"returned":stats.returned,"total_available":stats.total_available,"truncated":stats.truncated,"inventory_complete":"unknown","scope":"client matches in the most recent 50 events"});
+                        if stats.truncated {
+                            correlated["collection_error"] =
+                                json!("Requested recent event range is incomplete");
+                        }
+                    }
+                    Err(error) => {
+                        correlated["collection_error"] = json!(terminal_safe(&format!("{error:#}")))
+                    }
+                }
             }
 
             correlated["llm_summary"] = json!({
@@ -4041,20 +3751,19 @@ fn handle_correlate_command(
                 "is_wireless": !correlated["connected_ap"].is_null(),
                 "event_count": correlated.get("recent_events")
                     .and_then(|e| e.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0),
+                    .map(|a| a.len()),
             });
 
-            render_response(
-                ResponseData {
-                    status: 200,
-                    body: serde_json::to_string(&correlated)?,
-                    json: Some(correlated),
-                },
-                output,
-                render_opts,
-                None,
-            )
+            let incomplete = correlated.get("collection_error").is_some();
+            correlated["collection_complete"] = json!(!incomplete);
+            render_value(correlated, output, render_opts)?;
+            if incomplete {
+                Err(anyhow!(
+                    "Requested correlation data could not be fully collected"
+                ))
+            } else {
+                Ok(())
+            }
         }
         CorrelateCommand::Device {
             mac,
@@ -4067,40 +3776,35 @@ fn handle_correlate_command(
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             });
 
-            // Get device details
-            let devices = client.list_devices()?;
-            if let Some(ref json) = devices.json
-                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-            {
-                let device_data = arr
-                    .iter()
-                    .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(mac));
-                correlated["device"] = device_data.cloned().unwrap_or(json!(null));
-            }
-
-            // Get connected clients if requested and device is an AP
+            let devices = response_rows(&client.list_devices()?)?;
+            correlated["device"] = devices
+                .iter()
+                .find(|d| {
+                    d.get("mac")
+                        .and_then(|m| m.as_str())
+                        .is_some_and(|m| mac_matches(m, mac))
+                })
+                .cloned()
+                .unwrap_or(json!(null));
             if *include_clients {
-                let clients = client.list_clients()?;
-                if let Some(ref json) = clients.json
-                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-                {
-                    let connected_clients: Vec<_> = arr
-                        .iter()
-                        .filter(|c| {
-                            c.get("ap_mac").and_then(|m| m.as_str()) == Some(mac)
-                                || c.get("sw_mac").and_then(|m| m.as_str()) == Some(mac)
-                        })
-                        .cloned()
-                        .collect();
-                    correlated["connected_clients"] = json!(connected_clients);
-                    correlated["connected_clients_count"] = json!(connected_clients.len());
-                }
+                let clients = response_rows(&client.list_clients()?)?;
+                let connected: Vec<_> = clients
+                    .into_iter()
+                    .filter(|c| {
+                        c.get("ap_mac")
+                            .or_else(|| c.get("sw_mac"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|m| mac_matches(m, mac))
+                    })
+                    .collect();
+                correlated["connected_clients_count"] = json!(connected.len());
+                correlated["connected_clients"] = json!(connected);
             }
 
             correlated["llm_summary"] = json!({
                 "has_device_data": !correlated["device"].is_null(),
                 "device_type": correlated["device"]["type"].as_str().unwrap_or("unknown"),
-                "client_count": correlated.get("connected_clients_count").and_then(|c| c.as_u64()).unwrap_or(0),
+                "client_count": correlated.get("connected_clients_count").and_then(|c| c.as_u64()),
             });
 
             render_response(
@@ -4133,183 +3837,86 @@ fn handle_diagnose_command(
     render_opts: &RenderOpts,
     _default_site: Option<String>,
 ) -> Result<()> {
-    use serde_json::json;
-
-    match cmd {
-        DiagnoseCommand::Network { site: _ } => {
-            let mut diagnostics = json!({
-                "diagnostic_type": "network",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "checks": [],
-            });
-
-            let mut checks = Vec::new();
-
-            // Health check
-            if let Ok(health) = client.list_health() {
-                let health_status: serde_json::Value = if let Some(ref json) = health.json {
-                    json.get("data").cloned().unwrap_or(json!(null))
-                } else {
-                    json!(null)
-                };
-                checks.push(json!({
-                    "name": "Health",
-                    "status": if health.status == 200 { "pass" } else { "fail" },
-                    "data": health_status,
-                }));
-            }
-
-            // WAN check (filter health data for WAN subsystem)
-            if let Ok(wan_health) = client.list_health() {
-                let wan_ok = if let Some(ref json) = wan_health.json {
-                    json.get("data")
-                        .and_then(|d| d.as_array())
-                        .map(|arr| {
-                            arr.iter().any(|item| {
-                                item.get("subsystem").and_then(|s| s.as_str()) == Some("wan")
-                                    && item.get("status").and_then(|s| s.as_str()) == Some("ok")
-                            })
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                checks.push(json!({
-                    "name": "WAN",
-                    "status": if wan_ok { "pass" } else { "fail" },
-                }));
-            }
-
-            // Device check
-            if let Ok(devices) = client.list_devices() {
-                let device_count = devices
-                    .json
-                    .as_ref()
-                    .and_then(|j| j.get("data"))
-                    .and_then(|d| d.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                checks.push(json!({
-                    "name": "Devices",
-                    "status": "pass",
-                    "device_count": device_count,
-                }));
-            }
-
-            diagnostics["checks"] = json!(checks);
-            diagnostics["llm_summary"] = json!({
-                "total_checks": checks.len(),
-                "passed": checks.iter().filter(|c| c["status"] == "pass").count(),
-                "recommendation": "Review failed checks for detailed troubleshooting",
-            });
-
-            render_response(
-                ResponseData {
-                    status: 200,
-                    body: serde_json::to_string(&diagnostics)?,
-                    json: Some(diagnostics),
-                },
-                output,
-                render_opts,
-                None,
-            )
-        }
-        DiagnoseCommand::Wifi { site: _ } => {
-            let mut diagnostics = json!({
-                "diagnostic_type": "wifi",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            });
-
-            // WiFi connectivity check
-            if let Ok(connectivity) = client.wifi_connectivity() {
-                diagnostics["connectivity"] = connectivity.json.clone().unwrap_or(json!(null));
-            }
-
-            // Get APs
-            if let Ok(devices) = client.list_devices()
-                && let Some(ref json) = devices.json
-                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-            {
-                let aps: Vec<_> = arr
-                    .iter()
-                    .filter(|d| d.get("type").and_then(|t| t.as_str()) == Some("uap"))
-                    .map(|d| {
-                        json!({
-                            "mac": d.get("mac"),
-                            "name": d.get("name"),
-                            "state": d.get("state"),
-                            "num_sta": d.get("num_sta"),
-                        })
-                    })
-                    .collect();
-                diagnostics["access_points"] = json!(aps);
-                diagnostics["ap_count"] = json!(aps.len());
-            }
-
-            diagnostics["llm_summary"] = json!({
-                "ap_count": diagnostics.get("ap_count").and_then(|c| c.as_u64()).unwrap_or(0),
-                "recommendation": "Check WiFi connectivity and AP distribution",
-            });
-
-            render_response(
-                ResponseData {
-                    status: 200,
-                    body: serde_json::to_string(&diagnostics)?,
-                    json: Some(diagnostics),
-                },
-                output,
-                render_opts,
-                None,
-            )
-        }
-        DiagnoseCommand::Client { mac, site: _ } => {
-            if let Some(mac) = mac {
-                // Diagnose specific client
-                handle_correlate_command(
-                    &CorrelateCommand::Client {
-                        mac: mac.clone(),
-                        site: None,
-                        include_events: true,
-                    },
-                    client,
-                    output,
-                    render_opts,
-                    None,
-                )
-            } else {
-                // Diagnose all clients
-                let clients = client.list_clients()?;
-                let mut diagnostics = json!({
-                    "diagnostic_type": "client_overview",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-
-                if let Some(ref json) = clients.json
-                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-                {
-                    let wireless_count = arr
-                        .iter()
-                        .filter(|c| !c.get("is_wired").and_then(|w| w.as_bool()).unwrap_or(false))
-                        .count();
-                    let wired_count = arr.len() - wireless_count;
-
-                    diagnostics["total_clients"] = json!(arr.len());
-                    diagnostics["wireless_clients"] = json!(wireless_count);
-                    diagnostics["wired_clients"] = json!(wired_count);
+    let mut checks = Vec::new();
+    let kind = match cmd {
+        DiagnoseCommand::Network { .. } => {
+            match client.list_health().and_then(|r| response_rows(&r)) {
+                Ok(health) => {
+                    let healthy = !health.is_empty() && health.iter().all(|h| h["status"] == "ok");
+                    let wan = health.iter().find(|h| h["subsystem"] == "wan");
+                    checks.push(json!({"name":"Health", "status":if healthy {"pass"} else {"unknown_or_fail"}, "data":health}));
+                    checks.push(json!({"name":"WAN", "status":match wan { Some(w) if w["status"] == "ok" => "pass", Some(_) => "fail", None => "unknown" }}));
                 }
-
-                render_response(
-                    ResponseData {
-                        status: 200,
-                        body: serde_json::to_string(&diagnostics)?,
-                        json: Some(diagnostics),
-                    },
-                    output,
-                    render_opts,
-                    None,
-                )
+                Err(error) => {
+                    checks.push(json!({"name":"Health", "status":"error", "error":terminal_safe(&format!("{error:#}"))}));
+                    checks.push(json!({"name":"WAN", "status":"unknown", "error":"Health collection failed"}));
+                }
             }
+            match client.list_devices().and_then(|r| response_rows(&r)) {
+                Ok(devices) => checks.push(json!({"name":"Devices", "status":"collected", "device_count":devices.len()})),
+                Err(error) => checks.push(json!({"name":"Devices", "status":"error", "error":terminal_safe(&format!("{error:#}"))})),
+            }
+            "network"
         }
+        DiagnoseCommand::Wifi { .. } => {
+            match client.wifi_connectivity().and_then(|response| {
+                let data = response.json.ok_or_else(|| anyhow!("Missing WiFi connectivity JSON"))?;
+                if !data.is_object() && !data.is_array() { return Err(anyhow!("Invalid WiFi connectivity response shape")); }
+                Ok(data)
+            }) {
+                Ok(data) => checks.push(json!({"name":"Connectivity", "status":"collected", "data":data})),
+                Err(error) => checks.push(json!({"name":"Connectivity", "status":"error", "error":terminal_safe(&format!("{error:#}"))})),
+            }
+            match client.list_devices().and_then(|r| response_rows(&r)) {
+                Ok(devices) => {
+                    let aps: Vec<_> = devices.iter().filter(|d| d["type"] == "uap").map(|d| json!({"mac":d.get("mac"),"name":d.get("name"),"state":d.get("state"),"num_sta":d.get("num_sta")})).collect();
+                    checks.push(json!({"name":"Access points", "status":"collected", "ap_count":aps.len(), "data":aps}));
+                }
+                Err(error) => checks.push(json!({"name":"Access points", "status":"error", "error":terminal_safe(&format!("{error:#}"))})),
+            }
+            "wifi"
+        }
+        DiagnoseCommand::Client { mac: Some(mac), .. } => {
+            return handle_correlate_command(
+                &CorrelateCommand::Client {
+                    mac: mac.clone(),
+                    site: None,
+                    include_events: true,
+                },
+                client,
+                output,
+                render_opts,
+                None,
+            );
+        }
+        DiagnoseCommand::Client { mac: None, .. } => {
+            match client.list_clients().and_then(|r| response_rows(&r)) {
+                Ok(clients) => {
+                    let wired = clients.iter().filter(|c| c["is_wired"] == true).count();
+                    checks.push(json!({"name":"Clients", "status":"collected", "total_clients":clients.len(), "wired_clients":wired, "wireless_clients":clients.len()-wired}));
+                }
+                Err(error) => checks.push(json!({"name":"Clients", "status":"error", "error":terminal_safe(&format!("{error:#}"))})),
+            }
+            "client_overview"
+        }
+    };
+    let collection_failed = checks.iter().any(|c| c["status"] == "error");
+    let unsuccessful = checks
+        .iter()
+        .any(|c| c["status"] != "pass" && c["status"] != "collected");
+    let result = json!({
+        "diagnostic_type":kind, "timestamp":chrono::Utc::now().to_rfc3339(),
+        "checks":checks, "collection_complete":!collection_failed,
+        "outcome":if collection_failed {"incomplete"} else if unsuccessful {"unhealthy_or_unknown"} else {"collected"},
+        "llm_summary":{"total_checks":checks.len(), "errors":checks.iter().filter(|c| c["status"] == "error").count(), "recommendation":"Collected means the request succeeded; inspect health statuses and do not infer missing data is healthy"}
+    });
+    render_value(result, output, render_opts)?;
+    if unsuccessful {
+        Err(anyhow!(
+            "Diagnostics contain failed, unknown or incomplete checks"
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -4317,6 +3924,7 @@ fn handle_timeseries_command(
     cmd: &TimeSeriesCommand,
     client: &mut LocalClient,
     _output: OutputFormat,
+    render_opts: &RenderOpts,
     _default_site: Option<String>,
 ) -> Result<()> {
     use serde_json::json;
@@ -4337,9 +3945,14 @@ fn handle_timeseries_command(
             let stats = client.traffic_stats(&query)?;
 
             if format == "csv" {
-                print_timeseries_csv(&stats.json.unwrap_or(json!([])), "traffic")?;
+                render_response(
+                    stats,
+                    OutputFormat::Csv,
+                    render_opts,
+                    Some(&["time", "rx_bytes", "tx_bytes"]),
+                )?;
             } else {
-                println!("{}", serde_json::to_string_pretty(&stats.json)?);
+                render_response(stats, OutputFormat::Json, render_opts, None)?;
             }
             Ok(())
         }
@@ -4358,9 +3971,14 @@ fn handle_timeseries_command(
             let stats = client.wifi_stats_details(&query)?;
 
             if format == "csv" {
-                print_timeseries_csv(&stats.json.unwrap_or(json!([])), "wifi")?;
+                render_response(
+                    stats,
+                    OutputFormat::Csv,
+                    render_opts,
+                    Some(&["time", "ap_mac", "channel", "num_sta", "satisfaction"]),
+                )?;
             } else {
-                println!("{}", serde_json::to_string_pretty(&stats.json)?);
+                render_response(stats, OutputFormat::Json, render_opts, None)?;
             }
             Ok(())
         }
@@ -4369,120 +3987,87 @@ fn handle_timeseries_command(
             site: _,
             format,
         } => {
-            let events = client.list_events()?;
-
-            if format == "csv" {
-                let mut limited_events = events.json.clone().unwrap_or(json!({"data": []}));
-                if let Some(limit) = limit
-                    && let Some(arr) = limited_events
-                        .get_mut("data")
-                        .and_then(|d| d.as_array_mut())
+            let (mut events, stats) = client.list_events_paged(limit.unwrap_or(100))?;
+            attach_paged_metadata(&mut events, stats)?;
+            let value = events
+                .json
+                .as_mut()
+                .ok_or_else(|| anyhow!("Missing event JSON"))?;
+            let rows = list_payload_mut(value).ok_or_else(|| anyhow!("Missing event array"))?;
+            for event in rows {
+                let timestamp = event
+                    .get("timestamp")
+                    .or_else(|| event.get("time"))
+                    .or_else(|| event.get("datetime"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let timestamp_format = if timestamp
+                    .as_str()
+                    .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
                 {
-                    arr.truncate(*limit);
-                }
-                print_timeseries_csv(&limited_events, "events")?;
-            } else {
-                println!("{}", serde_json::to_string_pretty(&events.json)?);
+                    "rfc3339"
+                } else if timestamp.is_number() {
+                    "controller_numeric"
+                } else {
+                    "unknown"
+                };
+                let message = event
+                    .get("message_raw")
+                    .or_else(|| event.get("msg"))
+                    .or_else(|| event.get("message"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let category = event
+                    .get("category")
+                    .or_else(|| event.get("subsystem"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                event["timestamp"] = timestamp;
+                event["timestamp_format"] = json!(timestamp_format);
+                event["message"] = message;
+                event["category"] = category;
+            }
+            events.body = serde_json::to_string(value)?;
+            render_response(
+                events,
+                if format == "csv" {
+                    OutputFormat::Csv
+                } else {
+                    OutputFormat::Json
+                },
+                render_opts,
+                Some(&[
+                    "timestamp",
+                    "timestamp_format",
+                    "datetime",
+                    "key",
+                    "message",
+                    "category",
+                ]),
+            )?;
+            if stats.truncated {
+                return Err(anyhow!(
+                    "Event export could not retrieve the requested range"
+                ));
             }
             Ok(())
         }
     }
 }
 
-fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()> {
-    use csv::Writer;
-    use std::io;
-
-    let mut wtr = Writer::from_writer(io::stdout());
-
-    match data_type {
-        "traffic" => {
-            wtr.write_record(["timestamp", "rx_bytes", "tx_bytes"])?;
-            if let Some(arr) = data.as_array() {
-                for item in arr {
-                    wtr.write_record(&[
-                        item.get("time")
-                            .and_then(|t| t.as_u64())
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                        item.get("rx_bytes")
-                            .and_then(|r| r.as_u64())
-                            .map(|r| r.to_string())
-                            .unwrap_or_default(),
-                        item.get("tx_bytes")
-                            .and_then(|t| t.as_u64())
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                    ])?;
-                }
-            }
-        }
-        "wifi" => {
-            wtr.write_record(["timestamp", "ap_mac", "channel", "num_sta", "satisfaction"])?;
-            if let Some(arr) = data.as_array() {
-                for item in arr {
-                    wtr.write_record(&[
-                        item.get("time")
-                            .and_then(|t| t.as_u64())
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                        item.get("ap_mac")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("channel")
-                            .and_then(|c| c.as_u64())
-                            .map(|c| c.to_string())
-                            .unwrap_or_default(),
-                        item.get("num_sta")
-                            .and_then(|n| n.as_u64())
-                            .map(|n| n.to_string())
-                            .unwrap_or_default(),
-                        item.get("satisfaction")
-                            .and_then(|s| s.as_f64())
-                            .map(|s| s.to_string())
-                            .unwrap_or_default(),
-                    ])?;
-                }
-            }
-        }
-        "events" => {
-            wtr.write_record(["timestamp", "datetime", "key", "msg", "subsystem"])?;
-            if let Some(obj) = data.as_object()
-                && let Some(arr) = obj.get("data").and_then(|d| d.as_array())
-            {
-                for item in arr {
-                    wtr.write_record(&[
-                        item.get("time")
-                            .and_then(|t| t.as_u64())
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                        item.get("datetime")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("key")
-                            .and_then(|k| k.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("msg")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("subsystem")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ])?;
-                }
-            }
-        }
-        _ => {
-            return Err(anyhow!("Unknown time-series data type: {}", data_type));
-        }
-    }
-
-    wtr.flush()?;
+fn attach_paged_metadata(response: &mut ResponseData, stats: local::PagedFetch) -> Result<()> {
+    let value = response
+        .json
+        .as_mut()
+        .ok_or_else(|| anyhow!("Missing paginated JSON"))?;
+    capture_collection(value);
+    value["_unifictl"]["collection"] = json!({
+        "requested":stats.requested,"source_count":stats.returned,"returned_count":stats.returned,
+        "total_available":stats.total_available,"requested_range_complete":!stats.truncated,
+        "truncated":stats.truncated || stats.total_available.is_some_and(|n| n > stats.returned),
+        "inventory_complete":if stats.truncated || stats.total_available.is_some_and(|n| n > stats.returned) {"incomplete"} else if stats.total_available == Some(stats.returned) {"complete"} else {"unknown"}
+    });
+    response.body = serde_json::to_string(value)?;
     Ok(())
 }
 
@@ -4530,6 +4115,7 @@ where
     if let Some(interval) = watch {
         let mut first_run = true;
         loop {
+            let resp = fetch()?;
             // Clear screen on subsequent runs (not the first)
             if !first_run && output == OutputFormat::Pretty {
                 // Clear screen: ESC[2J moves cursor to top, ESC[H moves to home
@@ -4539,11 +4125,10 @@ where
 
             // Print timestamp for watch mode
             if output == OutputFormat::Pretty {
-                let now = chrono::Local::now();
-                println!("Updated: {}\n", now.format("%Y-%m-%d %H:%M:%S"));
+                let now = chrono::Utc::now();
+                println!("Collected: {}\n", now.to_rfc3339());
             }
 
-            let resp = fetch()?;
             render_response(resp, output, render_opts, columns)?;
 
             // Print instructions for exiting
@@ -4569,16 +4154,18 @@ fn confirm_deletion(
     }
 
     let name_part = if let Some(name) = resource_name {
-        format!(" \"{}\"", name)
+        format!(" \"{}\"", terminal_safe(name))
     } else {
         String::new()
     };
 
-    print!(
+    eprint!(
         "Are you sure you want to delete {}{} (ID: {})? [y/N]: ",
-        resource_type, name_part, resource_id
+        terminal_safe(resource_type),
+        name_part,
+        terminal_safe(resource_id)
     );
-    io::stdout().flush()?;
+    io::stderr().flush()?;
 
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -4592,7 +4179,9 @@ fn site_override(site: Option<String>) -> Option<LocalConfig> {
         username: None,
         password: None,
         site: Some(s),
-        verify_tls: false,
+        verify_tls: None,
+        ca_file: None,
+        port_fallback: None,
     })
 }
 
@@ -4608,6 +4197,7 @@ fn run_get(
     if let Some(interval) = watch {
         let mut first_run = true;
         loop {
+            let response = client.get(path, &query)?;
             // Clear screen on subsequent runs (not the first)
             if !first_run && output == OutputFormat::Pretty {
                 // Clear screen: ESC[2J moves cursor to top, ESC[H moves to home
@@ -4617,12 +4207,11 @@ fn run_get(
 
             // Print timestamp for watch mode
             if output == OutputFormat::Pretty {
-                let now = chrono::Local::now();
-                println!("Updated: {}\n", now.format("%Y-%m-%d %H:%M:%S"));
+                let now = chrono::Utc::now();
+                println!("Collected: {}\n", now.to_rfc3339());
             }
 
-            let response = client.get(path, &query)?;
-            render_response(response.clone(), output, render_opts, columns)?;
+            render_response(response, output, render_opts, columns)?;
 
             // Print instructions for exiting
             if output == OutputFormat::Pretty {
@@ -4651,48 +4240,61 @@ fn run_post(
 }
 
 fn render_response(
-    response: ResponseData,
+    mut response: ResponseData,
     output: OutputFormat,
     render_opts: &RenderOpts,
     columns: Option<&[&str]>,
 ) -> Result<()> {
-    let _status = response.status;
-    match output {
-        OutputFormat::Raw => {
-            println!("{}", response.body);
-        }
-        OutputFormat::Json => {
-            if let Some(json) = response.json {
-                println!("{}", serde_json::to_string(&json)?);
-            } else {
-                println!("{}", response.body);
-            }
-        }
-        OutputFormat::Pretty => {
-            if let Some(json) = response.json {
-                if !print_table(&json, columns, render_opts) {
-                    println!("{}", serde_json::to_string_pretty(&json)?);
-                }
-            } else {
-                println!("{}", response.body);
-            }
-        }
-        OutputFormat::Csv => {
-            if let Some(json) = response.json {
-                print_csv(&json, columns, render_opts)?;
-            } else {
-                println!("{}", response.body);
-            }
-        }
-        OutputFormat::Llm => {
-            if let Some(json) = response.json {
-                print_llm(&json)?;
-            } else {
-                println!("{}", response.body);
-            }
-        }
+    if output == OutputFormat::Raw && response.json.is_none() {
+        println!("{}", response.body);
+        return Ok(());
     }
-
+    let mut json = match response.json.take() {
+        Some(json) => json,
+        None if response.status == 204 && response.body.trim().is_empty() => json!({
+            "outcome":"accepted",
+            "verification":"unverified",
+            "message":"The controller accepted the request without a response body; read back state before further actions"
+        }),
+        None => {
+            return Err(anyhow!(
+                "Invalid response: expected JSON for structured or pretty output"
+            ));
+        }
+    };
+    if !json.is_object() && !json.is_array() {
+        json = json!({"data":json});
+    }
+    finish_collection(&mut json);
+    if json.get("_unifictl").is_none() {
+        json["_unifictl"] = json!({});
+    }
+    json["_unifictl"]["collected_at"] = json!(chrono::Utc::now().to_rfc3339());
+    json["_unifictl"]["target"] = json!(render_opts.target);
+    json["_unifictl"]["site"] = json!(render_opts.site);
+    json["_unifictl"]["http_status"] = json!(response.status);
+    json["_unifictl"]["untrusted_controller_data"] = json!(true);
+    match output {
+        OutputFormat::Json | OutputFormat::Raw => println!("{}", serde_json::to_string(&json)?),
+        OutputFormat::Pretty => {
+            let collection = &json["_unifictl"]["collection"];
+            if collection["truncated"] == true {
+                eprintln!(
+                    "Warning: incomplete collection after filtering or limits ({} returned, {} collected, total {}). Use -o json for collection metadata.",
+                    collection["returned_count"],
+                    collection["source_count"],
+                    collection["total_available"]
+                        .as_u64()
+                        .map_or_else(|| "unknown".to_string(), |n| n.to_string()),
+                );
+            }
+            if !print_table(&json, columns, render_opts) {
+                println!("{}", output::pretty_json(&json)?);
+            }
+        }
+        OutputFormat::Csv => print_csv(&json, columns, render_opts)?,
+        OutputFormat::Llm => print_llm(&json, render_opts.schema)?,
+    }
     Ok(())
 }
 
@@ -4721,6 +4323,15 @@ fn print_csv(
     };
 
     if rows.is_empty() {
+        eprintln!(
+            "{}",
+            serde_json::to_string(&json!({"_unifictl":json["_unifictl"]}))?
+        );
+        if let Some(columns) = columns_hint {
+            let mut writer = Writer::from_writer(io::stdout());
+            writer.write_record(columns.iter().map(|column| spreadsheet_safe(column)))?;
+            writer.flush()?;
+        }
         return Ok(());
     }
 
@@ -4790,7 +4401,7 @@ fn print_csv(
     let mut wtr = Writer::from_writer(io::stdout());
 
     // Write header
-    wtr.write_record(&csv_columns)?;
+    wtr.write_record(csv_columns.iter().map(|column| spreadsheet_safe(column)))?;
 
     // Filter rows if needed
     let needle = render_opts.filter.as_ref().map(|f| f.to_ascii_lowercase());
@@ -4863,13 +4474,26 @@ fn print_csv(
         });
     }
 
+    let mut metadata = json["_unifictl"].clone();
+    if filtered_rows.len() < rows.len() {
+        metadata["collection"]["returned_count"] = json!(filtered_rows.len());
+        metadata["collection"]["presentation_filtered"] = json!(true);
+        metadata["collection"]["inventory_complete"] = json!("incomplete");
+        metadata["collection"]["truncated"] = json!(true);
+    }
+    metadata["csv_profile"] = json!("spreadsheet_safe");
+    eprintln!("{}", serde_json::to_string(&json!({"_unifictl":metadata}))?);
     // Write rows
     for row in filtered_rows {
         if let serde_json::Value::Object(map) = row {
             let mut record = Vec::new();
             for col in &csv_columns {
                 let value = map.get(col).unwrap_or(&serde_json::Value::Null);
-                record.push(value_to_str(value));
+                record.push(if value.is_string() {
+                    spreadsheet_safe(&value_to_str(value))
+                } else {
+                    value_to_str(value)
+                });
             }
             wtr.write_record(&record)?;
         }
@@ -4879,7 +4503,7 @@ fn print_csv(
     Ok(())
 }
 
-fn print_llm(json: &serde_json::Value) -> Result<()> {
+fn print_llm(json: &serde_json::Value, schema_name: Option<&str>) -> Result<()> {
     use serde_json::json;
 
     // Initialize schema registry
@@ -4909,7 +4533,8 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
             "estimated_tokens": total_tokens,
             "data_type": data_type,
             "item_count": item_count,
-            "truncation_applied": false,
+            "truncation_applied": json["_unifictl"]["collection"]["truncated"].as_bool().unwrap_or(false),
+            "sampling_applied": false,
             "ai_guidance": {
                 "summary": format!("Response contains {} items with ~{} tokens", item_count, total_tokens),
                 "recommended_max_tokens": 4000,
@@ -4920,7 +4545,7 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
 
     // Add schema information if available (try to infer endpoint)
     // This is a simple heuristic - in practice, you'd pass context about which endpoint was called
-    let schema = registry.get("device.list"); // Placeholder - would be dynamic
+    let schema = schema_name.and_then(|name| registry.get(name));
     if let Some(schema) = schema {
         llm_output["schema"] = json!({
             "name": schema.name,
@@ -4937,6 +4562,7 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
         });
     }
 
+    llm_output["_unifictl"] = json["_unifictl"].clone();
     llm_output["summary"] = summarize_response(&data, schema);
 
     // Intelligent truncation for large responses
@@ -4944,8 +4570,6 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
     const SAMPLE_SIZE: usize = 5;
 
     if total_tokens > MAX_TOKENS {
-        llm_output["llm_metadata"]["truncation_applied"] = json!(true);
-
         if let serde_json::Value::Array(arr) = &data {
             // For arrays, show samples from beginning, middle, and end
             let mut samples = Vec::new();
@@ -4982,6 +4606,11 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
                 }
             }
 
+            let sampled = samples.len() < arr.len();
+            llm_output["llm_metadata"]["sampling_applied"] = json!(sampled);
+            if sampled {
+                llm_output["llm_metadata"]["truncation_applied"] = json!(true);
+            }
             llm_output["data_samples"] = json!(samples);
             llm_output["llm_metadata"]["truncation_note"] = json!(format!(
                 "Original response had {} items. Showing {} representative samples. Use --limit flag to control output size.",
@@ -5147,9 +4776,9 @@ fn print_table(
             let mut out_row = Vec::new();
             for col in columns.iter() {
                 let value = map.get(col).unwrap_or(&serde_json::Value::Null);
-                let mut rendered = value_to_str(value);
+                let mut rendered = terminal_safe(&value_to_str(value));
                 if col == "id" && !*FULL_IDS.get().unwrap_or(&false) && rendered.len() > 12 {
-                    rendered = format!("{}…", &rendered[..12]);
+                    rendered = format!("{}…", rendered.chars().take(12).collect::<String>());
                 }
                 out_row.push(rendered);
             }
@@ -5207,7 +4836,7 @@ fn print_table(
     }
 
     let print_padded = |value: &str, width: usize| {
-        print!("{}", value);
+        print!("{}", terminal_safe(value));
         if width > value.len() {
             print!("{}", " ".repeat(width - value.len()));
         }

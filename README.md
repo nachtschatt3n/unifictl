@@ -3,9 +3,9 @@
 <div align="center">
 
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.89+-orange.svg)](https://www.rust-lang.org/)
 [![Version](https://img.shields.io/badge/version-5.7.0-green.svg)](https://github.com/nachtschatt3n/unifictl)
-[![Tests](https://img.shields.io/badge/tests-75%20passing-success.svg)](#testing)
+[Testing](#testing)
 
 **A powerful CLI tool for UniFi networks with AI-first design**
 
@@ -455,7 +455,7 @@ bash test_all_endpoints.sh
 cargo test --test integration_test
 ```
 
-Current test coverage: **75 endpoints, 100% passing**
+Automated tests use synthetic HTTP mocks. Real controller/version/role compatibility must be checked separately in an authorized test environment; a mock pass is not that evidence.
 
 ## Configuration
 
@@ -467,7 +467,7 @@ unifictl login --api-key "YOUR_API_KEY" \
   --controller-url https://192.168.1.1 \
   --username admin \
   --site default \
-  [--verify-tls] \
+  [--ca-file /path/to/controller-ca.pem] \
   [--scope local|user]
 
 unifictl cloud config-show  # View current config (passwords masked)
@@ -475,9 +475,15 @@ unifictl cloud config-show  # View current config (passwords masked)
 
 Omitting `--password` causes an interactive prompt with hidden input — this is the recommended approach to avoid exposing credentials in shell history.
 
-**File permissions**: `config.yaml` holds the controller password and API key, so `unifictl` creates and rewrites it owner-only (mode `0600`, the same way it writes `session.json`) and keeps the user config directory at `0700`. A config file left world-readable by an older release is tightened to `0600` the first time it is read, with a one-line notice on stderr. This applies on Unix (Linux/macOS); on Windows the file inherits the directory's ACL as before.
+**File permissions**: Configuration and session files are written atomically with mode `0600` on Unix, and the user configuration/cache directories are kept at `0700`. Reading a project config does not change its permissions. User configuration and cache files are checked through an owned, regular, non-symlink file handle; old broad permissions are repaired through that handle. Windows files still inherit directory ACLs; protect that directory separately.
 
-**Note**: TLS verification is disabled by default for self-signed certificates. Use `--verify-tls` if your controller has a valid certificate.
+**Credential destinations**: A project `.unifictl.yaml` can override nonsecret settings such as `site`. If it changes a controller URL or username, it must supply credentials for that target instead of inheriting the user's password. A project cloud base-URL change likewise cannot inherit the user's API key. Project TLS/CA settings cannot weaken the trust policy of an inherited user password. Use global `--no-project-config` in automation or when entering an unfamiliar checkout. Explicit CLI cloud URL overrides are trusted user input; cloud URLs require HTTPS.
+
+**Session cache**: Sessions are stored separately for each controller URL, username and site, bounded to 64 entries. Equivalent URL spellings (host case, default port, empty root path) share the same cache identity. Alternating sites does not repeatedly log in. Saving changed local credentials invalidates that principal's cached sites; `login validate` always tests the supplied password afresh. The cache never changes the configured port or destination. Reuse is also bound to the verification mode and CA bundle; old cache entries without that trust profile require a fresh login. `--no-session-cache` bypasses reuse; it does not revoke remote sessions.
+
+**TLS migration**: Verification is enabled when `verify_tls` is omitted. For a private CA or self-signed controller certificate, use `unifictl login --controller-url https://controller.example --username admin --verify-tls --ca-file /absolute/path/controller-ca.pem`. The PEM bundle adds trusted roots while hostname verification remains enabled; use a hostname present in the certificate. Relative CA paths in YAML are relative to that YAML file. `--insecure` is an explicit local-controller opt-out (also permitting HTTP) and cannot be combined with a CA file. Existing `verify_tls: false` configurations retain their explicit opt-out and print a warning; migrate them to verification rather than leaving them unchanged. Authentication and API redirects are never followed. The `:8443` to `:443` login fallback is off by default because it sends the password to a different port; opt in with `unifictl login ... --port-fallback` (or `port_fallback: true` in the config) and disable again with `--no-port-fallback`. It only applies when the `:8443` controller is unreachable or has no login endpoint, never after a credential rejection.
+
+Saving login settings for a different controller resets the old TLS exception and CA selection; supply that target's trust settings explicitly. Re-saving the same canonical URL preserves its settings. A CA combined with disabled verification is rejected before prompting for a password or saving configuration.
 
 ## Troubleshooting
 
@@ -487,41 +493,15 @@ UniFi Dream Machines may hit login rate limits with CLI tools that create new se
 
 **Symptoms**: `403 invalid username/password`, `429 AUTHENTICATION_FAILED_LIMIT_REACHED`, or repeated local login failures
 
-**SSH recovery process (current UniFi OS)**:
-```bash
-# SSH directly to the console as root
-ssh root@<udm-ip>
+Repeated credential rejection (401/403) is terminal. Safe reads share at most one authentication refresh for the client lifetime, including multi-component commands, and each read has at most one bounded `Retry-After` delay. Writes are never automatically replayed; `adopt-all` stops on the first 401/403/429 or ambiguous result and marks remaining targets as not attempted. Check credentials, permissions, the explicit URL and the configured site, then wait for the controller's documented lockout period. Do not raise gateway login limits or restart controller services as part of routine CLI recovery. Monitoring supervisors should use backoff and jitter, inspect exit status, and avoid overlapping executions.
 
-# Inspect UniFi-related services
-systemctl list-units | grep -i 'unifi\|ulp'
-
-# Confirm the login limiter config exists
-grep -n "success.login.limit.count" /usr/lib/ulp-go/config.props
-
-# Restart the auth service that owns the limiter on current UDM builds
-systemctl restart ulp-go
-
-# If needed, also restart the main UniFi services
-systemctl restart unifi-core unifi-directory uos-agent
-```
-
-**Notes**:
-```bash
-# On newer firmware, `unifi-os` may not exist as a systemd service.
-# If you change the limiter, the config file is:
-/usr/lib/ulp-go/config.props
-
-# Example setting
-success.login.limit.count = 200
-```
-
-In testing on a current UDM Pro, restarting `ulp-go` cleared `AUTHENTICATION_FAILED_LIMIT_REACHED` while `systemctl restart unifi` and `systemctl restart unifi-core unifi-directory uos-agent` alone did not.
+**Legacy login compatibility remains unverified**: The legacy `/api/login` route is tried only after earlier login routes return 404/405. A self-hosted controller that returns 401 at `/api/auth/login` will stop login before that legacy route. Do not interpret this as proof of an incorrect password. This conservative behavior needs validation against a disposable controller of the affected version; no automatic credential retry or controller-family detection is claimed.
 
 ### Common Issues
 
 **Port 8443 connectivity**: The tool automatically preserves port `:8443` for local controllers
 
-**Certificate errors**: Use the default (no `--verify-tls`) for self-signed certs
+**Certificate errors**: Install a trusted certificate or supply `--ca-file` with the correct controller CA and certificate hostname.
 
 **Site parameter**: Commands default to configured site; override with `--site <NAME>`
 
