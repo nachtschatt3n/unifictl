@@ -40,6 +40,7 @@ pub struct LocalClient {
     trust_profile: String,
     refresh_used: bool,
     auth_blocked: Option<ControllerFailure>,
+    port_fallback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +266,7 @@ impl LocalClient {
             &config.site,
             config.verify_tls,
             config.ca_file.as_deref(),
+            config.port_fallback,
         )
     }
 
@@ -276,7 +278,7 @@ impl LocalClient {
         site: &str,
         verify_tls: bool,
     ) -> Result<Self> {
-        Self::build(url, username, password, site, verify_tls, None)
+        Self::build(url, username, password, site, verify_tls, None, false)
     }
 
     fn build(
@@ -286,6 +288,7 @@ impl LocalClient {
         site: &str,
         verify_tls: bool,
         ca_file: Option<&std::path::Path>,
+        port_fallback: bool,
     ) -> Result<Self> {
         validate_target_id(site)?;
         let base_url = crate::client::validate_base_url(url, !verify_tls || cfg!(test))?;
@@ -330,6 +333,7 @@ impl LocalClient {
             trust_profile: session::trust_profile(verify_tls, &ca_pem),
             refresh_used: false,
             auth_blocked: None,
+            port_fallback,
         };
         client.restore_cached_session();
         Ok(client)
@@ -347,6 +351,7 @@ impl LocalClient {
             // port/path. Older 8443->443 fallback entries require a fresh login.
             let resolved = match Url::parse(&sess.resolved_url) {
                 Ok(u) if u == self.base_url => u,
+                Ok(u) if self.port_fallback && self.is_fallback_of_configured(&u) => u,
                 _ => return,
             };
             self.base_url = resolved;
@@ -355,6 +360,13 @@ impl LocalClient {
             self.is_legacy = sess.is_legacy;
             self.logged_in = true;
         }
+    }
+
+    /// True when `u` is the configured `:8443` URL moved to port 443 and the
+    /// user opted in to that fallback.
+    fn is_fallback_of_configured(&self, u: &Url) -> bool {
+        let mut alt = self.base_url.clone();
+        self.base_url.port() == Some(8443) && alt.set_port(Some(443)).is_ok() && *u == alt
     }
 
     /// Persist the current authenticated session to the on-disk cache
@@ -1239,20 +1251,49 @@ impl LocalClient {
             "remember": true,
             "strict": true,
         });
-        // Login discovery is same-origin and only on an unavailable endpoint.
-        // A credential rejection or ambiguous response must not submit the
-        // password repeatedly. A different port is a different authority.
+        // Login discovery is same-origin by default. A different port is a
+        // different authority, so the legacy `:8443` -> `:443` fallback only
+        // runs when the user opted in (`port_fallback`), and then only when the
+        // first authority is unreachable or has no login endpoint. A credential
+        // rejection or ambiguous response never submits the password elsewhere.
+        let mut bases = vec![self.base_url.clone()];
+        if self.port_fallback
+            && self.base_url.port() == Some(8443)
+            && let Ok(mut alt) = Url::parse(self.base_url.as_str())
+            && alt.set_port(Some(443)).is_ok()
+        {
+            bases.push(alt);
+        }
+        let mut last_err = anyhow!("login endpoint unavailable (404/405)");
+        for base in bases {
+            match self.login_on(&base, &creds)? {
+                Ok(()) => return Ok(()),
+                Err(unavailable) => last_err = unavailable,
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Try every login path on one base URL. The outer `Result` is terminal
+    /// (credentials rejected, ambiguous response); the inner `Err` means this
+    /// authority offered no usable login endpoint, so the next one may be tried.
+    fn login_on(
+        &mut self,
+        base: &Url,
+        creds: &serde_json::Value,
+    ) -> Result<std::result::Result<(), anyhow::Error>> {
         for path in [
             "api/auth/login",
             "proxy/network/api/auth/login",
             "auth/login",
             "api/login",
         ] {
-            let url = self
-                .base_url
-                .join(path)
-                .context("building login endpoint")?;
-            let resp = self.request_login(&url, &creds)?;
+            let url = base.join(path).context("building login endpoint")?;
+            let resp = match self.request_login(&url, creds) {
+                Ok(resp) => resp,
+                // Nothing was received, so nothing was accepted or rejected.
+                Err(err) => return Ok(Err(err)),
+            };
             let status = resp.status();
             if matches!(
                 status,
@@ -1275,14 +1316,15 @@ impl LocalClient {
                     "login response did not establish a session; credentials were not retried"
                 ));
             }
+            self.base_url = base.clone();
             self.is_legacy = path == "api/login";
             self.logged_in = true;
             self.csrf = extract_csrf(&resp);
             self.session_cookie = extract_session_cookie(&resp);
             self.persist_session();
-            return Ok(());
+            return Ok(Ok(()));
         }
-        Err(anyhow!("login endpoint unavailable (404/405)"))
+        Ok(Err(anyhow!("login endpoint unavailable (404/405)")))
     }
 
     fn request_login(
@@ -1638,6 +1680,30 @@ mod tests {
         legacy.assert_calls(0);
         assert!(err.contains("HTTP 429"));
         assert!(!err.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
+    }
+
+    #[test]
+    fn port_fallback_is_off_by_default_and_only_maps_8443_to_443() {
+        let mut client =
+            LocalClient::new("https://example.test:8443/", "u", "p", "default", true).unwrap();
+        let alt = Url::parse("https://example.test:443/").unwrap();
+        assert!(!client.port_fallback);
+        assert!(client.is_fallback_of_configured(&alt));
+        assert!(!client.is_fallback_of_configured(&Url::parse("https://evil.test/").unwrap()));
+        client.base_url = Url::parse("https://example.test:9443/").unwrap();
+        assert!(!client.is_fallback_of_configured(&alt));
+    }
+
+    #[test]
+    fn login_unreachable_without_fallback_reports_single_failure() {
+        let server = MockServer::start();
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(401);
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        assert!(client.list_sites().is_err());
+        login.assert_calls(1);
     }
 
     #[test]
@@ -3221,6 +3287,7 @@ mod tests {
             site: "default".into(),
             verify_tls: true,
             ca_file: None,
+            port_fallback: false,
         };
         assert!(LocalClient::from_config(&config).is_ok());
         config.ca_file = Some(temp.path().join("missing.pem"));

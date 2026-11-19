@@ -74,14 +74,16 @@ Artifact download or build failure blocks publication. The verified set is
 flattened into `dist/`, with SHA-256 checksums and `release-source.json` containing
 the source commit and lockfile digest. No partial build matrix is published.
 
-crates.io publication is optional: without `CRATES_IO_TOKEN`, its step reports
-that the channel is disabled. If a configured publication fails, the GitHub
-release remains blocked. The GitHub job refuses to alter an already-public
-release, uploads to a draft, downloads the uploaded assets, and compares every
-file's bytes to the verified set. Only then does it make the draft public/latest.
-An interrupted upload leaves a draft for inspection or a retry; it must not be
-promoted manually without repeating verification. There is no atomic transaction
-between crates.io and GitHub: crates.io can succeed before a later GitHub failure.
+The GitHub release is published first. crates.io publication runs only after the
+GitHub release is public, and is optional: without `CRATES_IO_TOKEN`, its step
+reports that the channel is disabled. A failed GitHub release therefore never
+leaves an unretractable crates.io version behind. The GitHub job refuses to alter
+an already-public release, uploads to a draft, downloads the uploaded assets, and
+compares every file's bytes to the verified set. Only then does it make the draft
+public/latest. An interrupted upload leaves a draft for inspection or a retry; it
+must not be promoted manually without repeating verification. There is no atomic
+transaction between the two channels: if crates.io fails after the GitHub release
+is public, re-run only the publish job.
 
 Only the GitHub publication job has `contents: write`; build/validation jobs
 have read access and do not persist checkout credentials. Configure repository

@@ -222,6 +222,17 @@ struct LoginSetArgs {
     ca_file: Option<PathBuf>,
     #[arg(
         long,
+        help = "Opt in to retrying login on :443 when a :8443 controller is unreachable"
+    )]
+    port_fallback: bool,
+    #[arg(
+        long,
+        conflicts_with = "port_fallback",
+        help = "Disable the :8443 -> :443 login fallback (default)"
+    )]
+    no_port_fallback: bool,
+    #[arg(
+        long,
         value_enum,
         default_value_t = ScopeArg::User,
         help = "Where to write the config (local project dir or user config dir)"
@@ -1453,6 +1464,13 @@ fn run(cli: Cli) -> Result<()> {
                 // A trust exception belongs to its controller, not the next login.
                 local_cfg.verify_tls = None;
                 local_cfg.ca_file = None;
+                local_cfg.port_fallback = None;
+            }
+            if args.port_fallback {
+                local_cfg.port_fallback = Some(true);
+            }
+            if args.no_port_fallback {
+                local_cfg.port_fallback = Some(false);
             }
             if args.verify_tls {
                 local_cfg.verify_tls = Some(true);
@@ -4163,6 +4181,7 @@ fn site_override(site: Option<String>) -> Option<LocalConfig> {
         site: Some(s),
         verify_tls: None,
         ca_file: None,
+        port_fallback: None,
     })
 }
 

@@ -58,6 +58,9 @@ chmod +x "$2/bin/cargo-audit"
         self.assertNotIn("if: always() &&", source)
         self.assertIn("needs: [validate, build-release, build-arch-packages, build-deb-packages]", source)
         self.assertIn("needs: [validate, verify-artifacts]", source)
+        # GitHub first, crates.io only after the GitHub release succeeded.
+        self.assertIn("needs: [validate, create-release]", source)
+        self.assertNotIn("publish-crates-io]", source)
 
     def test_audit_evidence_keeps_package_clean(self):
         real_cargo = shutil.which("cargo")

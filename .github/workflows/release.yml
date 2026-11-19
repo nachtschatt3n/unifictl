@@ -386,7 +386,7 @@ jobs:
 
   publish-crates-io:
     name: Publish to crates.io when configured
-    needs: [validate, verify-artifacts]
+    needs: [validate, create-release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -406,7 +406,7 @@ jobs:
 
   create-release:
     name: Create complete validated GitHub Release
-    needs: [validate, verify-artifacts, publish-crates-io]
+    needs: [validate, verify-artifacts]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -444,7 +444,7 @@ jobs:
             Verify its SHA-256 checksum before installing. `release-source.json` records
             the source commit and lockfile digest. Checksums detect corruption; they are
             not independent signatures or a claim of reproducible builds.
-            crates.io publication is optional and runs only when its token is configured.
+            crates.io publication follows this release and runs only when its token is configured.
           files: |
             dist/unifictl-*.tar.gz
             dist/unifictl-*.zip

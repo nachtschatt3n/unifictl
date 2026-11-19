@@ -41,6 +41,9 @@ pub struct LocalConfig {
     #[serde(default)]
     pub verify_tls: Option<bool>,
     pub ca_file: Option<PathBuf>,
+    /// Opt in to retrying login on `:443` when a `:8443` controller is unreachable.
+    #[serde(default)]
+    pub port_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +79,7 @@ pub struct LocalEffectiveConfig {
     pub site: String,
     pub verify_tls: bool,
     pub ca_file: Option<PathBuf>,
+    pub port_fallback: bool,
 }
 
 pub fn config_path(scope: Scope, cwd: &Path) -> Result<PathBuf> {
@@ -187,6 +191,7 @@ pub fn resolve_local(cwd: &Path, overrides: Option<LocalConfig>) -> Result<Local
         site,
         verify_tls: local.verify_tls.unwrap_or(true),
         ca_file: local.ca_file,
+        port_fallback: local.port_fallback.unwrap_or(false),
     })
 }
 
@@ -267,6 +272,12 @@ fn merge_local(user: LocalConfig, local: LocalConfig) -> LocalConfig {
             user.ca_file
         } else {
             local.ca_file.or(user.ca_file)
+        },
+        // Fallback re-sends the secret to another authority: same trust rule.
+        port_fallback: if inherit_password {
+            user.port_fallback
+        } else {
+            local.port_fallback.or(user.port_fallback)
         },
     }
 }
@@ -422,6 +433,7 @@ mod tests {
                 site: Some("site1".into()),
                 verify_tls: Some(false),
                 ca_file: None,
+                port_fallback: None,
             }),
         };
         save(Scope::User, &user_cfg, cwd.path()).unwrap();
@@ -436,6 +448,7 @@ mod tests {
                 site: Some("localsite".into()),
                 verify_tls: Some(true),
                 ca_file: None,
+                port_fallback: None,
             }),
         };
         save(Scope::Local, &local_cfg, cwd.path()).unwrap();
@@ -504,6 +517,7 @@ mod tests {
                 site: Some("default".into()),
                 verify_tls: Some(false),
                 ca_file: None,
+                port_fallback: None,
             }),
         }
     }
