@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ master, main ]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,33 +18,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify failing audit and incomplete release gates
+        run: python3 .github/workflows/test_supply_chain.py
+
   clippy:
     name: Clippy Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -51,7 +65,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -W clippy::all
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -62,16 +76,17 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -82,32 +97,40 @@ jobs:
 
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --verbose --all-targets
+        run: cargo test --locked --verbose --all-targets
         env:
           # Reduce parallelism on Windows to avoid stack overflow
           RUST_TEST_THREADS: 1
 
       - name: Run tests (Other platforms)
         if: runner.os != 'Windows'
-        run: cargo test --verbose --all-targets
+        run: cargo test --locked --verbose --all-targets
 
       - name: Build
-        run: cargo build --verbose --release
+        run: cargo build --locked --verbose --release
 
   security:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - name: Install cargo-audit
-        run: |
-          cargo install cargo-audit --features vendored-openssl || echo "cargo-audit installation failed, skipping audit"
+      - name: Run pinned security audit
+        run: bash .github/workflows/audit.sh "$RUNNER_TEMP/audit.json"
 
-      - name: Run security audit
-        run: cargo audit --deny warnings || echo "Security audit skipped"
-        continue-on-error: true
+      - name: Verify clean package after audit
+        run: cargo package --locked
+
+      - name: Retain audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: audit-${{ github.workflow }}
+          path: ${{ runner.temp }}/audit.json
+          if-no-files-found: error

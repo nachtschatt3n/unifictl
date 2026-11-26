@@ -1,96 +1,91 @@
-# GitHub Actions Workflows
+# CI, dependency policy and releases
 
-This directory contains CI/CD workflows for the unifictl project.
+`ci.yml` checks formatting, Clippy, tests/builds on Linux, macOS and Windows,
+and dependencies. `test.yml` additionally exercises stable, beta and nightly
+Rust. Cargo build, check and test commands use the committed lockfile. Action
+implementations are pinned to full commit hashes; review these pins when
+updating them. The stable Rust toolchain itself follows stable releases.
 
-## Workflows
+## Dependency policy
 
-### `ci.yml` - Fast CI Checks
-**Triggers:** Push and PR to master/main
+All three CI/release workflows run
+`bash .github/workflows/audit.sh "$RUNNER_TEMP/audit.json"`. The artifact upload
+uses the same runner temporary path, outside the Git checkout, so audit evidence
+cannot dirty the source package or become part of a published crate.
+The script installs **cargo-audit 0.22.2 with its locked dependencies** into an
+isolated temporary directory. Missing tooling, installation/network/database
+errors, vulnerability matches and advisory warnings all fail the job. There are
+no blanket advisory ignores or successful fallbacks. The JSON report is retained
+as an Actions artifact; the tool version is recorded in the step log and the
+report records the advisory database metadata when fetched.
 
-Runs quick checks on every push/PR:
-- **Format Check**: Ensures code follows Rust formatting standards
-- **Clippy Lint**: Catches common mistakes and enforces best practices
-- **Tests**: Runs test suite on Ubuntu, macOS, and Windows
-- **Security Audit**: Scans dependencies for known vulnerabilities
+A green audit checks the lockfile against the database at that time. It is not
+proof that all code or downloaded binaries are safe. Any proposed exception
+needs a specific advisory, dependency/feature/target scope, owner, justification,
+expiry and review before changing the gate. No exceptions are currently defined.
 
-**Duration:** ~5-10 minutes
-
-### `test.yml` - Comprehensive Test Suite
-**Triggers:** Push and PR to master/main
-
-Runs extensive testing:
-- **Multi-version Testing**: Tests on stable, beta, and nightly Rust
-- **Format & Clippy**: Only on stable Rust
-- **Integration Tests**: Separate job for integration test suite
-- **Security Audit**: Dependency vulnerability scanning
-
-**Duration:** ~15-20 minutes
-
-### `release.yml` - Build and Release
-**Triggers:** 
-- Push of version tags (e.g., `v0.4.0`)
-- Manual workflow dispatch
-
-**Jobs:**
-1. **build-release**: Builds release binaries for multiple platforms:
-   - **Linux**: x86_64, aarch64
-   - **macOS**: x86_64, aarch64 (Apple Silicon)
-2. **build-arch-packages**: Builds Arch Linux packages (.pkg.tar.zst)
-3. **publish-crates-io**: Automatically publishes to crates.io (requires `CRATES_IO_TOKEN` secret)
-4. **create-release**: Creates GitHub Release with artifacts
-
-**Outputs:**
-- Release archives (`.tar.gz` for Unix)
-- Arch Linux packages (`.pkg.tar.zst`)
-- Checksums file (`checksums.txt`)
-- GitHub Release with download links
-- Published to crates.io
-
-**Duration:** ~30-45 minutes
-
-**Required Secrets:**
-- `CRATES_IO_TOKEN`: crates.io API token for automated publishing (get from https://crates.io/me)
-
-## Usage
-
-### Running Tests Locally
-```bash
-# Format check
+```sh
 cargo fmt --all -- --check
-
-# Clippy
-cargo clippy --all-targets --all-features -- -D warnings
-
-# Tests
-cargo test --all-targets
-
-# Integration tests
-cargo test --test integration_test
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
+python3 .github/workflows/test_supply_chain.py  # Python 3.11+
+audit_report=$(mktemp)
+bash .github/workflows/audit.sh "$audit_report"
 ```
 
-### Creating a Release
+CI also runs `cargo package --locked` after the audit, before a release tag is
+needed. CI, comprehensive tests and release validation all reject Clippy warnings.
 
-**Automatic (Recommended):**
-```bash
-# Create and push a version tag
-git tag v0.3.0
-git push origin v0.3.0
-```
+The Python tests are offline failure injections: audit installation/execution
+failures, malformed/mismatched release tags, missing/empty/duplicate/unexpected
+assets, and altered/incomplete uploaded bytes must block their gate. A minimal
+committed Cargo fixture executes the actual workflow audit commands with a mock
+auditor, then packages successfully with evidence outside its checkout; an
+untracked audit file inside the checkout must fail packaging. This fixture has
+its own Cargo target directory.
 
-**Manual:**
-1. Go to GitHub Actions
-2. Select "Release" workflow
-3. Click "Run workflow"
-4. Enter version tag (e.g., `v0.3.0`)
-5. Click "Run workflow"
+## Release contract
 
-### Release Artifacts
+A tag push or manual dispatch starts `release.yml`. A manual dispatch requires
+an **existing stable `vMAJOR.MINOR.PATCH` tag pointing to the selected commit**.
+A prerelease tag matching the trigger starts validation and is rejected.
+The tag's version must match `Cargo.toml`. The validation job records the exact
+commit, then runs formatting, Clippy, all tests, the negative gate tests, the
+strict dependency audit and a locked crates.io publish dry run. Every build and
+publication depends on this common validation.
 
-After a release is created, artifacts will be available at:
-- GitHub Releases page
-- Download links in release notes
-- Checksums for verification
+The required asset set is:
 
-## Workflow Status
+- Linux x86_64 binary archive;
+- macOS x86_64 and aarch64 binary archives;
+- Windows x86_64 ZIP archive;
+- Debian amd64 and arm64 packages;
+- Arch x86_64 and aarch64 packages.
 
-View workflow runs at: https://github.com/nachtschatt3n/unifictl/actions
+All eight files must exist, be nonempty, and have exactly the expected names.
+Artifact download or build failure blocks publication. The verified set is
+flattened into `dist/`, with SHA-256 checksums and `release-source.json` containing
+the source commit and lockfile digest. No partial build matrix is published.
+
+The GitHub release is published first. crates.io publication runs only after the
+GitHub release is public, and is optional: without `CRATES_IO_TOKEN`, its step
+reports that the channel is disabled. A failed GitHub release therefore never
+leaves an unretractable crates.io version behind. The GitHub job refuses to alter
+an already-public release, uploads to a draft, downloads the uploaded assets, and
+compares every file's bytes to the verified set. Only then does it make the draft
+public/latest. An interrupted upload leaves a draft for inspection or a retry; it
+must not be promoted manually without repeating verification. There is no atomic
+transaction between the two channels: if crates.io fails after the GitHub release
+is public, re-run only the publish job.
+
+Only the GitHub publication job has `contents: write`; build/validation jobs
+have read access and do not persist checkout credentials. Configure repository
+rules to protect version tags and require human review of release-workflow
+changes. Registry credentials should have only the required publishing scope.
+These repository/account settings cannot be enforced by this YAML alone.
+
+Checksums detect corruption relative to this pipeline's output. They are not an
+independent signature, build attestation or reproducible-build proof. No release
+or foreign-platform build is implied by local tests of the workflow contracts.
+The separate manually triggered Homebrew workflow is not part of this validated
+release transaction and needs its own publication review.

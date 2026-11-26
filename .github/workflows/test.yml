@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ master, main ]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -23,19 +26,20 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -51,41 +55,48 @@ jobs:
 
       - name: Run Clippy
         if: matrix.check-clippy
-        run: cargo clippy --all-targets --all-features -- -W clippy::all
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --verbose --all-targets
+        run: cargo test --locked --verbose --all-targets
 
       - name: Build
-        run: cargo build --verbose --release
+        run: cargo build --locked --verbose --release
 
   security:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - name: Install cargo-audit
-        run: |
-          cargo install cargo-audit --features vendored-openssl || echo "cargo-audit installation failed, skipping audit"
+      - name: Run pinned security audit
+        run: bash .github/workflows/audit.sh "$RUNNER_TEMP/audit.json"
 
-      - name: Run security audit
-        run: cargo audit --deny warnings || echo "Security audit skipped"
-        continue-on-error: true
+      - name: Retain audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: audit-${{ github.workflow }}
+          path: ${{ runner.temp }}/audit.json
+          if-no-files-found: error
 
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Run integration tests
-        run: cargo test --test integration_test --verbose
+        run: cargo test --locked --test integration_test --verbose
