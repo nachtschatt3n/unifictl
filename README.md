@@ -559,3 +559,5 @@ Built by [Mathias Uhl](https://github.com/nachtschatt3n)
 **[⬆ Back to Top](#unifictl)**
 
 </div>
+
+For a manual release, select the commit carrying the existing stable version tag. See the [release workflow](.github/workflows/README.md#release-contract) for artifact verification and publication order.
