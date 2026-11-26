@@ -383,3 +383,17 @@ unifictl local network list -o json | jq -r '.data[] | select(.name | contains("
     unifictl local network delete "$network_id" --dry-run
   done
 ```
+
+## Controller TLS and port fallback
+
+```bash
+# Trust a private CA; the password is prompted securely.
+unifictl login --controller-url https://controller.example:8443 --username admin --ca-file ./controller-ca.pem
+# Only if this controller requires the alternate port, explicitly allow it.
+unifictl login --controller-url https://controller.example:8443 --username admin --port-fallback
+# Ignore configuration in an untrusted current working directory.
+unifictl --no-project-config local site list -o json
+```
+
+See [TLS/session migration](docs/TLS_SESSION_MIGRATION.md) for existing insecure
+settings, cached-session migration and explicit malformed-YAML repair.
