@@ -258,7 +258,7 @@ unifictl local time-series traffic --start $START --end $END --format csv
 unifictl local device list --unadopted
 
 # Adopt all pending devices
-unifictl local device adopt-all
+unifictl local device adopt-all --yes
 
 # Restart a device
 unifictl local device restart <MAC>
@@ -305,6 +305,44 @@ print(f"Estimated tokens: {data['llm_metadata']['estimated_tokens']}")
 print(f"Token efficient: {data['llm_metadata']['ai_guidance']['token_efficient']}")
 ```
 
+## Safe writes and collection completeness
+
+A local mutation is submitted once to a preselected controller route. A timeout,
+lost response, redirect, server error, or unavailable route can leave the outcome
+unknown. The CLI does not retry the mutation or discover another route by replaying
+it. Read back the affected resource before deciding whether another command is
+needed. HTTP 401/403/429 is terminal for a batch. Modern local writes use the
+proxied legacy REST/command route or the v2 site route according to the resource;
+controllers that require another write route are not supported by automatic
+fallback. This is not a claim of compatibility with every controller version.
+
+`device adopt-all` requires `--yes` to submit actions, or `--dry-run` to inspect
+pending targets without mutation. It validates and deduplicates the observed MACs,
+stops after authorization/rate rejection or an unknown write outcome, and reports
+remaining targets as `not_attempted`. A successful HTTP response means
+`accepted_unverified`; one inventory readback must show `adopted: true` to mark a
+target `confirmed`. Partial failures and unconfirmed results exit nonzero.
+Adoption may still finish asynchronously; inspect controller state before retrying.
+
+JSON and raw output keep their existing shapes by default. To request collection
+metadata explicitly, use `--with-metadata -o json` with device/client/event/alarm
+lists or top-client/top-device. Bare arrays are wrapped in `data` only with this
+option. `_unifictl.collection` reports the requested limit, returned and observed
+counts, controller-reported total when available, truncation, filtering, and
+`inventory_complete` (`complete`, `incomplete`, or `unknown`). `observed_count`
+counts available matching rows before the CLI limit. A fulfilled requested limit
+is not proof of a complete inventory. Without a controller-reported total,
+completeness remains unknown even for a valid empty list. `--with-metadata` is
+JSON-only; raw response output is not extended.
+
+Event pagination keeps a stable page size after the first page, fails explicitly
+on missing record arrays, repeated records or changing reported totals, and
+retains the existing safety cap. These checks do not provide snapshot isolation
+while the controller's events change. Other aggregate, correlation and time-series
+commands do not yet use this collection metadata contract. `--watch` rejects zero;
+choose a polling interval appropriate to controller limits and use supervisor
+backoff and missing-sample alerts. A successful fetch is not a health diagnosis.
+
 ## Command Reference
 
 ### Cloud API (Site Manager)
@@ -336,7 +374,7 @@ unifictl local device get <MAC> [--ports] [--config]
 unifictl local device restart <MAC>
 unifictl local device power-cycle <MAC> <PORT>
 unifictl local device adopt <MAC>
-unifictl local device adopt-all
+unifictl local device adopt-all --yes
 unifictl local device upgrade <MAC>
 unifictl local device spectrum-scan <MAC>
 unifictl local device port-anomalies

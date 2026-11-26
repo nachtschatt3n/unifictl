@@ -69,6 +69,13 @@ struct Cli {
     )]
     output: OutputFormat,
 
+    #[arg(
+        long,
+        global = true,
+        help = "Include completeness metadata with JSON device/client/event/alarm lists"
+    )]
+    with_metadata: bool,
+
     #[arg(long, global = true, help = "Do not truncate long IDs in table output")]
     full_ids: bool,
 
@@ -108,7 +115,8 @@ struct Cli {
         long,
         value_name = "SECONDS",
         global = true,
-        help = "Watch mode: refresh every SECONDS (tables only)"
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Watch mode: refresh every SECONDS (minimum 1)"
     )]
     watch: Option<u64>,
 
@@ -786,6 +794,14 @@ enum LocalDeviceCommand {
     AdoptAll {
         #[arg(long)]
         site: Option<String>,
+        #[arg(
+            long,
+            help = "Authorize adoption of all selected pending devices",
+            required_unless_present = "dry_run"
+        )]
+        yes: bool,
+        #[arg(long, help = "List adoption targets without submitting any actions")]
+        dry_run: bool,
     },
     /// Upgrade the device
     Upgrade {
@@ -1264,6 +1280,7 @@ impl From<ScopeArg> for Scope {
 
 #[derive(Clone)]
 struct RenderOpts {
+    with_metadata: bool,
     columns_override: Option<Vec<String>>,
     sort_by: Option<String>,
     filter: Option<String>,
@@ -1292,6 +1309,11 @@ fn validate_controller_url(url: &str) -> Result<String> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.with_metadata && cli.output != OutputFormat::Json {
+        return Err(anyhow!(
+            "--with-metadata requires --output json; raw output remains unchanged"
+        ));
+    }
     let cwd = std::env::current_dir().context("reading current directory")?;
     FULL_IDS.get_or_init(|| cli.full_ids);
     session::set_disabled(cli.no_session_cache);
@@ -1348,6 +1370,7 @@ fn main() -> Result<()> {
     let effective = resolve(&cwd, cli.api_key.clone(), cli.base_url.clone())?;
     let client = ApiClient::new(&effective.base_url, &effective.api_key)?;
     let render_opts = RenderOpts {
+        with_metadata: cli.with_metadata,
         columns_override: cli.columns.as_ref().map(|c| {
             c.split(',')
                 .map(|s| s.trim().to_string())
@@ -1676,23 +1699,20 @@ fn handle_local(
                 || {
                     let mut resp = client.list_devices()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            if unadopted {
-                                arr.retain(|item| {
-                                    let state = item.get("state").and_then(|s| s.as_str());
-                                    let adopted = item.get("adopted").and_then(|a| a.as_bool());
-                                    state == Some("pending") || adopted == Some(false)
-                                });
-                            }
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
+                        if let Some(arr) = list_payload_mut(&mut json)
+                            && unadopted
+                        {
+                            arr.retain(|item| {
+                                let state = item.get("state").and_then(|s| s.as_str());
+                                let adopted = item.get("adopted").and_then(|a| a.as_bool());
+                                state == Some("pending") || adopted == Some(false)
+                            });
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(resp, limit, "devices", render_opts.with_metadata, unadopted)
                 },
                 output,
                 render_opts,
@@ -1702,8 +1722,12 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Device(LocalDeviceCommand::AdoptAll { site: _ }) => {
-            let effective = resolve_local(cwd, site_override(global_site))?;
+        LocalCommands::Device(LocalDeviceCommand::AdoptAll {
+            site,
+            yes: _,
+            dry_run,
+        }) => {
+            let effective = resolve_local(cwd, site_override(site.or(global_site)))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1711,57 +1735,95 @@ fn handle_local(
                 &effective.site,
                 effective.verify_tls,
             )?;
-            // Get all devices and adopt unadopted ones
             let devices = client.list_devices()?;
-            if let Some(json) = devices.json {
-                if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                    let mut adopted_count = 0;
-                    let mut failed_count = 0;
-
-                    for device in data {
-                        let state = device.get("state").and_then(|s| s.as_str());
-                        let adopted = device.get("adopted").and_then(|a| a.as_bool());
-                        let is_unadopted = state == Some("pending") || adopted == Some(false);
-
-                        if is_unadopted
-                            && let Some(mac) = device.get("mac").and_then(|m| m.as_str())
-                        {
-                            match client.device_action(mac, "adopt") {
-                                Ok(_) => {
-                                    adopted_count += 1;
-                                    if let Some(name) = device.get("name").and_then(|n| n.as_str())
-                                    {
-                                        println!("Adopted: {} ({})", name, mac);
-                                    } else {
-                                        println!("Adopted device: {}", mac);
-                                    }
-                                }
-                                Err(e) => {
-                                    failed_count += 1;
-                                    if let Some(name) = device.get("name").and_then(|n| n.as_str())
-                                    {
-                                        eprintln!("Failed to adopt {} ({}): {}", name, mac, e);
-                                    } else {
-                                        eprintln!("Failed to adopt device {}: {}", mac, e);
-                                    }
-                                }
-                            }
+            let rows = local::collection_payload(
+                devices
+                    .json
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("adoption inventory is missing JSON"))?,
+            )?;
+            let mut targets = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for device in rows.iter().filter(|device| {
+                device.get("state").and_then(|v| v.as_str()) == Some("pending")
+                    || device.get("adopted").and_then(|v| v.as_bool()) == Some(false)
+            }) {
+                let mac = device
+                    .get("mac")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("pending device has no MAC; no actions submitted"))?;
+                let key = adoption_mac(mac).ok_or_else(|| {
+                    anyhow!("pending device has an invalid MAC; no actions submitted")
+                })?;
+                if seen.insert(key) {
+                    targets.push(mac.to_string());
+                }
+            }
+            let mut stopped = false;
+            let mut results = Vec::new();
+            for mac in targets {
+                let result = if dry_run {
+                    json!({"mac":mac,"outcome":"planned"})
+                } else if stopped {
+                    json!({"mac":mac,"outcome":"not_attempted"})
+                } else {
+                    match client.device_action(&mac, "adopt") {
+                        Ok(_) => json!({"mac":mac,"outcome":"accepted_unverified"}),
+                        Err(error) => {
+                            stopped = local::should_stop_batch(&error);
+                            json!({"mac":mac,"outcome":if local::write_outcome_unknown(&error) {"unknown"} else {"failed"},"error":error.to_string()})
                         }
                     }
-
-                    println!(
-                        "\nAdoption complete: {} adopted, {} failed",
-                        adopted_count, failed_count
-                    );
-                    Ok(())
-                } else {
-                    println!("No devices found");
-                    Ok(())
-                }
-            } else {
-                println!("No devices found");
-                Ok(())
+                };
+                results.push(result);
             }
+            // Acceptance is not adoption completion. Check current state once;
+            // pending results remain explicit and cause a nonzero exit.
+            if !dry_run
+                && !stopped
+                && results
+                    .iter()
+                    .any(|r| r["outcome"] == "accepted_unverified")
+                && let Ok(readback) = client.list_devices()
+                && let Some(rows) = readback
+                    .json
+                    .as_ref()
+                    .and_then(|json| local::collection_payload(json).ok())
+            {
+                for result in &mut results {
+                    if result["outcome"] == "accepted_unverified"
+                        && rows.iter().any(|device| {
+                            device
+                                .get("mac")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|mac| {
+                                    mac_matches(mac, result["mac"].as_str().unwrap_or_default())
+                                })
+                                && device.get("adopted").and_then(|v| v.as_bool()) == Some(true)
+                        })
+                    {
+                        result["outcome"] = json!("confirmed");
+                    }
+                }
+            }
+            let complete = dry_run || results.iter().all(|r| r["outcome"] == "confirmed");
+            let report = json!({"data":results,"dry_run":dry_run,"batch_stopped":stopped,"complete":complete});
+            render_response(
+                ResponseData {
+                    status: 200,
+                    body: serde_json::to_string(&report)?,
+                    json: Some(report),
+                },
+                output,
+                render_opts,
+                Some(&["mac", "outcome", "error"]),
+            )?;
+            if !complete {
+                return Err(anyhow!(
+                    "adoption incomplete; inspect per-target outcomes before retrying"
+                ));
+            }
+            Ok(())
         }
         LocalCommands::Device(LocalDeviceCommand::Get {
             mac,
@@ -1956,13 +2018,18 @@ fn handle_local(
                                     || (blocked && is_blocked)
                                     || (!wired && !wireless && !blocked)
                             });
-                            truncate_with_warning(arr, limit, "clients");
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(
+                        resp,
+                        limit,
+                        "clients",
+                        render_opts.with_metadata,
+                        wired || wireless || blocked,
+                    )
                 },
                 output,
                 render_opts,
@@ -2038,18 +2105,13 @@ fn handle_local(
             )?;
             render_local(
                 || {
-                    let mut resp = client.clients_v2_active()?;
-                    if let Some(mut json) = resp.json.clone() {
-                        // v2 endpoint: bare array, no `data` envelope — see the
-                        // note in `client history`.
-                        if let Some(arr) = list_payload_mut(&mut json) {
-                            truncate_with_warning(arr, limit, "active clients");
-                        }
-                        resp.body =
-                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                        resp.json = Some(json);
-                    }
-                    Ok(resp)
+                    limit_collection(
+                        client.clients_v2_active()?,
+                        limit,
+                        "active clients",
+                        render_opts.with_metadata,
+                        false,
+                    )
                 },
                 output,
                 render_opts,
@@ -2079,24 +2141,28 @@ fn handle_local(
                         // bare array, not a `{"data": …}` envelope. Reaching
                         // straight for `data` found nothing, so both --mac and
                         // --limit were silently ignored here.
-                        if let Some(arr) = list_payload_mut(&mut json) {
-                            if let Some(ref mac_val) = mac_filter
-                                && !retain_clients_with_mac(arr, mac_val)
-                            {
-                                eprintln!(
-                                    "No matching client: no entry in the connection history has \
+                        if let Some(arr) = list_payload_mut(&mut json)
+                            && let Some(ref mac_val) = mac_filter
+                            && !retain_clients_with_mac(arr, mac_val)
+                        {
+                            eprintln!(
+                                "No matching client: no entry in the connection history has \
                                      MAC {mac_val}. (History covers clients the controller still \
                                      remembers; try `client active` or `client list` for \
                                      currently known clients.)"
-                                );
-                            }
-                            truncate_with_warning(arr, limit, "history entries");
+                            );
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(
+                        resp,
+                        limit,
+                        "history entries",
+                        render_opts.with_metadata,
+                        mac_filter.is_some(),
+                    )
                 },
                 output,
                 render_opts,
@@ -2160,7 +2226,7 @@ fn handle_local(
                     // is sent, so truncating a single default response could
                     // never honor a --limit above 50. Paginate instead, and say
                     // so out loud when the controller runs dry early.
-                    let (resp, stats) = client.list_events_paged(limit)?;
+                    let (mut resp, stats) = client.list_events_paged(limit)?;
                     if stats.truncated {
                         match stats.total_available {
                             Some(total) => eprintln!(
@@ -2174,6 +2240,25 @@ fn handle_local(
                                 stats.requested, stats.returned
                             ),
                         }
+                    }
+                    if render_opts.with_metadata {
+                        let truncated = stats.truncated
+                            || stats.observed > stats.returned
+                            || stats
+                                .total_available
+                                .is_some_and(|total| total > stats.returned);
+                        attach_collection_metadata(
+                            &mut resp,
+                            stats.requested,
+                            stats.observed,
+                            stats.total_available,
+                            truncated,
+                            false,
+                            stats.returned >= stats.requested
+                                || stats
+                                    .total_available
+                                    .is_some_and(|total| total <= stats.returned),
+                        )?;
                     }
                     Ok(resp)
                 },
@@ -2632,18 +2717,13 @@ fn handle_local(
             )?;
             render_local(
                 || {
-                    let mut resp = client.list_alarms(archived)?;
-                    if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
-                            && arr.len() > limit
-                        {
-                            arr.truncate(limit);
-                        }
-                        resp.body =
-                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                        resp.json = Some(json);
-                    }
-                    Ok(resp)
+                    limit_collection(
+                        client.list_alarms(archived)?,
+                        limit,
+                        "alarms",
+                        render_opts.with_metadata,
+                        false,
+                    )
                 },
                 output,
                 render_opts,
@@ -3375,22 +3455,19 @@ fn handle_local(
                 || {
                     let mut resp = client.list_clients()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                        if let Some(arr) = list_payload_mut(&mut json) {
                             let score = |item: &serde_json::Value| -> u128 {
                                 let tx = item.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let rx = item.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                                 tx as u128 + rx as u128
                             };
                             arr.sort_by_key(|item| std::cmp::Reverse(score(item)));
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(resp, limit, "clients", render_opts.with_metadata, false)
                 },
                 output,
                 render_opts,
@@ -3413,7 +3490,7 @@ fn handle_local(
                 || {
                     let mut resp = client.list_devices()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                        if let Some(arr) = list_payload_mut(&mut json) {
                             let score = |item: &serde_json::Value| -> i64 {
                                 item.get("num_sta")
                                     .and_then(|v| v.as_i64())
@@ -3421,15 +3498,12 @@ fn handle_local(
                                     .unwrap_or(0)
                             };
                             arr.sort_by_key(|item| std::cmp::Reverse(score(item)));
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(resp, limit, "devices", render_opts.with_metadata, false)
                 },
                 output,
                 render_opts,
@@ -4498,6 +4572,89 @@ fn retain_clients_with_mac(arr: &mut Vec<serde_json::Value>, mac: &str) -> bool 
             .unwrap_or(false)
     });
     !arr.is_empty()
+}
+
+fn adoption_mac(mac: &str) -> Option<String> {
+    let compact: String = mac
+        .chars()
+        .filter(|c| !matches!(c, ':' | '-' | '.'))
+        .collect();
+    (compact.len() == 12 && compact.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| compact.to_ascii_lowercase())
+}
+
+fn limit_collection(
+    mut response: ResponseData,
+    limit: usize,
+    resource: &str,
+    metadata: bool,
+    filtered: bool,
+) -> Result<ResponseData> {
+    let mut json = response
+        .json
+        .take()
+        .ok_or_else(|| anyhow!("collection is missing JSON"))?;
+    local::collection_payload(&json)?;
+    let total = json
+        .get("total_element_count")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let rows = list_payload_mut(&mut json)
+        .ok_or_else(|| anyhow!("collection is missing its records array"))?;
+    let available = rows.len();
+    truncate_with_warning(rows, limit, resource);
+    let returned = rows.len();
+    response.body = serde_json::to_string(&json)?;
+    response.json = Some(json);
+    if metadata {
+        attach_collection_metadata(
+            &mut response,
+            limit,
+            available,
+            total,
+            available > returned || total.is_some_and(|total| total > returned),
+            filtered,
+            returned >= limit || (!filtered && total.is_some_and(|total| total <= returned)),
+        )?;
+    }
+    Ok(response)
+}
+
+fn attach_collection_metadata(
+    response: &mut ResponseData,
+    requested: usize,
+    observed: usize,
+    total: Option<usize>,
+    truncated: bool,
+    filtered: bool,
+    requested_range_complete: bool,
+) -> Result<()> {
+    let mut json = response
+        .json
+        .take()
+        .ok_or_else(|| anyhow!("collection is missing JSON"))?;
+    let returned = local::list_payload(&json)
+        .ok_or_else(|| anyhow!("collection is missing its records array"))?
+        .len();
+    if json.is_array() {
+        json = json!({"data":json});
+    }
+    let inventory_complete = if truncated || filtered {
+        "incomplete"
+    } else if total.is_some_and(|total| total <= returned) {
+        "complete"
+    } else {
+        "unknown"
+    };
+    // This opt-in namespace is computed locally, never accepted from a controller.
+    json["_unifictl"] = json!({"collection": {
+        "requested":requested,"returned_count":returned,"observed_count":observed,
+        "total_available":total,"truncated":truncated,"filtered":filtered,
+        "inventory_complete":inventory_complete,"requested_range_complete":requested_range_complete,
+    }});
+    response.body = serde_json::to_string(&json)?;
+    response.json = Some(json);
+    Ok(())
 }
 
 /// Truncate a list payload to `limit`, telling the user on stderr when rows
