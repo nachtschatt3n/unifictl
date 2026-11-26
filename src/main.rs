@@ -16,6 +16,7 @@
 
 mod client;
 mod config;
+mod diagnostics;
 mod local;
 mod schema;
 mod session;
@@ -1568,7 +1569,7 @@ fn main() -> Result<()> {
                 println!("Validating cloud (Site Manager) credentials...");
                 match client.get("/v1/hosts", &[]) {
                     Ok(_) => println!("Cloud API: ok"),
-                    Err(e) => println!("Cloud API: FAILED ({})", e),
+                    Err(e) => eprintln!("Cloud API: FAILED ({})", e),
                 }
             }
 
@@ -1585,7 +1586,7 @@ fn main() -> Result<()> {
                     local.list_sites()
                 }) {
                     Ok(_) => println!("Local controller: ok"),
-                    Err(e) => println!("Local controller: FAILED ({})", e),
+                    Err(e) => eprintln!("Local controller: FAILED ({})", e),
                 }
             }
         }
