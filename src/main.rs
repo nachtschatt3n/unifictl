@@ -69,6 +69,13 @@ struct Cli {
     )]
     output: OutputFormat,
 
+    #[arg(
+        long,
+        global = true,
+        help = "Include collection metadata in JSON output (automatic for LLM output)"
+    )]
+    with_metadata: bool,
+
     #[arg(long, global = true, help = "Do not truncate long IDs in table output")]
     full_ids: bool,
 
@@ -108,7 +115,8 @@ struct Cli {
         long,
         value_name = "SECONDS",
         global = true,
-        help = "Watch mode: refresh every SECONDS (tables only)"
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Watch mode: refresh every SECONDS (minimum 1)"
     )]
     watch: Option<u64>,
 
@@ -637,7 +645,7 @@ enum TimeSeriesCommand {
     },
     /// Export event log as time-series data
     Events {
-        #[arg(long, help = "Number of recent events to export (default: 100)")]
+        #[arg(long, help = "Number of recent events to export (default: 50)")]
         limit: Option<usize>,
         #[arg(long)]
         site: Option<String>,
@@ -786,6 +794,14 @@ enum LocalDeviceCommand {
     AdoptAll {
         #[arg(long)]
         site: Option<String>,
+        #[arg(
+            long,
+            help = "Authorize adoption of all selected pending devices",
+            required_unless_present = "dry_run"
+        )]
+        yes: bool,
+        #[arg(long, help = "List adoption targets without submitting any actions")]
+        dry_run: bool,
     },
     /// Upgrade the device
     Upgrade {
@@ -1264,6 +1280,7 @@ impl From<ScopeArg> for Scope {
 
 #[derive(Clone)]
 struct RenderOpts {
+    with_metadata: bool,
     columns_override: Option<Vec<String>>,
     sort_by: Option<String>,
     filter: Option<String>,
@@ -1292,6 +1309,11 @@ fn validate_controller_url(url: &str) -> Result<String> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.with_metadata && !matches!(cli.output, OutputFormat::Json | OutputFormat::Llm) {
+        return Err(anyhow!(
+            "--with-metadata requires --output json or llm; raw output remains unchanged"
+        ));
+    }
     let cwd = std::env::current_dir().context("reading current directory")?;
     FULL_IDS.get_or_init(|| cli.full_ids);
     session::set_disabled(cli.no_session_cache);
@@ -1348,6 +1370,7 @@ fn main() -> Result<()> {
     let effective = resolve(&cwd, cli.api_key.clone(), cli.base_url.clone())?;
     let client = ApiClient::new(&effective.base_url, &effective.api_key)?;
     let render_opts = RenderOpts {
+        with_metadata: cli.with_metadata || cli.output == OutputFormat::Llm,
         columns_override: cli.columns.as_ref().map(|c| {
             c.split(',')
                 .map(|s| s.trim().to_string())
@@ -1676,23 +1699,20 @@ fn handle_local(
                 || {
                     let mut resp = client.list_devices()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
-                            if unadopted {
-                                arr.retain(|item| {
-                                    let state = item.get("state").and_then(|s| s.as_str());
-                                    let adopted = item.get("adopted").and_then(|a| a.as_bool());
-                                    state == Some("pending") || adopted == Some(false)
-                                });
-                            }
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
+                        if let Some(arr) = list_payload_mut(&mut json)
+                            && unadopted
+                        {
+                            arr.retain(|item| {
+                                let state = item.get("state").and_then(|s| s.as_str());
+                                let adopted = item.get("adopted").and_then(|a| a.as_bool());
+                                state == Some("pending") || adopted == Some(false)
+                            });
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(resp, limit, "devices", render_opts.with_metadata, unadopted)
                 },
                 output,
                 render_opts,
@@ -1702,8 +1722,12 @@ fn handle_local(
                 watch,
             )
         }
-        LocalCommands::Device(LocalDeviceCommand::AdoptAll { site: _ }) => {
-            let effective = resolve_local(cwd, site_override(global_site))?;
+        LocalCommands::Device(LocalDeviceCommand::AdoptAll {
+            site,
+            yes: _,
+            dry_run,
+        }) => {
+            let effective = resolve_local(cwd, site_override(site.or(global_site)))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -1711,57 +1735,95 @@ fn handle_local(
                 &effective.site,
                 effective.verify_tls,
             )?;
-            // Get all devices and adopt unadopted ones
             let devices = client.list_devices()?;
-            if let Some(json) = devices.json {
-                if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                    let mut adopted_count = 0;
-                    let mut failed_count = 0;
-
-                    for device in data {
-                        let state = device.get("state").and_then(|s| s.as_str());
-                        let adopted = device.get("adopted").and_then(|a| a.as_bool());
-                        let is_unadopted = state == Some("pending") || adopted == Some(false);
-
-                        if is_unadopted
-                            && let Some(mac) = device.get("mac").and_then(|m| m.as_str())
-                        {
-                            match client.device_action(mac, "adopt") {
-                                Ok(_) => {
-                                    adopted_count += 1;
-                                    if let Some(name) = device.get("name").and_then(|n| n.as_str())
-                                    {
-                                        println!("Adopted: {} ({})", name, mac);
-                                    } else {
-                                        println!("Adopted device: {}", mac);
-                                    }
-                                }
-                                Err(e) => {
-                                    failed_count += 1;
-                                    if let Some(name) = device.get("name").and_then(|n| n.as_str())
-                                    {
-                                        eprintln!("Failed to adopt {} ({}): {}", name, mac, e);
-                                    } else {
-                                        eprintln!("Failed to adopt device {}: {}", mac, e);
-                                    }
-                                }
-                            }
+            let rows = local::collection_payload(
+                devices
+                    .json
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("adoption inventory is missing JSON"))?,
+            )?;
+            let mut targets = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for device in rows.iter().filter(|device| {
+                device.get("state").and_then(|v| v.as_str()) == Some("pending")
+                    || device.get("adopted").and_then(|v| v.as_bool()) == Some(false)
+            }) {
+                let mac = device
+                    .get("mac")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("pending device has no MAC; no actions submitted"))?;
+                let key = adoption_mac(mac).ok_or_else(|| {
+                    anyhow!("pending device has an invalid MAC; no actions submitted")
+                })?;
+                if seen.insert(key) {
+                    targets.push(mac.to_string());
+                }
+            }
+            let mut stopped = false;
+            let mut results = Vec::new();
+            for mac in targets {
+                let result = if dry_run {
+                    json!({"mac":mac,"outcome":"planned"})
+                } else if stopped {
+                    json!({"mac":mac,"outcome":"not_attempted"})
+                } else {
+                    match client.device_action(&mac, "adopt") {
+                        Ok(_) => json!({"mac":mac,"outcome":"accepted_unverified"}),
+                        Err(error) => {
+                            stopped = local::should_stop_batch(&error);
+                            json!({"mac":mac,"outcome":if local::write_outcome_unknown(&error) {"unknown"} else {"failed"},"error":error.to_string()})
                         }
                     }
-
-                    println!(
-                        "\nAdoption complete: {} adopted, {} failed",
-                        adopted_count, failed_count
-                    );
-                    Ok(())
-                } else {
-                    println!("No devices found");
-                    Ok(())
-                }
-            } else {
-                println!("No devices found");
-                Ok(())
+                };
+                results.push(result);
             }
+            // Acceptance is not adoption completion. Check current state once;
+            // pending results remain explicit and cause a nonzero exit.
+            if !dry_run
+                && !stopped
+                && results
+                    .iter()
+                    .any(|r| r["outcome"] == "accepted_unverified")
+                && let Ok(readback) = client.list_devices()
+                && let Some(rows) = readback
+                    .json
+                    .as_ref()
+                    .and_then(|json| local::collection_payload(json).ok())
+            {
+                for result in &mut results {
+                    if result["outcome"] == "accepted_unverified"
+                        && rows.iter().any(|device| {
+                            device
+                                .get("mac")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|mac| {
+                                    mac_matches(mac, result["mac"].as_str().unwrap_or_default())
+                                })
+                                && device.get("adopted").and_then(|v| v.as_bool()) == Some(true)
+                        })
+                    {
+                        result["outcome"] = json!("confirmed");
+                    }
+                }
+            }
+            let complete = dry_run || results.iter().all(|r| r["outcome"] == "confirmed");
+            let report = json!({"data":results,"dry_run":dry_run,"batch_stopped":stopped,"complete":complete});
+            render_response(
+                ResponseData {
+                    status: 200,
+                    body: serde_json::to_string(&report)?,
+                    json: Some(report),
+                },
+                output,
+                render_opts,
+                Some(&["mac", "outcome", "error"]),
+            )?;
+            if !complete {
+                return Err(anyhow!(
+                    "adoption incomplete; inspect per-target outcomes before retrying"
+                ));
+            }
+            Ok(())
         }
         LocalCommands::Device(LocalDeviceCommand::Get {
             mac,
@@ -1956,13 +2018,18 @@ fn handle_local(
                                     || (blocked && is_blocked)
                                     || (!wired && !wireless && !blocked)
                             });
-                            truncate_with_warning(arr, limit, "clients");
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(
+                        resp,
+                        limit,
+                        "clients",
+                        render_opts.with_metadata,
+                        wired || wireless || blocked,
+                    )
                 },
                 output,
                 render_opts,
@@ -2038,18 +2105,13 @@ fn handle_local(
             )?;
             render_local(
                 || {
-                    let mut resp = client.clients_v2_active()?;
-                    if let Some(mut json) = resp.json.clone() {
-                        // v2 endpoint: bare array, no `data` envelope — see the
-                        // note in `client history`.
-                        if let Some(arr) = list_payload_mut(&mut json) {
-                            truncate_with_warning(arr, limit, "active clients");
-                        }
-                        resp.body =
-                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                        resp.json = Some(json);
-                    }
-                    Ok(resp)
+                    limit_collection(
+                        client.clients_v2_active()?,
+                        limit,
+                        "active clients",
+                        render_opts.with_metadata,
+                        false,
+                    )
                 },
                 output,
                 render_opts,
@@ -2079,24 +2141,28 @@ fn handle_local(
                         // bare array, not a `{"data": …}` envelope. Reaching
                         // straight for `data` found nothing, so both --mac and
                         // --limit were silently ignored here.
-                        if let Some(arr) = list_payload_mut(&mut json) {
-                            if let Some(ref mac_val) = mac_filter
-                                && !retain_clients_with_mac(arr, mac_val)
-                            {
-                                eprintln!(
-                                    "No matching client: no entry in the connection history has \
+                        if let Some(arr) = list_payload_mut(&mut json)
+                            && let Some(ref mac_val) = mac_filter
+                            && !retain_clients_with_mac(arr, mac_val)
+                        {
+                            eprintln!(
+                                "No matching client: no entry in the connection history has \
                                      MAC {mac_val}. (History covers clients the controller still \
                                      remembers; try `client active` or `client list` for \
                                      currently known clients.)"
-                                );
-                            }
-                            truncate_with_warning(arr, limit, "history entries");
+                            );
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(
+                        resp,
+                        limit,
+                        "history entries",
+                        render_opts.with_metadata,
+                        mac_filter.is_some(),
+                    )
                 },
                 output,
                 render_opts,
@@ -2160,7 +2226,7 @@ fn handle_local(
                     // is sent, so truncating a single default response could
                     // never honor a --limit above 50. Paginate instead, and say
                     // so out loud when the controller runs dry early.
-                    let (resp, stats) = client.list_events_paged(limit)?;
+                    let (mut resp, stats) = client.list_events_paged(limit)?;
                     if stats.truncated {
                         match stats.total_available {
                             Some(total) => eprintln!(
@@ -2174,6 +2240,25 @@ fn handle_local(
                                 stats.requested, stats.returned
                             ),
                         }
+                    }
+                    if render_opts.with_metadata {
+                        let truncated = stats.truncated
+                            || stats.observed > stats.returned
+                            || stats
+                                .total_available
+                                .is_some_and(|total| total > stats.returned);
+                        attach_collection_metadata(
+                            &mut resp,
+                            stats.requested,
+                            stats.observed,
+                            stats.total_available,
+                            truncated,
+                            false,
+                            stats.returned >= stats.requested
+                                || stats
+                                    .total_available
+                                    .is_some_and(|total| total <= stats.returned),
+                        )?;
                     }
                     Ok(resp)
                 },
@@ -2632,18 +2717,13 @@ fn handle_local(
             )?;
             render_local(
                 || {
-                    let mut resp = client.list_alarms(archived)?;
-                    if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
-                            && arr.len() > limit
-                        {
-                            arr.truncate(limit);
-                        }
-                        resp.body =
-                            serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
-                        resp.json = Some(json);
-                    }
-                    Ok(resp)
+                    limit_collection(
+                        client.list_alarms(archived)?,
+                        limit,
+                        "alarms",
+                        render_opts.with_metadata,
+                        false,
+                    )
                 },
                 output,
                 render_opts,
@@ -3375,22 +3455,19 @@ fn handle_local(
                 || {
                     let mut resp = client.list_clients()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                        if let Some(arr) = list_payload_mut(&mut json) {
                             let score = |item: &serde_json::Value| -> u128 {
                                 let tx = item.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let rx = item.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                                 tx as u128 + rx as u128
                             };
                             arr.sort_by_key(|item| std::cmp::Reverse(score(item)));
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(resp, limit, "clients", render_opts.with_metadata, false)
                 },
                 output,
                 render_opts,
@@ -3413,7 +3490,7 @@ fn handle_local(
                 || {
                     let mut resp = client.list_devices()?;
                     if let Some(mut json) = resp.json.clone() {
-                        if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                        if let Some(arr) = list_payload_mut(&mut json) {
                             let score = |item: &serde_json::Value| -> i64 {
                                 item.get("num_sta")
                                     .and_then(|v| v.as_i64())
@@ -3421,15 +3498,12 @@ fn handle_local(
                                     .unwrap_or(0)
                             };
                             arr.sort_by_key(|item| std::cmp::Reverse(score(item)));
-                            if arr.len() > limit {
-                                arr.truncate(limit);
-                            }
                         }
                         resp.body =
                             serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
                         resp.json = Some(json);
                     }
-                    Ok(resp)
+                    limit_collection(resp, limit, "devices", render_opts.with_metadata, false)
                 },
                 output,
                 render_opts,
@@ -3811,7 +3885,13 @@ fn handle_local(
             }
         }
         LocalCommands::Correlate(cmd) => {
-            let effective = resolve_local(cwd, site_override(global_site.clone()))?;
+            let command_site = match &cmd {
+                CorrelateCommand::Client { site, .. }
+                | CorrelateCommand::Device { site, .. }
+                | CorrelateCommand::Ap { site, .. } => site.clone(),
+            };
+            let effective =
+                resolve_local(cwd, site_override(command_site.or(global_site.clone())))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -3823,7 +3903,13 @@ fn handle_local(
             Ok(())
         }
         LocalCommands::Diagnose(cmd) => {
-            let effective = resolve_local(cwd, site_override(global_site.clone()))?;
+            let command_site = match &cmd {
+                DiagnoseCommand::Network { site, .. }
+                | DiagnoseCommand::Wifi { site, .. }
+                | DiagnoseCommand::Client { site, .. } => site.clone(),
+            };
+            let effective =
+                resolve_local(cwd, site_override(command_site.or(global_site.clone())))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -3835,7 +3921,13 @@ fn handle_local(
             Ok(())
         }
         LocalCommands::TimeSeries(cmd) => {
-            let effective = resolve_local(cwd, site_override(global_site.clone()))?;
+            let command_site = match &cmd {
+                TimeSeriesCommand::Traffic { site, .. }
+                | TimeSeriesCommand::Wifi { site, .. }
+                | TimeSeriesCommand::Events { site, .. } => site.clone(),
+            };
+            let effective =
+                resolve_local(cwd, site_override(command_site.or(global_site.clone())))?;
             let mut client = LocalClient::new(
                 &effective.url,
                 &effective.username,
@@ -3843,7 +3935,7 @@ fn handle_local(
                 &effective.site,
                 effective.verify_tls,
             )?;
-            handle_timeseries_command(&cmd, &mut client, output, global_site)?;
+            handle_timeseries_command(&cmd, &mut client, output, render_opts, global_site)?;
             Ok(())
         }
         LocalCommands::Dns(LocalDnsCommand::List { site: _, limit }) => {
@@ -3994,46 +4086,61 @@ fn handle_correlate_command(
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             });
 
-            // Get client details
-            let clients = client.list_clients()?;
-            if let Some(ref json) = clients.json
-                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-            {
-                let client_data = arr
-                    .iter()
-                    .find(|c| c.get("mac").and_then(|m| m.as_str()) == Some(mac));
-                correlated["client"] = client_data.cloned().unwrap_or(json!(null));
-            }
-
-            // Get connected AP info (if wireless)
+            let clients = response_rows(&client.list_clients()?)?;
+            correlated["client"] = clients
+                .iter()
+                .find(|c| {
+                    c.get("mac")
+                        .and_then(|m| m.as_str())
+                        .is_some_and(|m| mac_matches(m, mac))
+                })
+                .cloned()
+                .unwrap_or(json!(null));
             if let Some(ap_mac) = correlated["client"]["ap_mac"].as_str() {
-                let devices = client.list_devices()?;
-                if let Some(ref json) = devices.json
-                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-                {
-                    let ap_data = arr
-                        .iter()
-                        .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(ap_mac));
-                    correlated["connected_ap"] = ap_data.cloned().unwrap_or(json!(null));
-                }
+                let devices = response_rows(&client.list_devices()?)?;
+                correlated["connected_ap"] = devices
+                    .iter()
+                    .find(|d| {
+                        d.get("mac")
+                            .and_then(|m| m.as_str())
+                            .is_some_and(|m| mac_matches(m, ap_mac))
+                    })
+                    .cloned()
+                    .unwrap_or(json!(null));
             }
 
-            // Get events if requested
-            if *include_events
-                && let Ok(events_resp) = client.list_events()
-                && let Some(ref json) = events_resp.json
-                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-            {
-                let client_events: Vec<_> = arr
-                    .iter()
-                    .filter(|e| {
-                        e.get("user").and_then(|u| u.as_str()) == Some(mac)
-                            || e.get("client_mac").and_then(|m| m.as_str()) == Some(mac)
-                    })
-                    .take(20)
-                    .cloned()
-                    .collect();
-                correlated["recent_events"] = json!(client_events);
+            // Optional collection is still observable when explicitly requested.
+            if *include_events {
+                match client.list_events_paged(50) {
+                    Ok((response, stats)) => {
+                        let events = response_rows(&response)?;
+                        let mut relevant: Vec<_> = events
+                            .into_iter()
+                            .filter(|e| {
+                                ["user", "client_mac"].iter().any(|field| {
+                                    e.get(*field)
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|value| mac_matches(value, mac))
+                                })
+                            })
+                            .collect();
+                        let matching_observed = relevant.len();
+                        relevant.truncate(20);
+                        correlated["recent_events"] = json!(relevant);
+                        if render_opts.with_metadata {
+                            correlated["_unifictl"]["events_collection"] = json!({"requested":50,"returned":stats.returned,"matching_observed":matching_observed,"matching_returned":relevant.len(),"total_available":stats.total_available,"truncated":stats.truncated || stats.observed > stats.returned || stats.total_available.is_some_and(|total| total > stats.returned) || matching_observed > relevant.len(),"inventory_complete":"unknown","scope":"at most 20 client matches in the most recent 50 events"});
+                        }
+                        if stats.truncated {
+                            correlated["collection_error"] =
+                                json!("Requested recent event range is incomplete");
+                        }
+                    }
+                    Err(_) => {
+                        correlated["collection_error"] = json!(
+                            "Requested event collection failed; no complete correlation is available"
+                        )
+                    }
+                }
             }
 
             correlated["llm_summary"] = json!({
@@ -4041,20 +4148,22 @@ fn handle_correlate_command(
                 "is_wireless": !correlated["connected_ap"].is_null(),
                 "event_count": correlated.get("recent_events")
                     .and_then(|e| e.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0),
+                    .map(|a| a.len()),
             });
 
-            render_response(
-                ResponseData {
-                    status: 200,
-                    body: serde_json::to_string(&correlated)?,
-                    json: Some(correlated),
-                },
-                output,
-                render_opts,
-                None,
-            )
+            let incomplete = correlated.get("collection_error").is_some();
+            if render_opts.with_metadata {
+                correlated["_unifictl"]["requested_sources_complete"] = json!(!incomplete);
+                correlated["_unifictl"]["inventory_complete"] = json!("unknown");
+            }
+            render_value(correlated, output, render_opts)?;
+            if incomplete {
+                Err(anyhow!(
+                    "Requested correlation data could not be fully collected"
+                ))
+            } else {
+                Ok(())
+            }
         }
         CorrelateCommand::Device {
             mac,
@@ -4067,42 +4176,42 @@ fn handle_correlate_command(
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             });
 
-            // Get device details
-            let devices = client.list_devices()?;
-            if let Some(ref json) = devices.json
-                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-            {
-                let device_data = arr
-                    .iter()
-                    .find(|d| d.get("mac").and_then(|m| m.as_str()) == Some(mac));
-                correlated["device"] = device_data.cloned().unwrap_or(json!(null));
-            }
-
-            // Get connected clients if requested and device is an AP
+            let devices = response_rows(&client.list_devices()?)?;
+            correlated["device"] = devices
+                .iter()
+                .find(|d| {
+                    d.get("mac")
+                        .and_then(|m| m.as_str())
+                        .is_some_and(|m| mac_matches(m, mac))
+                })
+                .cloned()
+                .unwrap_or(json!(null));
             if *include_clients {
-                let clients = client.list_clients()?;
-                if let Some(ref json) = clients.json
-                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-                {
-                    let connected_clients: Vec<_> = arr
-                        .iter()
-                        .filter(|c| {
-                            c.get("ap_mac").and_then(|m| m.as_str()) == Some(mac)
-                                || c.get("sw_mac").and_then(|m| m.as_str()) == Some(mac)
+                let clients = response_rows(&client.list_clients()?)?;
+                let connected: Vec<_> = clients
+                    .into_iter()
+                    .filter(|c| {
+                        ["ap_mac", "sw_mac"].iter().any(|field| {
+                            c.get(*field)
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|value| mac_matches(value, mac))
                         })
-                        .cloned()
-                        .collect();
-                    correlated["connected_clients"] = json!(connected_clients);
-                    correlated["connected_clients_count"] = json!(connected_clients.len());
-                }
+                    })
+                    .collect();
+                correlated["connected_clients_count"] = json!(connected.len());
+                correlated["connected_clients"] = json!(connected);
             }
 
             correlated["llm_summary"] = json!({
                 "has_device_data": !correlated["device"].is_null(),
                 "device_type": correlated["device"]["type"].as_str().unwrap_or("unknown"),
-                "client_count": correlated.get("connected_clients_count").and_then(|c| c.as_u64()).unwrap_or(0),
+                "client_count": correlated.get("connected_clients_count").and_then(|c| c.as_u64()),
             });
 
+            if render_opts.with_metadata {
+                correlated["_unifictl"] =
+                    json!({"requested_sources_complete":true,"inventory_complete":"unknown"});
+            }
             render_response(
                 ResponseData {
                     status: 200,
@@ -4126,6 +4235,33 @@ fn handle_correlate_command(
     }
 }
 
+fn response_rows(response: &ResponseData) -> Result<Vec<serde_json::Value>> {
+    Ok(local::collection_payload(
+        response
+            .json
+            .as_ref()
+            .ok_or_else(|| anyhow!("collection is missing JSON"))?,
+    )?
+    .clone())
+}
+
+fn render_value(
+    value: serde_json::Value,
+    output: OutputFormat,
+    options: &RenderOpts,
+) -> Result<()> {
+    render_response(
+        ResponseData {
+            status: 200,
+            body: serde_json::to_string(&value)?,
+            json: Some(value),
+        },
+        output,
+        options,
+        None,
+    )
+}
+
 fn handle_diagnose_command(
     cmd: &DiagnoseCommand,
     client: &mut LocalClient,
@@ -4133,190 +4269,126 @@ fn handle_diagnose_command(
     render_opts: &RenderOpts,
     _default_site: Option<String>,
 ) -> Result<()> {
-    use serde_json::json;
-
+    let mut errors = Vec::new();
+    let mut unhealthy = false;
+    let mut result = json!({"timestamp":chrono::Utc::now().to_rfc3339()});
     match cmd {
-        DiagnoseCommand::Network { site: _ } => {
-            let mut diagnostics = json!({
-                "diagnostic_type": "network",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "checks": [],
-            });
-
+        DiagnoseCommand::Network { .. } => {
+            result["diagnostic_type"] = json!("network");
             let mut checks = Vec::new();
-
-            // Health check
-            if let Ok(health) = client.list_health() {
-                let health_status: serde_json::Value = if let Some(ref json) = health.json {
-                    json.get("data").cloned().unwrap_or(json!(null))
-                } else {
-                    json!(null)
-                };
-                checks.push(json!({
-                    "name": "Health",
-                    "status": if health.status == 200 { "pass" } else { "fail" },
-                    "data": health_status,
-                }));
-            }
-
-            // WAN check (filter health data for WAN subsystem)
-            if let Ok(wan_health) = client.list_health() {
-                let wan_ok = if let Some(ref json) = wan_health.json {
-                    json.get("data")
-                        .and_then(|d| d.as_array())
-                        .map(|arr| {
-                            arr.iter().any(|item| {
-                                item.get("subsystem").and_then(|s| s.as_str()) == Some("wan")
-                                    && item.get("status").and_then(|s| s.as_str()) == Some("ok")
-                            })
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                checks.push(json!({
-                    "name": "WAN",
-                    "status": if wan_ok { "pass" } else { "fail" },
-                }));
-            }
-
-            // Device check
-            if let Ok(devices) = client.list_devices() {
-                let device_count = devices
-                    .json
-                    .as_ref()
-                    .and_then(|j| j.get("data"))
-                    .and_then(|d| d.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                checks.push(json!({
-                    "name": "Devices",
-                    "status": "pass",
-                    "device_count": device_count,
-                }));
-            }
-
-            diagnostics["checks"] = json!(checks);
-            diagnostics["llm_summary"] = json!({
-                "total_checks": checks.len(),
-                "passed": checks.iter().filter(|c| c["status"] == "pass").count(),
-                "recommendation": "Review failed checks for detailed troubleshooting",
-            });
-
-            render_response(
-                ResponseData {
-                    status: 200,
-                    body: serde_json::to_string(&diagnostics)?,
-                    json: Some(diagnostics),
-                },
-                output,
-                render_opts,
-                None,
-            )
-        }
-        DiagnoseCommand::Wifi { site: _ } => {
-            let mut diagnostics = json!({
-                "diagnostic_type": "wifi",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            });
-
-            // WiFi connectivity check
-            if let Ok(connectivity) = client.wifi_connectivity() {
-                diagnostics["connectivity"] = connectivity.json.clone().unwrap_or(json!(null));
-            }
-
-            // Get APs
-            if let Ok(devices) = client.list_devices()
-                && let Some(ref json) = devices.json
-                && let Some(arr) = json.get("data").and_then(|d| d.as_array())
+            // One snapshot backs both checks; a successful HTTP request alone
+            // does not establish healthy subsystem status.
+            match client
+                .list_health()
+                .and_then(|response| response_rows(&response))
             {
-                let aps: Vec<_> = arr
-                    .iter()
-                    .filter(|d| d.get("type").and_then(|t| t.as_str()) == Some("uap"))
-                    .map(|d| {
-                        json!({
-                            "mac": d.get("mac"),
-                            "name": d.get("name"),
-                            "state": d.get("state"),
-                            "num_sta": d.get("num_sta"),
-                        })
-                    })
-                    .collect();
-                diagnostics["access_points"] = json!(aps);
-                diagnostics["ap_count"] = json!(aps.len());
+                Ok(health) => {
+                    let healthy =
+                        !health.is_empty() && health.iter().all(|row| row["status"] == "ok");
+                    let wan = health.iter().find(|row| row["subsystem"] == "wan");
+                    let wan_status = match wan {
+                        Some(row) if row["status"] == "ok" => "pass",
+                        Some(row) if row.get("status").and_then(|v| v.as_str()).is_some() => "fail",
+                        _ => "unknown",
+                    };
+                    unhealthy = !healthy || wan_status != "pass";
+                    checks.push(json!({"name":"Health","status":if healthy {"pass"}else{"unknown_or_fail"},"data":health}));
+                    checks.push(json!({"name":"WAN","status":wan_status}));
+                }
+                Err(_) => {
+                    errors.push("Health collection failed");
+                    checks.push(json!({"name":"Health","status":"error","error":"Health collection failed"}));
+                    checks.push(json!({"name":"WAN","status":"unknown","error":"Health collection unavailable"}));
+                }
             }
-
-            diagnostics["llm_summary"] = json!({
-                "ap_count": diagnostics.get("ap_count").and_then(|c| c.as_u64()).unwrap_or(0),
-                "recommendation": "Check WiFi connectivity and AP distribution",
-            });
-
-            render_response(
-                ResponseData {
-                    status: 200,
-                    body: serde_json::to_string(&diagnostics)?,
-                    json: Some(diagnostics),
+            match client
+                .list_devices()
+                .and_then(|response| response_rows(&response))
+            {
+                Ok(devices) => checks.push(
+                    json!({"name":"Devices","status":"collected","device_count":devices.len()}),
+                ),
+                Err(_) => {
+                    errors.push("Device collection failed");
+                    checks.push(json!({"name":"Devices","status":"error","error":"Device collection failed"}));
+                }
+            }
+            result["llm_summary"] = json!({"total_checks":checks.len(),"passed":checks.iter().filter(|row|row["status"]=="pass").count(),"recommendation":"Collected is not a health assessment; inspect failed or unknown checks"});
+            result["checks"] = json!(checks);
+        }
+        DiagnoseCommand::Wifi { .. } => {
+            result["diagnostic_type"] = json!("wifi");
+            match client.wifi_connectivity() {
+                Ok(response) => {
+                    result["connectivity"] = response
+                        .json
+                        .ok_or_else(|| anyhow!("Missing WiFi connectivity JSON"))?
+                }
+                Err(_) => errors.push("WiFi connectivity collection failed"),
+            }
+            match client
+                .list_devices()
+                .and_then(|response| response_rows(&response))
+            {
+                Ok(devices) => {
+                    let aps:Vec<_>=devices.iter().filter(|row|row["type"]=="uap")
+                        .map(|row|json!({"mac":row.get("mac"),"name":row.get("name"),"state":row.get("state"),"num_sta":row.get("num_sta")})).collect();
+                    result["ap_count"] = json!(aps.len());
+                    result["access_points"] = json!(aps);
+                }
+                Err(_) => errors.push("Access-point collection failed"),
+            }
+            result["llm_summary"] = json!({"ap_count":result.get("ap_count"),"recommendation":"Data collection is not a WiFi health assessment; inspect connectivity and AP state"});
+        }
+        DiagnoseCommand::Client { mac: Some(mac), .. } => {
+            return handle_correlate_command(
+                &CorrelateCommand::Client {
+                    mac: mac.clone(),
+                    site: None,
+                    include_events: true,
                 },
+                client,
                 output,
                 render_opts,
                 None,
-            )
+            );
         }
-        DiagnoseCommand::Client { mac, site: _ } => {
-            if let Some(mac) = mac {
-                // Diagnose specific client
-                handle_correlate_command(
-                    &CorrelateCommand::Client {
-                        mac: mac.clone(),
-                        site: None,
-                        include_events: true,
-                    },
-                    client,
-                    output,
-                    render_opts,
-                    None,
-                )
-            } else {
-                // Diagnose all clients
-                let clients = client.list_clients()?;
-                let mut diagnostics = json!({
-                    "diagnostic_type": "client_overview",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-
-                if let Some(ref json) = clients.json
-                    && let Some(arr) = json.get("data").and_then(|d| d.as_array())
-                {
-                    let wireless_count = arr
-                        .iter()
-                        .filter(|c| !c.get("is_wired").and_then(|w| w.as_bool()).unwrap_or(false))
-                        .count();
-                    let wired_count = arr.len() - wireless_count;
-
-                    diagnostics["total_clients"] = json!(arr.len());
-                    diagnostics["wireless_clients"] = json!(wireless_count);
-                    diagnostics["wired_clients"] = json!(wired_count);
+        DiagnoseCommand::Client { mac: None, .. } => {
+            result["diagnostic_type"] = json!("client_overview");
+            match client
+                .list_clients()
+                .and_then(|response| response_rows(&response))
+            {
+                Ok(clients) => {
+                    let wired = clients.iter().filter(|row| row["is_wired"] == true).count();
+                    result["total_clients"] = json!(clients.len());
+                    result["wired_clients"] = json!(wired);
+                    result["wireless_clients"] = json!(clients.len() - wired);
                 }
-
-                render_response(
-                    ResponseData {
-                        status: 200,
-                        body: serde_json::to_string(&diagnostics)?,
-                        json: Some(diagnostics),
-                    },
-                    output,
-                    render_opts,
-                    None,
-                )
+                Err(_) => errors.push("Client collection failed"),
             }
         }
     }
+    if !errors.is_empty() {
+        result["collection_errors"] = json!(errors);
+    }
+    if render_opts.with_metadata {
+        result["_unifictl"] = json!({"requested_sources_complete":errors.is_empty(),"inventory_complete":"unknown","health_assessment":if unhealthy {"unhealthy_or_unknown"}else{"inspect_source_fields"}});
+    }
+    render_value(result, output, render_opts)?;
+    if !errors.is_empty() || unhealthy {
+        return Err(anyhow!(
+            "Diagnostics contain failed, unknown or incomplete checks"
+        ));
+    }
+    Ok(())
 }
 
 fn handle_timeseries_command(
     cmd: &TimeSeriesCommand,
     client: &mut LocalClient,
     _output: OutputFormat,
+    render_opts: &RenderOpts,
     _default_site: Option<String>,
 ) -> Result<()> {
     use serde_json::json;
@@ -4337,7 +4409,13 @@ fn handle_timeseries_command(
             let stats = client.traffic_stats(&query)?;
 
             if format == "csv" {
-                print_timeseries_csv(&stats.json.unwrap_or(json!([])), "traffic")?;
+                print_timeseries_csv(
+                    stats
+                        .json
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Missing traffic JSON"))?,
+                    "traffic",
+                )?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&stats.json)?);
             }
@@ -4358,7 +4436,13 @@ fn handle_timeseries_command(
             let stats = client.wifi_stats_details(&query)?;
 
             if format == "csv" {
-                print_timeseries_csv(&stats.json.unwrap_or(json!([])), "wifi")?;
+                print_timeseries_csv(
+                    stats
+                        .json
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Missing WiFi JSON"))?,
+                    "wifi",
+                )?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&stats.json)?);
             }
@@ -4369,127 +4453,99 @@ fn handle_timeseries_command(
             site: _,
             format,
         } => {
-            let events = client.list_events()?;
-
+            // Preserve the former default window while honoring explicit limits
+            // in every export format, including limits above the default page.
+            let (mut events, stats) = client.export_events_paged(limit.unwrap_or(50))?;
+            if render_opts.with_metadata {
+                attach_collection_metadata(
+                    &mut events,
+                    stats.requested,
+                    stats.observed,
+                    stats.total_available,
+                    stats.truncated
+                        || stats.observed > stats.returned
+                        || stats
+                            .total_available
+                            .is_some_and(|total| total > stats.returned),
+                    false,
+                    stats.returned >= stats.requested
+                        || stats
+                            .total_available
+                            .is_some_and(|total| total <= stats.returned),
+                )?;
+            }
             if format == "csv" {
-                let mut limited_events = events.json.clone().unwrap_or(json!({"data": []}));
-                if let Some(limit) = limit
-                    && let Some(arr) = limited_events
-                        .get_mut("data")
-                        .and_then(|d| d.as_array_mut())
-                {
-                    arr.truncate(*limit);
+                if render_opts.with_metadata {
+                    eprintln!(
+                        "{}",
+                        json!({"_unifictl":events.json.as_ref().and_then(|value|value.get("_unifictl"))})
+                    );
                 }
-                print_timeseries_csv(&limited_events, "events")?;
+                print_timeseries_csv(
+                    events
+                        .json
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Missing event JSON"))?,
+                    "events",
+                )?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&events.json)?);
+            }
+            if stats.truncated {
+                return Err(anyhow!(
+                    "Event export could not retrieve the requested range"
+                ));
             }
             Ok(())
         }
     }
 }
 
-fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()> {
-    use csv::Writer;
-    use std::io;
-
-    let mut wtr = Writer::from_writer(io::stdout());
-
-    match data_type {
-        "traffic" => {
-            wtr.write_record(["timestamp", "rx_bytes", "tx_bytes"])?;
-            if let Some(arr) = data.as_array() {
-                for item in arr {
-                    wtr.write_record(&[
-                        item.get("time")
-                            .and_then(|t| t.as_u64())
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                        item.get("rx_bytes")
-                            .and_then(|r| r.as_u64())
-                            .map(|r| r.to_string())
-                            .unwrap_or_default(),
-                        item.get("tx_bytes")
-                            .and_then(|t| t.as_u64())
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                    ])?;
-                }
-            }
-        }
-        "wifi" => {
-            wtr.write_record(["timestamp", "ap_mac", "channel", "num_sta", "satisfaction"])?;
-            if let Some(arr) = data.as_array() {
-                for item in arr {
-                    wtr.write_record(&[
-                        item.get("time")
-                            .and_then(|t| t.as_u64())
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                        item.get("ap_mac")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("channel")
-                            .and_then(|c| c.as_u64())
-                            .map(|c| c.to_string())
-                            .unwrap_or_default(),
-                        item.get("num_sta")
-                            .and_then(|n| n.as_u64())
-                            .map(|n| n.to_string())
-                            .unwrap_or_default(),
-                        item.get("satisfaction")
-                            .and_then(|s| s.as_f64())
-                            .map(|s| s.to_string())
-                            .unwrap_or_default(),
-                    ])?;
-                }
-            }
-        }
-        "events" => {
-            wtr.write_record(["timestamp", "datetime", "key", "msg", "subsystem"])?;
-            if let Some(obj) = data.as_object()
-                && let Some(arr) = obj.get("data").and_then(|d| d.as_array())
-            {
-                for item in arr {
-                    wtr.write_record(&[
-                        item.get("time")
-                            .and_then(|t| t.as_u64())
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                        item.get("datetime")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("key")
-                            .and_then(|k| k.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("msg")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("subsystem")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ])?;
-                }
-            }
-        }
-        _ => {
-            return Err(anyhow!("Unknown time-series data type: {}", data_type));
-        }
+fn export_field(item: &serde_json::Value, fields: &[&str]) -> String {
+    match fields
+        .iter()
+        .find_map(|field| item.get(*field).filter(|value| !value.is_null()))
+    {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(value) if value.is_number() || value.is_boolean() => value.to_string(),
+        _ => String::new(),
     }
+}
 
-    wtr.flush()?;
+fn print_timeseries_csv(data: &serde_json::Value, data_type: &str) -> Result<()> {
+    let rows = local::collection_payload(data)?;
+    let columns: &[(&str, &[&str])] = match data_type {
+        "traffic" => &[
+            ("timestamp", &["time", "timestamp", "datetime"]),
+            ("rx_bytes", &["rx_bytes"]),
+            ("tx_bytes", &["tx_bytes"]),
+        ],
+        "wifi" => &[
+            ("timestamp", &["time", "timestamp", "datetime"]),
+            ("ap_mac", &["ap_mac"]),
+            ("channel", &["channel"]),
+            ("num_sta", &["num_sta"]),
+            ("satisfaction", &["satisfaction"]),
+        ],
+        "events" => &[
+            ("timestamp", &["time", "timestamp", "datetime"]),
+            ("datetime", &["datetime"]),
+            ("key", &["key"]),
+            ("msg", &["msg", "message_raw", "message"]),
+            ("subsystem", &["subsystem", "category"]),
+        ],
+        _ => return Err(anyhow!("Unknown time-series data type")),
+    };
+    let mut writer = csv::Writer::from_writer(io::stdout());
+    writer.write_record(columns.iter().map(|(name, _)| *name))?;
+    for row in rows {
+        writer.write_record(columns.iter().map(|(_, fields)| export_field(row, fields)))?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
-/// Retain only the client records whose `mac` field matches `mac`.
-///
-/// Returns `true` when at least one record survived, so callers can report a
-/// clean "no matching client" instead of rendering an empty table.
+/// Retain only matching MACs from a collected client list.
 fn retain_clients_with_mac(arr: &mut Vec<serde_json::Value>, mac: &str) -> bool {
     arr.retain(|item| {
         item.get("mac")
@@ -4498,6 +4554,89 @@ fn retain_clients_with_mac(arr: &mut Vec<serde_json::Value>, mac: &str) -> bool 
             .unwrap_or(false)
     });
     !arr.is_empty()
+}
+
+fn adoption_mac(mac: &str) -> Option<String> {
+    let compact: String = mac
+        .chars()
+        .filter(|c| !matches!(c, ':' | '-' | '.'))
+        .collect();
+    (compact.len() == 12 && compact.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| compact.to_ascii_lowercase())
+}
+
+fn limit_collection(
+    mut response: ResponseData,
+    limit: usize,
+    resource: &str,
+    metadata: bool,
+    filtered: bool,
+) -> Result<ResponseData> {
+    let mut json = response
+        .json
+        .take()
+        .ok_or_else(|| anyhow!("collection is missing JSON"))?;
+    local::collection_payload(&json)?;
+    let total = json
+        .get("total_element_count")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let rows = list_payload_mut(&mut json)
+        .ok_or_else(|| anyhow!("collection is missing its records array"))?;
+    let available = rows.len();
+    truncate_with_warning(rows, limit, resource);
+    let returned = rows.len();
+    response.body = serde_json::to_string(&json)?;
+    response.json = Some(json);
+    if metadata {
+        attach_collection_metadata(
+            &mut response,
+            limit,
+            available,
+            total,
+            available > returned || total.is_some_and(|total| total > returned),
+            filtered,
+            returned >= limit || (!filtered && total.is_some_and(|total| total <= returned)),
+        )?;
+    }
+    Ok(response)
+}
+
+fn attach_collection_metadata(
+    response: &mut ResponseData,
+    requested: usize,
+    observed: usize,
+    total: Option<usize>,
+    truncated: bool,
+    filtered: bool,
+    requested_range_complete: bool,
+) -> Result<()> {
+    let mut json = response
+        .json
+        .take()
+        .ok_or_else(|| anyhow!("collection is missing JSON"))?;
+    let returned = local::list_payload(&json)
+        .ok_or_else(|| anyhow!("collection is missing its records array"))?
+        .len();
+    if json.is_array() {
+        json = json!({"data":json});
+    }
+    let inventory_complete = if truncated || filtered {
+        "incomplete"
+    } else if total.is_some_and(|total| total <= returned) {
+        "complete"
+    } else {
+        "unknown"
+    };
+    // This opt-in namespace is computed locally, never accepted from a controller.
+    json["_unifictl"] = json!({"collection": {
+        "requested":requested,"returned_count":returned,"observed_count":observed,
+        "total_available":total,"truncated":truncated,"filtered":filtered,
+        "inventory_complete":inventory_complete,"requested_range_complete":requested_range_complete,
+    }});
+    response.body = serde_json::to_string(&json)?;
+    response.json = Some(json);
+    Ok(())
 }
 
 /// Truncate a list payload to `limit`, telling the user on stderr when rows
@@ -4909,7 +5048,9 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
             "estimated_tokens": total_tokens,
             "data_type": data_type,
             "item_count": item_count,
-            "truncation_applied": false,
+            "truncation_applied": json.pointer("/_unifictl/collection/truncated").cloned().unwrap_or(serde_json::Value::Null),
+            "sampling_applied": false,
+            "collection": json.pointer("/_unifictl/collection").cloned().unwrap_or(json!({"inventory_complete":"unknown","returned_count":item_count,"truncated":null})),
             "ai_guidance": {
                 "summary": format!("Response contains {} items with ~{} tokens", item_count, total_tokens),
                 "recommended_max_tokens": 4000,
@@ -4944,8 +5085,6 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
     const SAMPLE_SIZE: usize = 5;
 
     if total_tokens > MAX_TOKENS {
-        llm_output["llm_metadata"]["truncation_applied"] = json!(true);
-
         if let serde_json::Value::Array(arr) = &data {
             // For arrays, show samples from beginning, middle, and end
             let mut samples = Vec::new();
@@ -4982,6 +5121,13 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
                 }
             }
 
+            let mut seen = std::collections::HashSet::new();
+            samples.retain(|sample| seen.insert(sample["index"].as_u64()));
+            let sampled = samples.len() < arr.len();
+            llm_output["llm_metadata"]["sampling_applied"] = json!(sampled);
+            if sampled {
+                llm_output["llm_metadata"]["truncation_applied"] = json!(true);
+            }
             llm_output["data_samples"] = json!(samples);
             llm_output["llm_metadata"]["truncation_note"] = json!(format!(
                 "Original response had {} items. Showing {} representative samples. Use --limit flag to control output size.",

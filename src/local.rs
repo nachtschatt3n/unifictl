@@ -34,6 +34,7 @@ pub struct LocalClient {
     password: String,
     site: String,
     logged_in: bool,
+    cached_session_unverified: bool,
     is_legacy: bool,
     csrf: Option<String>,
     session_cookie: Option<String>,
@@ -64,6 +65,87 @@ static UA: OnceLock<HeaderValue> = OnceLock::new();
 /// read before giving up and surfacing the rate-limit error. Keeps the CLI
 /// responsive rather than blocking on a multi-minute lockout window.
 const RETRY_AFTER_CAP_SECS: u64 = 30;
+
+/// Only known POST query endpoints are safe to replay.
+fn is_read_operation(method: &Method, path: &str) -> bool {
+    *method == Method::GET
+        || (*method == Method::POST
+            && matches!(
+                path,
+                "system-log/all"
+                    | "system-log/count"
+                    | "system-log/critical"
+                    | "system-log/device-alert"
+                    | "system-log/admin-activity"
+                    | "app-traffic-rate"
+                    | "traffic-flows"
+                    | "ports/mac-tables"
+                    | "stat/report/5minutes.ap"
+            ))
+}
+
+/// Only named collection endpoints have this contract. Settings, aggregates,
+/// and mutation responses may legitimately be objects without a `data` array.
+fn expects_collection(method: &Method, path: &str) -> bool {
+    (*method == Method::GET
+        && matches!(
+            path,
+            "self/sites"
+                | "stat/device"
+                | "stat/sta"
+                | "clients/active"
+                | "clients/history"
+                | "list/alarm"
+                | "stat/health"
+                | "rest/networkconf"
+                | "static-dns"
+                | "rest/wlanconf"
+                | "rest/portconf"
+                | "rest/firewallrule"
+                | "rest/firewallgroup"
+                | "rest/routing"
+                | "firewall/zone"
+                | "object-oriented-network-configs"
+        ))
+        || (*method == Method::POST
+            && matches!(
+                path,
+                "system-log/all"
+                    | "system-log/critical"
+                    | "system-log/device-alert"
+                    | "system-log/admin-activity"
+            ))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct WriteFailure {
+    stop_batch: bool,
+    unknown: bool,
+    message: String,
+}
+
+/// Stop a batch after an ambiguous outcome or authentication/rate rejection.
+pub fn should_stop_batch(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<WriteFailure>()
+        .is_some_and(|failure| failure.stop_batch)
+}
+
+pub fn write_outcome_unknown(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<WriteFailure>()
+        .is_some_and(|failure| failure.unknown)
+}
+
+fn unknown_write(message: &str) -> anyhow::Error {
+    WriteFailure {
+        stop_batch: true,
+        unknown: true,
+        message: format!("outcome=unknown: {message}; read back controller state before any retry"),
+    }
+    .into()
+}
 
 /// Parse a `Retry-After` header expressed in delta-seconds. HTTP-date form is
 /// intentionally not handled (UniFi controllers emit delta-seconds).
@@ -107,6 +189,18 @@ pub fn list_payload(json: &serde_json::Value) -> Option<&Vec<serde_json::Value>>
     json.get("data").and_then(|d| d.as_array())
 }
 
+/// A named collection must not turn an application error into an empty inventory.
+pub fn collection_payload(json: &serde_json::Value) -> Result<&Vec<serde_json::Value>> {
+    if let Some(rc) = json.get("meta").and_then(|meta| meta.get("rc"))
+        && rc.as_str() != Some("ok")
+    {
+        return Err(anyhow!(
+            "controller reported a collection error; response body omitted"
+        ));
+    }
+    list_payload(json).ok_or_else(|| anyhow!("collection is missing its records array"))
+}
+
 /// Strip the separators UniFi and users mix freely (`:`, `-`, `.`, spaces) so
 /// `d4:8a:fc:44:0c:48`, `D4-8A-FC-44-0C-48` and `d48afc440c48` all compare
 /// equal.
@@ -132,6 +226,8 @@ pub struct PagedFetch {
     pub requested: usize,
     /// Number of records actually returned.
     pub returned: usize,
+    /// Distinct records received before applying the requested limit.
+    pub observed: usize,
     /// Total records the controller reports as available, when it says so.
     pub total_available: Option<usize>,
     /// True when the controller holds more records than we returned *and* the
@@ -152,6 +248,7 @@ impl LocalClient {
         let user_agent = UA.get_or_init(|| HeaderValue::from_static("unifictl-local/0.1"));
         let http = Client::builder()
             .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(!verify_tls)
             .user_agent(user_agent.clone())
             .timeout(Duration::from_secs(10)) // Total request timeout
@@ -167,6 +264,7 @@ impl LocalClient {
             password: password.to_string(),
             site: site.to_string(),
             logged_in: false,
+            cached_session_unverified: false,
             is_legacy: false,
             csrf: None,
             session_cookie: None,
@@ -201,6 +299,7 @@ impl LocalClient {
             self.session_cookie = sess.session_cookie;
             self.is_legacy = sess.is_legacy;
             self.logged_in = true;
+            self.cached_session_unverified = true;
         }
     }
 
@@ -230,9 +329,13 @@ impl LocalClient {
     pub fn device_stats(&mut self, mac: &str) -> Result<ResponseData> {
         let mut resp = self.list_devices()?;
         if let Some(mut json) = resp.json.clone()
-            && let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+            && let Some(arr) = list_payload_mut(&mut json)
         {
-            arr.retain(|item| item.get("mac").and_then(|m| m.as_str()) == Some(mac));
+            arr.retain(|item| {
+                item.get("mac")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(|value| mac_matches(value, mac))
+            });
             resp.body = serde_json::to_string(&json).unwrap_or(resp.body);
             resp.json = Some(json);
         }
@@ -485,7 +588,7 @@ impl LocalClient {
     pub fn vpn_health(&mut self) -> Result<ResponseData> {
         let mut resp = self.list_health()?;
         if let Some(mut json) = resp.json.clone() {
-            if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+            if let Some(arr) = list_payload_mut(&mut json) {
                 arr.retain(|item| {
                     item.get("subsystem")
                         .and_then(|v| v.as_str())
@@ -499,6 +602,7 @@ impl LocalClient {
         Ok(resp)
     }
 
+    #[cfg(test)]
     pub fn list_events(&mut self) -> Result<ResponseData> {
         // Legacy `stat/event` is gone on modern UniFi OS. The general event feed
         // now lives at `/proxy/network/v2/api/site/{site}/system-log/all` (POST,
@@ -522,7 +626,22 @@ impl LocalClient {
     /// met or the controller runs out of records, then report — via
     /// [`PagedFetch`] — whether anything was left behind.
     pub fn list_events_paged(&mut self, limit: usize) -> Result<(ResponseData, PagedFetch)> {
+        self.collect_event_pages(limit, false)
+    }
+
+    /// Preserve the controller's first-page JSON envelope for legacy exports.
+    pub fn export_events_paged(&mut self, limit: usize) -> Result<(ResponseData, PagedFetch)> {
+        self.collect_event_pages(limit, true)
+    }
+
+    fn collect_event_pages(
+        &mut self,
+        limit: usize,
+        preserve_shape: bool,
+    ) -> Result<(ResponseData, PagedFetch)> {
         let mut collected: Vec<serde_json::Value> = Vec::new();
+        let mut first_shape = None;
+        let mut seen = std::collections::HashSet::new();
         let mut total_available: Option<usize> = None;
         let mut page_size = limit.clamp(1, SYSTEM_LOG_MAX_PAGE_SIZE);
         // Page numbering is 0-based: page 0 holds the newest records.
@@ -545,23 +664,37 @@ impl LocalClient {
             // half-filled page.
             let resp = self.system_log_all(Some(&payload))?;
 
-            let json = match resp.json.clone() {
-                Some(j) => j,
-                None => {
-                    last_resp = Some(resp);
-                    break;
-                }
-            };
+            let json = resp
+                .json
+                .as_ref()
+                .ok_or_else(|| anyhow!("event page is missing a JSON response"))?;
             if let Some(total) = json
                 .get("total_element_count")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
             {
+                if total_available.is_some_and(|previous| previous != total) {
+                    return Err(anyhow!(
+                        "event inventory changed during pagination; retry the read"
+                    ));
+                }
                 total_available = Some(total);
             }
-            let page_items = list_payload(&json).cloned().unwrap_or_default();
+            let page_items = collection_payload(json)?;
+            if preserve_shape && first_shape.is_none() {
+                first_shape = Some(json.clone());
+            }
             let got = page_items.len();
-            collected.extend(page_items);
+            for item in page_items {
+                let identity = item.get("_id").or_else(|| item.get("id"));
+                let key = serde_json::to_string(identity.unwrap_or(item))?;
+                if !seen.insert(key) {
+                    return Err(anyhow!(
+                        "event pagination repeated a record; incomplete or unstable inventory"
+                    ));
+                }
+                collected.push(item.clone());
+            }
             last_resp = Some(resp);
 
             if got == 0 {
@@ -575,7 +708,9 @@ impl LocalClient {
             // A controller that clamps `pageSize` below what we asked for would
             // otherwise leave holes in the next page's offset window — adopt
             // the size it actually honored so paging stays contiguous.
-            if got < page_size {
+            // Changing pageSize after offset zero moves pageNumber * pageSize
+            // backwards and can repeat records from earlier pages.
+            if page_number == 0 && got < page_size {
                 page_size = got;
             }
             page_number += 1;
@@ -587,16 +722,27 @@ impl LocalClient {
             json: Some(serde_json::json!({ "data": [] })),
         });
 
+        let observed = collected.len();
         collected.truncate(limit);
         let returned = collected.len();
 
-        let mut json = resp.json.clone().unwrap_or_else(|| serde_json::json!({}));
-        if !json.is_object() {
-            json = serde_json::json!({});
+        let mut json = first_shape
+            .or_else(|| resp.json.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if preserve_shape && json.is_array() {
+            json = serde_json::Value::Array(collected);
+        } else {
+            if !json.is_object() {
+                json = serde_json::json!({});
+            }
+            json["data"] = serde_json::Value::Array(collected);
+            if !preserve_shape || json.get("page_number").is_some() {
+                json["page_number"] = serde_json::json!(0);
+            }
+            if !preserve_shape || json.get("page_size").is_some() {
+                json["page_size"] = serde_json::json!(returned);
+            }
         }
-        json["data"] = serde_json::Value::Array(collected);
-        json["page_number"] = serde_json::json!(0);
-        json["page_size"] = serde_json::json!(returned);
         resp.body = serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
         resp.json = Some(json);
 
@@ -605,6 +751,7 @@ impl LocalClient {
         let stats = PagedFetch {
             requested: limit,
             returned,
+            observed,
             total_available,
             truncated,
         };
@@ -876,6 +1023,20 @@ impl LocalClient {
         body: Option<&B>,
     ) -> Result<ResponseData> {
         self.ensure_login()?;
+        if !is_read_operation(&method, path) {
+            if self.cached_session_unverified {
+                let sites = self
+                    .list_sites()
+                    .context("validating cached session before write")?;
+                let value = sites
+                    .json
+                    .as_ref()
+                    .context("missing session preflight JSON")?;
+                collection_payload(value).context("invalid session preflight site list")?;
+                self.cached_session_unverified = false;
+            }
+            return self.mutate_once(&method, site_scoped, path, query, body);
+        }
         let urls = self.build_urls(site_scoped, fallback_global, path)?;
 
         let send_once = |mut r: reqwest::blocking::RequestBuilder,
@@ -893,6 +1054,11 @@ impl LocalClient {
         let mut last_err: Option<anyhow::Error> = None;
 
         for url in urls {
+            if url.origin() != self.base_url.origin() {
+                return Err(anyhow!(
+                    "read candidate changed the configured controller origin"
+                ));
+            }
             let mut resp = send_once(
                 self.build_request(&method, &url, query, body),
                 &self.csrf,
@@ -943,13 +1109,41 @@ impl LocalClient {
                     let status = status.as_u16();
                     let text = res.text().context("reading response body")?;
 
-                    // Validate that the response is actually JSON, not HTML
-                    // If parsing fails and response looks like HTML, try next URL
-                    let json = serde_json::from_str(&text).ok();
-                    if json.is_none() && text.trim_start().starts_with("<!doctype") {
-                        last_err = Some(anyhow!("received HTML instead of JSON at {}", url));
+                    // Some controller generations serve the UI at an unsupported
+                    // API route. Only this read-only loop may try the next known
+                    // same-origin candidate; HTML is never a successful result.
+                    let trimmed = text.trim_start();
+                    if ["<!doctype html", "<html"].iter().any(|prefix| {
+                        trimmed
+                            .get(..prefix.len())
+                            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+                    }) {
+                        last_err = Some(anyhow!(
+                            "controller returned an HTML page instead of API JSON; response body omitted"
+                        ));
                         continue;
                     }
+                    let mut value: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|_| anyhow!("invalid controller JSON response"))?;
+                    if !value.is_object() && !value.is_array() {
+                        return Err(anyhow!("invalid controller JSON response"));
+                    }
+                    if let Some(rc) = value.get("meta").and_then(|meta| meta.get("rc"))
+                        && rc.as_str() != Some("ok")
+                    {
+                        return Err(anyhow!(
+                            "controller reported an application error; response body omitted"
+                        ));
+                    }
+                    if expects_collection(&method, path) {
+                        collection_payload(&value)?;
+                    }
+                    // Locally generated metadata is never sourced from a controller.
+                    // Keep the original response body for the lossless raw format.
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("_unifictl");
+                    }
+                    let json = Some(value);
 
                     return Ok(ResponseData {
                         status,
@@ -979,6 +1173,102 @@ impl LocalClient {
         }
 
         Err(last_err.unwrap_or_else(|| anyhow!("request failed")))
+    }
+
+    /// Select a route before submission. Never discover write routes by replaying
+    /// a request: even a proxy's 404/405 can follow a forwarded mutation.
+    fn mutate_once<Q: Serialize + ?Sized, B: Serialize + ?Sized>(
+        &mut self,
+        method: &Method,
+        site_scoped: bool,
+        path: &str,
+        query: Option<&Q>,
+        body: Option<&B>,
+    ) -> Result<ResponseData> {
+        let modern_v2 = !self.is_legacy
+            && site_scoped
+            && !["rest/", "cmd/", "stat/", "list/", "self/", "integration/"]
+                .iter()
+                .any(|prefix| path.starts_with(prefix));
+        let url = if modern_v2 {
+            self.base_url
+                .join(&format!("proxy/network/v2/api/site/{}/{}", self.site, path))?
+        } else {
+            self.build_urls(site_scoped, false, path)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no mutation route available"))?
+        };
+        let mut request = self.build_request(method, &url, query, body);
+        if let Some(token) = &self.csrf {
+            request = request.header("X-CSRF-Token", token);
+        }
+        if let Some(cookie) = &self.session_cookie {
+            request = request.header(COOKIE, cookie);
+        }
+        let response = request
+            .send()
+            .map_err(|_| unknown_write("mutation response unavailable"))?;
+        let status = response.status();
+        if !status.is_success() {
+            if status.is_server_error()
+                || status.is_redirection()
+                || matches!(
+                    status,
+                    StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                )
+            {
+                return Err(unknown_write(&format!(
+                    "mutation returned HTTP {}",
+                    status.as_u16()
+                )));
+            }
+            if status == StatusCode::UNAUTHORIZED {
+                self.logged_in = false;
+                self.session_cookie = None;
+                self.csrf = None;
+                session::clear();
+            }
+            return Err(WriteFailure {
+                unknown: false,
+                stop_batch: matches!(
+                    status,
+                    StatusCode::UNAUTHORIZED
+                        | StatusCode::FORBIDDEN
+                        | StatusCode::TOO_MANY_REQUESTS
+                ),
+                message: format!(
+                    "mutation rejected: HTTP {}; request was not retried",
+                    status.as_u16()
+                ),
+            }
+            .into());
+        }
+        let text = response
+            .text()
+            .map_err(|_| unknown_write("mutation response body incomplete"))?;
+        let json = if status == StatusCode::NO_CONTENT && text.is_empty() {
+            None
+        } else {
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|_| unknown_write("invalid mutation JSON response"))?;
+            if !value.is_object() && !value.is_array() {
+                return Err(unknown_write("invalid mutation JSON response"));
+            }
+            if let Some(rc) = value.get("meta").and_then(|meta| meta.get("rc"))
+                && rc.as_str() != Some("ok")
+            {
+                return Err(anyhow!(
+                    "controller reported an application error; response body omitted"
+                ));
+            }
+            Some(value)
+        };
+        Ok(ResponseData {
+            status: status.as_u16(),
+            body: text,
+            json,
+        })
     }
 
     fn ensure_login(&mut self) -> Result<()> {
@@ -2648,5 +2938,553 @@ mod tests {
             result.is_err(),
             "an API failure must propagate, not silently return a short page"
         );
+    }
+
+    #[test]
+    fn later_short_event_page_never_changes_the_offset() {
+        let server = MockServer::start();
+        login_mock(&server);
+        let first = server.mock(|when, then| {
+            when.method(POST)
+                .path_contains("system-log/all")
+                .json_body(json!({"pageSize":1000,"pageNumber":0}));
+            then.status(200).json_body(json!({"data":events(0,1000)}));
+        });
+        let short = server.mock(|when, then| {
+            when.method(POST)
+                .path_contains("system-log/all")
+                .json_body(json!({"pageSize":1000,"pageNumber":1}));
+            then.status(200).json_body(json!({"data":events(1000,5)}));
+        });
+        let end = server.mock(|when, then| {
+            when.method(POST)
+                .path_contains("system-log/all")
+                .json_body(json!({"pageSize":1000,"pageNumber":2}));
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let (response, stats) = client.list_events_paged(1010).unwrap();
+        assert_eq!(stats.returned, 1005);
+        assert!(!stats.truncated);
+        let values = response.json.unwrap();
+        assert_eq!(values["data"][1004]["key"], "EVT_1004");
+        first.assert_hits(1);
+        short.assert_hits(1);
+        end.assert_hits(1);
+    }
+
+    #[test]
+    fn event_pagination_rejects_wrong_shape_and_repeated_records() {
+        for body in [
+            json!({"unexpected":[]}),
+            json!({"data":[{"id":"repeat"}],"total_element_count":3}),
+        ] {
+            let server = MockServer::start();
+            login_mock(&server);
+            let page = server.mock(|when, then| {
+                when.method(POST).path_contains("system-log/all");
+                then.status(200).json_body(body.clone());
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            assert!(client.list_events_paged(3).is_err());
+            assert!(page.hits() <= 2);
+        }
+    }
+
+    #[test]
+    fn event_pagination_rejects_changed_reported_total() {
+        let server = MockServer::start();
+        login_mock(&server);
+        let first = server.mock(|when, then| {
+            when.method(POST)
+                .path_contains("system-log/all")
+                .json_body(json!({"pageSize":3,"pageNumber":0}));
+            then.status(200)
+                .json_body(json!({"data":[{"id":"first"}],"total_element_count":3}));
+        });
+        let changed = server.mock(|when, then| {
+            when.method(POST)
+                .path_contains("system-log/all")
+                .json_body(json!({"pageSize":1,"pageNumber":1}));
+            then.status(200)
+                .json_body(json!({"data":[{"id":"second"}],"total_element_count":4}));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        assert!(
+            client
+                .list_events_paged(3)
+                .unwrap_err()
+                .to_string()
+                .contains("inventory changed")
+        );
+        first.assert_hits(1);
+        changed.assert_hits(1);
+    }
+
+    #[test]
+    fn lost_headers_and_truncated_write_body_are_unknown_without_replay() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Instant;
+        for partial_body in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let submitted = Arc::new(AtomicUsize::new(0));
+            let count = submitted.clone();
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(400);
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            socket
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .unwrap();
+                            let mut received = [0; 4096];
+                            if socket.read(&mut received).unwrap_or(0) > 0 {
+                                count.fetch_add(1, Ordering::SeqCst);
+                                if partial_body {
+                                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").unwrap();
+                                }
+                            }
+                            let _ = socket.shutdown(Shutdown::Both);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("synthetic server failed: {error}"),
+                    }
+                }
+            });
+            let mut client =
+                LocalClient::new(&format!("http://{address}"), "u", "p", "default", true).unwrap();
+            client.logged_in = true;
+            let error = client
+                .create_network(&json!({"name":"test"}))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("outcome=unknown"), "{error}");
+            server.join().unwrap();
+            assert_eq!(submitted.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn mutations_submit_once_on_http_failures_and_stop_unsafe_batches() {
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            for status in [400, 401, 403, 404, 405, 409, 429, 500, 307] {
+                let server = MockServer::start();
+                let login = login_mock(&server);
+                let primary = server.mock(|when, then| {
+                    when.path("/proxy/network/api/s/default/rest/networkconf");
+                    then.status(status)
+                        .header("Retry-After", "0")
+                        .header("Location", server.url("/redirected"))
+                        .body("synthetic-private-body");
+                });
+                let alternate = server.mock(|when, then| {
+                    when.path("/proxy/network/v2/api/site/default/rest/networkconf");
+                    then.status(200).json_body(json!({"ok":true}));
+                });
+                let redirected = server.mock(|when, then| {
+                    when.path("/redirected");
+                    then.status(200).json_body(json!({"ok":true}));
+                });
+                let mut client =
+                    LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+                let error = client
+                    .request::<(), serde_json::Value>(
+                        method.clone(),
+                        true,
+                        false,
+                        "rest/networkconf",
+                        None,
+                        Some(&json!({"name":"synthetic"})),
+                    )
+                    .unwrap_err();
+                assert_eq!(should_stop_batch(&error), !matches!(status, 400 | 409));
+                assert!(!error.to_string().contains("synthetic-private-body"));
+                login.assert_hits(1);
+                primary.assert_hits(1);
+                alternate.assert_hits(0);
+                redirected.assert_hits(0);
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_success_requires_valid_json_or_empty_204() {
+        for (status, body, valid, ambiguous) in [
+            (200, "not-json", false, true),
+            (200, "null", false, true),
+            (200, r#"{"meta":{"rc":"error"},"data":[]}"#, false, false),
+            (200, r#"{"id":"accepted"}"#, true, false),
+            (204, "", true, false),
+        ] {
+            let server = MockServer::start();
+            login_mock(&server);
+            let response = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/proxy/network/v2/api/site/default/static-dns");
+                then.status(status).body(body);
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            let result = client.create_dns_record(&json!({"key":"synthetic.invalid"}));
+            assert_eq!(result.is_ok(), valid);
+            if let Err(error) = result {
+                assert_eq!(should_stop_batch(&error), ambiguous);
+            }
+            response.assert_hits(1);
+        }
+    }
+
+    #[test]
+    fn timed_out_write_is_unknown_without_retry() {
+        let server = MockServer::start();
+        let response = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/api/s/default/rest/networkconf");
+            then.status(200)
+                .delay(Duration::from_millis(200))
+                .json_body(json!({"ok":true}));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        client.logged_in = true;
+        client.http = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_millis(40))
+            .build()
+            .unwrap();
+        let error = client.create_network(&json!({"name":"test"})).unwrap_err();
+        assert!(should_stop_batch(&error));
+        assert!(error.to_string().contains("outcome=unknown"));
+        response.assert_hits(1);
+    }
+    #[test]
+    fn event_pagination_records_observed_rows_before_limit() {
+        let server = MockServer::start();
+        login_mock(&server);
+        let page = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/v2/api/site/default/system-log/all");
+            then.status(200)
+                .json_body(json!({"data":[{"id":"one"},{"id":"two"}]}));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let (response, stats) = client.list_events_paged(1).unwrap();
+        assert_eq!(stats.returned, 1);
+        assert_eq!(stats.observed, 2);
+        assert_eq!(response.json.unwrap()["data"].as_array().unwrap().len(), 1);
+        page.assert_hits(1);
+    }
+    #[test]
+    fn collection_contract_rejects_error_envelopes_but_accepts_valid_empty_arrays() {
+        for value in [
+            json!([]),
+            json!({"data":[]}),
+            json!({"meta":{"rc":"ok"},"data":[]}),
+        ] {
+            assert!(collection_payload(&value).unwrap().is_empty());
+        }
+        for value in [
+            json!({"meta":{"rc":"error","message":"synthetic-private-body"},"data":[]}),
+            json!({"error":"synthetic-private-body"}),
+            json!({"data":null}),
+        ] {
+            let error = collection_payload(&value).unwrap_err();
+            assert!(!error.to_string().contains("synthetic-private-body"));
+        }
+    }
+    #[test]
+    fn stale_session_refreshes_on_a_read_before_one_mutation() {
+        let server = MockServer::start();
+        let stale = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/self/sites")
+                .header("X-CSRF-Token", "expired");
+            then.status(401);
+        });
+        let login = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "fresh")
+                .json_body(json!({"ok":true}));
+        });
+        let fresh = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/self/sites")
+                .header("X-CSRF-Token", "fresh");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let write = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/api/s/default/cmd/devmgr")
+                .header("X-CSRF-Token", "fresh");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        client.logged_in = true;
+        client.cached_session_unverified = true;
+        client.csrf = Some("expired".into());
+        client
+            .device_action("00:11:22:33:44:55", "restart")
+            .unwrap();
+        stale.assert();
+        login.assert();
+        fresh.assert();
+        write.assert();
+    }
+    #[test]
+    fn collection_contract_is_explicit_and_method_specific() {
+        for path in [
+            "self/sites",
+            "stat/device",
+            "stat/sta",
+            "clients/active",
+            "clients/history",
+            "list/alarm",
+            "stat/health",
+            "rest/networkconf",
+            "static-dns",
+            "rest/wlanconf",
+            "rest/portconf",
+            "rest/firewallrule",
+            "rest/firewallgroup",
+            "rest/routing",
+            "firewall/zone",
+            "object-oriented-network-configs",
+        ] {
+            assert!(expects_collection(&Method::GET, path), "{path}");
+            for method in [Method::POST, Method::PUT, Method::DELETE] {
+                assert!(!expects_collection(&method, path), "{method} {path}");
+            }
+        }
+        for path in [
+            "system-log/all",
+            "system-log/critical",
+            "system-log/device-alert",
+            "system-log/admin-activity",
+        ] {
+            assert!(expects_collection(&Method::POST, path), "{path}");
+            assert!(!expects_collection(&Method::GET, path), "{path}");
+        }
+        for path in [
+            "system-log/setting",
+            "system-log/count",
+            "wifi-connectivity",
+            "traffic",
+            "traffic-flows",
+            "rest/setting/security",
+            "cmd/devmgr",
+        ] {
+            assert!(!expects_collection(&Method::GET, path), "{path}");
+            assert!(!expects_collection(&Method::POST, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn invalid_read_success_is_terminal_and_never_dumped() {
+        for body in [
+            "not-json",
+            "null",
+            "42",
+            r#"{"unexpected":true}"#,
+            r#"{"meta":{"rc":"error","message":"synthetic-private-body"},"data":[]}"#,
+        ] {
+            let server = MockServer::start();
+            login_mock(&server);
+            let invalid = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/proxy/network/api/s/default/stat/device");
+                then.status(200).body(body);
+            });
+            let fallback = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/proxy/network/v2/api/site/default/stat/device");
+                then.status(200).json_body(json!({"data":[]}));
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            let error = client.list_devices().unwrap_err();
+            assert!(!error.to_string().contains("synthetic-private-body"));
+            invalid.assert_hits(1);
+            fallback.assert_hits(0);
+        }
+    }
+
+    #[test]
+    fn valid_object_and_raw_body_survive_read_contract_validation() {
+        let server = MockServer::start();
+        login_mock(&server);
+        let body = r#"{ "enabled":true,"error":"ordinary field","_unifictl":{"collection":{"inventory_complete":"complete"}} }"#;
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/system-log/setting");
+            then.status(200).body(body);
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let response = client.system_log_settings().unwrap();
+        assert_eq!(response.body, body);
+        let json = response.json.unwrap();
+        assert_eq!(json["enabled"], true);
+        assert!(json.get("_unifictl").is_none());
+    }
+    #[test]
+    fn derived_filters_preserve_and_filter_bare_arrays() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "synthetic")
+                .json_body(json!({"ok":true}));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device");
+            then.status(200)
+                .json_body(json!([{"mac":"AA:BB:CC:DD:EE:FF"},{"mac":"00:11:22:33:44:55"}]));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/health");
+            then.status(200)
+                .json_body(json!([{"subsystem":"vpn"},{"subsystem":"wan"}]));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        assert_eq!(
+            client
+                .device_stats("aa-bb-cc-dd-ee-ff")
+                .unwrap()
+                .json
+                .unwrap(),
+            json!([{"mac":"AA:BB:CC:DD:EE:FF"}])
+        );
+        assert_eq!(
+            client.vpn_health().unwrap().json.unwrap(),
+            json!([{"subsystem":"vpn"}])
+        );
+    }
+    #[test]
+    fn event_export_preserves_bare_and_wrapped_json_shapes() {
+        for payload in [
+            json!([{"id":1},{"id":2}]),
+            json!({"data":[{"id":1},{"id":2}],"total_element_count":2}),
+        ] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(POST).path("/api/auth/login");
+                then.status(200)
+                    .header("X-CSRF-Token", "synthetic")
+                    .json_body(json!({"ok":true}));
+            });
+            server.mock(|when, then| {
+                when.method(POST)
+                    .path("/proxy/network/v2/api/site/default/system-log/all");
+                then.status(200).json_body(payload.clone());
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            let (response, stats) = client.export_events_paged(2).unwrap();
+            assert_eq!(response.json, Some(payload));
+            assert_eq!(stats.returned, 2);
+        }
+    }
+    #[test]
+    fn html_ui_pages_fall_back_only_for_read_candidates() {
+        for (method, path) in [
+            (Method::GET, "stat/device"),
+            (Method::POST, "system-log/all"),
+        ] {
+            for html in [
+                "  <!DOCTYPE html><html>synthetic-private-ui</html>",
+                "<html>synthetic-private-ui</html>",
+            ] {
+                let server = MockServer::start();
+                let login = login_mock(&server);
+                let primary = server.mock(|when, then| {
+                    when.path(format!("/proxy/network/api/s/default/{path}"));
+                    then.status(200).body(html);
+                });
+                let fallback = server.mock(|when, then| {
+                    when.path(format!("/proxy/network/v2/api/site/default/{path}"));
+                    then.status(200).json_body(json!({"data":[]}));
+                });
+                let mut client =
+                    LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+                let response = client
+                    .request::<(), serde_json::Value>(
+                        method.clone(),
+                        true,
+                        false,
+                        path,
+                        None,
+                        Some(&json!({})),
+                    )
+                    .unwrap();
+                assert_eq!(response.json, Some(json!({"data":[]})));
+                assert!(!response.body.contains("synthetic-private-ui"));
+                login.assert_hits(1);
+                primary.assert_hits(1);
+                fallback.assert_hits(1);
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_html_read_candidates_fail_without_auth_refresh_or_body_disclosure() {
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let pages = server.mock(|when, then| {
+            when.method(GET).path_contains("stat/device");
+            then.status(200)
+                .body("<!doctype html><html>synthetic-private-ui</html>");
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let error = client.list_devices().unwrap_err().to_string();
+        assert!(error.contains("HTML page"));
+        assert!(!error.contains("synthetic-private-ui"));
+        login.assert_hits(1);
+        pages.assert_hits(4);
+    }
+
+    #[test]
+    fn html_mutation_response_is_unknown_and_never_replayed() {
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            let server = MockServer::start();
+            let login = login_mock(&server);
+            let primary = server.mock(|when, then| {
+                when.path("/proxy/network/api/s/default/rest/networkconf");
+                then.status(200)
+                    .body("<!doctype html><html>synthetic-private-ui</html>");
+            });
+            let fallback = server.mock(|when, then| {
+                when.path("/proxy/network/v2/api/site/default/rest/networkconf");
+                then.status(200).json_body(json!({"ok":true}));
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            let error = client
+                .request::<(), serde_json::Value>(
+                    method,
+                    true,
+                    false,
+                    "rest/networkconf",
+                    None,
+                    Some(&json!({})),
+                )
+                .unwrap_err();
+            assert!(write_outcome_unknown(&error));
+            assert!(should_stop_batch(&error));
+            assert!(!error.to_string().contains("synthetic-private-ui"));
+            login.assert_hits(1);
+            primary.assert_hits(1);
+            fallback.assert_hits(0);
+        }
     }
 }
