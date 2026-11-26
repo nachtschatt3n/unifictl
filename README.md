@@ -477,7 +477,7 @@ Omitting `--password` causes an interactive prompt with hidden input — this is
 
 **File permissions**: `config.yaml` holds the controller password and API key, so `unifictl` creates and rewrites it owner-only (mode `0600`, the same way it writes `session.json`) and keeps the user config directory at `0700`. A config file left world-readable by an older release is tightened to `0600` the first time it is read, with a one-line notice on stderr. This applies on Unix (Linux/macOS); on Windows the file inherits the directory's ACL as before.
 
-**Note**: TLS verification is disabled by default for self-signed certificates. Use `--verify-tls` if your controller has a valid certificate.
+**Note**: New configurations verify TLS by default. Use `--ca-file /path/to/ca.pem` for a private CA, or explicitly select `--insecure`. Existing `verify_tls: false` settings remain supported with a warning. See [TLS/session migration](docs/TLS_SESSION_MIGRATION.md) for the unreleased changes after 5.7.0.
 
 ## Troubleshooting
 
@@ -521,7 +521,7 @@ In testing on a current UDM Pro, restarting `ulp-go` cleared `AUTHENTICATION_FAI
 
 **Port 8443 connectivity**: The tool automatically preserves port `:8443` for local controllers
 
-**Certificate errors**: Use the default (no `--verify-tls`) for self-signed certs
+**Certificate errors**: Configure the controller CA with `--ca-file`; `--insecure` is an explicit fallback when verification cannot be used.
 
 **Site parameter**: Commands default to configured site; override with `--site <NAME>`
 

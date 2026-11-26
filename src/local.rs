@@ -27,7 +27,7 @@ use std::time::Duration;
 pub struct LocalClient {
     base_url: Url,
     /// The controller URL exactly as configured (cache key; may differ from
-    /// `base_url` when login falls back from `:8443` to `:443`).
+    /// `base_url` (legacy cache entries may name a different resolved URL).
     configured_url: String,
     http: Client,
     username: String,
@@ -37,7 +37,34 @@ pub struct LocalClient {
     is_legacy: bool,
     csrf: Option<String>,
     session_cookie: Option<String>,
+    trust_profile: String,
+    refresh_used: bool,
+    auth_blocked: Option<ControllerFailure>,
+    port_fallback: bool,
+    cached_session_unverified: bool,
 }
+
+#[derive(Debug, Clone)]
+struct ControllerFailure {
+    status: Option<u16>,
+    message: String,
+}
+
+impl std::fmt::Display for ControllerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(status) = self.status {
+            write!(f, "{} (HTTP {status})", self.message)
+        } else {
+            f.write_str(&self.message)
+        }
+    }
+}
+
+impl std::error::Error for ControllerFailure {}
+
+#[derive(Debug, thiserror::Error)]
+#[error("login connection failed before a request could be sent")]
+struct LoginUnavailable;
 
 // Hand-written Debug so credentials and session tokens never leak into logs,
 // panic messages, or error chains.
@@ -141,6 +168,22 @@ pub struct PagedFetch {
 }
 
 impl LocalClient {
+    pub fn from_config(config: &crate::config::LocalEffectiveConfig) -> Result<Self> {
+        if !config.verify_tls {
+            eprintln!("unifictl: TLS verification disabled by explicit configuration (--insecure)");
+        }
+        Self::build(
+            &config.url,
+            &config.username,
+            &config.password,
+            &config.site,
+            config.verify_tls,
+            config.ca_file.as_deref(),
+            config.port_fallback,
+        )
+    }
+
+    #[cfg(test)]
     pub fn new(
         url: &str,
         username: &str,
@@ -148,17 +191,52 @@ impl LocalClient {
         site: &str,
         verify_tls: bool,
     ) -> Result<Self> {
-        let base_url = Url::parse(url).context("parsing local controller url")?;
+        Self::build(url, username, password, site, verify_tls, None, false)
+    }
+
+    fn build(
+        url: &str,
+        username: &str,
+        password: &str,
+        site: &str,
+        verify_tls: bool,
+        ca_file: Option<&std::path::Path>,
+        port_fallback: bool,
+    ) -> Result<Self> {
+        if site.is_empty()
+            || site.chars().any(|c| c.is_control() || "/\\%?#".contains(c))
+            || matches!(site, "." | "..")
+        {
+            return Err(anyhow!("invalid site identifier"));
+        }
+        let base_url = crate::config::validate_controller_url(url, !verify_tls || cfg!(test))?;
+        if ca_file.is_some() && !verify_tls {
+            return Err(anyhow!(
+                "a CA file requires TLS verification; remove --insecure/verify_tls: false"
+            ));
+        }
         let user_agent = UA.get_or_init(|| HeaderValue::from_static("unifictl-local/0.1"));
-        let http = Client::builder()
+        let mut builder = Client::builder()
             .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(!verify_tls)
             .user_agent(user_agent.clone())
-            .timeout(Duration::from_secs(10)) // Total request timeout
-            .connect_timeout(Duration::from_secs(5)) // Connection timeout
-            .build()
-            .context("building local HTTP client")?;
-
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5));
+        let mut ca_pem = Vec::new();
+        if let Some(path) = ca_file {
+            let pem = std::fs::read(path).context("reading controller CA file")?;
+            let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+                .context("parsing controller CA certificates (PEM required)")?;
+            if certificates.is_empty() {
+                return Err(anyhow!("controller CA file contains no certificates"));
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+            ca_pem = pem;
+        }
+        let http = builder.build().context("building local HTTP client")?;
         let mut client = Self {
             base_url,
             configured_url: url.to_string(),
@@ -170,6 +248,11 @@ impl LocalClient {
             is_legacy: false,
             csrf: None,
             session_cookie: None,
+            trust_profile: session::trust_profile(verify_tls, &ca_pem),
+            refresh_used: false,
+            auth_blocked: None,
+            port_fallback,
+            cached_session_unverified: false,
         };
         client.restore_cached_session();
         Ok(client)
@@ -177,23 +260,17 @@ impl LocalClient {
 
     /// Adopt a persisted session, if one is cached for this controller. The
     /// session is used optimistically: its validity is only confirmed on the
-    /// first request (a genuine 401/403 triggers exactly one re-login).
+    /// first read (a 401 allows one re-login; permission denial is terminal).
     fn restore_cached_session(&mut self) {
         if let Some(sess) = session::load(&self.configured_url, &self.username, &self.site) {
-            // Only adopt the cached resolved URL if it shares the configured
-            // controller's scheme and host. A tampered cache must not be able to
-            // redirect requests — or, via the 401 re-login path, the credential
-            // POST — to an attacker-controlled host. The port may legitimately
-            // differ (8443 -> 443 fallback), so it is not compared.
+            if sess.trust_profile.as_deref() != Some(&self.trust_profile) {
+                return;
+            }
+            // Cache entries never expand the configured destination, including
+            // port/path. Older 8443->443 fallback entries require a fresh login.
             let resolved = match Url::parse(&sess.resolved_url) {
-                Ok(u)
-                    if u.scheme() == self.base_url.scheme()
-                        && u.host_str() == self.base_url.host_str() =>
-                {
-                    u
-                }
-                // Untrusted or mismatched cache entry: ignore it and fall back
-                // to a fresh login against the configured URL.
+                Ok(u) if u == self.base_url => u,
+                Ok(u) if self.port_fallback && self.is_fallback_of_configured(&u) => u,
                 _ => return,
             };
             self.base_url = resolved;
@@ -201,7 +278,15 @@ impl LocalClient {
             self.session_cookie = sess.session_cookie;
             self.is_legacy = sess.is_legacy;
             self.logged_in = true;
+            self.cached_session_unverified = true;
         }
+    }
+
+    /// True when `u` is the configured `:8443` URL moved to port 443 and the
+    /// user opted in to that fallback.
+    fn is_fallback_of_configured(&self, u: &Url) -> bool {
+        let mut alt = self.base_url.clone();
+        self.base_url.port() == Some(8443) && alt.set_port(Some(443)).is_ok() && *u == alt
     }
 
     /// Persist the current authenticated session to the on-disk cache
@@ -216,6 +301,7 @@ impl LocalClient {
             csrf: self.csrf.clone(),
             session_cookie: self.session_cookie.clone(),
             created_at: session::now_secs(),
+            trust_profile: Some(self.trust_profile.clone()),
         });
     }
 
@@ -876,6 +962,9 @@ impl LocalClient {
         body: Option<&B>,
     ) -> Result<ResponseData> {
         self.ensure_login()?;
+        if method != Method::GET {
+            self.prepare_session_for_write()?;
+        }
         let urls = self.build_urls(site_scoped, fallback_global, path)?;
 
         let send_once = |mut r: reqwest::blocking::RequestBuilder,
@@ -903,9 +992,10 @@ impl LocalClient {
             // A 429 (rate limit) or a network timeout must NEVER reach this
             // branch — re-authenticating on a 429 extends the per-IP lockout.
             if let Ok(r) = &resp
-                && matches!(r.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                && r.status() == StatusCode::UNAUTHORIZED
+                && method == Method::GET
             {
-                self.force_relogin()?;
+                self.refresh_after_unauthorized()?;
                 resp = send_once(
                     self.build_request(&method, &url, query, body),
                     &self.csrf,
@@ -936,6 +1026,21 @@ impl LocalClient {
                         let body = res.text().unwrap_or_default();
                         let msg =
                             Self::format_error_message(&method, path, status, &body, url.as_str());
+                        if matches!(
+                            status,
+                            StatusCode::UNAUTHORIZED
+                                | StatusCode::FORBIDDEN
+                                | StatusCode::TOO_MANY_REQUESTS
+                        ) {
+                            let failure = ControllerFailure {
+                                status: Some(status.as_u16()),
+                                message: msg,
+                            };
+                            if status == StatusCode::UNAUTHORIZED {
+                                self.auth_blocked = Some(failure.clone());
+                            }
+                            return Err(failure.into());
+                        }
                         last_err = Some(anyhow!(msg));
                         continue;
                     }
@@ -981,7 +1086,48 @@ impl LocalClient {
         Err(last_err.unwrap_or_else(|| anyhow!("request failed")))
     }
 
+    /// A cached token must prove liveness with a safe read before any write.
+    fn prepare_session_for_write(&mut self) -> Result<()> {
+        if self.cached_session_unverified {
+            self.cached_session_unverified = false;
+            let result = self.list_sites().and_then(|response| {
+                let rejected = response
+                    .json
+                    .as_ref()
+                    .and_then(|json| json.pointer("/meta/rc"))
+                    .is_some_and(|rc| rc.as_str() != Some("ok"));
+                if rejected || response.json.as_ref().and_then(list_payload).is_none() {
+                    return Err(anyhow!("session preflight returned an invalid site list"));
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                self.cached_session_unverified = true;
+                return Err(error.context("validating cached session before write"));
+            }
+        }
+        Ok(())
+    }
+
+    /// One refresh for the entire client, including multi-request commands.
+    fn refresh_after_unauthorized(&mut self) -> Result<()> {
+        if self.refresh_used {
+            let failure = ControllerFailure {
+                status: Some(401),
+                message: "authentication rejected after one refresh; credentials were not retried"
+                    .into(),
+            };
+            self.auth_blocked = Some(failure.clone());
+            return Err(failure.into());
+        }
+        self.refresh_used = true;
+        self.force_relogin()
+    }
+
     fn ensure_login(&mut self) -> Result<()> {
+        if let Some(failure) = &self.auth_blocked {
+            return Err(failure.clone().into());
+        }
         if self.logged_in {
             return Ok(());
         }
@@ -989,82 +1135,129 @@ impl LocalClient {
     }
 
     fn force_relogin(&mut self) -> Result<()> {
+        if let Some(failure) = &self.auth_blocked {
+            return Err(failure.clone().into());
+        }
         self.logged_in = false;
         self.csrf = None;
         self.session_cookie = None;
         // Invalidate the stale on-disk session; login() rewrites it on success.
-        session::clear();
+        session::clear_identity(&self.configured_url, &self.username, &self.site);
         self.login()
     }
 
+    /// Validate the supplied password, never just the cached session.
+    pub fn validate_credentials(&mut self) -> Result<ResponseData> {
+        self.force_relogin()?;
+        self.list_sites()
+    }
+
     fn login(&mut self) -> Result<()> {
+        if let Some(failure) = &self.auth_blocked {
+            return Err(failure.clone().into());
+        }
+        match self.login_once() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let failure = error
+                    .downcast_ref::<ControllerFailure>()
+                    .cloned()
+                    .unwrap_or_else(|| ControllerFailure {
+                        status: None,
+                        message: error.to_string(),
+                    });
+                self.auth_blocked = Some(failure.clone());
+                Err(failure.into())
+            }
+        }
+    }
+
+    fn login_once(&mut self) -> Result<()> {
         let creds = serde_json::json!({
             "username": self.username,
             "password": self.password,
             "remember": true,
             "strict": true,
         });
-        // Preserve the original port explicitly
-        let original_port = self.base_url.port();
+        // Login discovery is same-origin by default. A different port is a
+        // different authority, so the legacy `:8443` -> `:443` fallback only
+        // runs when the user opted in (`port_fallback`), and then only when the
+        // first authority is unreachable or has no login endpoint. A credential
+        // rejection or ambiguous response never submits the password elsewhere.
         let mut bases = vec![self.base_url.clone()];
-
-        // Only try port 443 alternative if we're using 8443
-        if original_port == Some(8443)
+        if self.port_fallback
+            && self.base_url.port() == Some(8443)
             && let Ok(mut alt) = Url::parse(self.base_url.as_str())
+            && alt.set_port(Some(443)).is_ok()
         {
-            let _ = alt.set_port(Some(443));
             bases.push(alt);
         }
+        let mut last_err = anyhow!("login endpoint unavailable (404/405)");
+        for base in bases {
+            match self.login_on(&base, &creds)? {
+                Ok(()) => return Ok(()),
+                Err(unavailable) => last_err = unavailable,
+            }
+        }
+        Err(last_err)
+    }
 
-        let auth_paths = [
+    /// Try every login path on one base URL. The outer `Result` is terminal
+    /// (credentials rejected, ambiguous response); the inner `Err` means this
+    /// authority offered no usable login endpoint, so the next one may be tried.
+    fn login_on(
+        &mut self,
+        base: &Url,
+        creds: &serde_json::Value,
+    ) -> Result<std::result::Result<(), anyhow::Error>> {
+        for path in [
             "api/auth/login",
             "proxy/network/api/auth/login",
             "auth/login",
             "api/login",
-        ];
-
-        let mut last_err: Option<anyhow::Error> = None;
-        for base in bases {
-            for path in auth_paths.iter() {
-                let url = match base.join(path) {
-                    Ok(u) => u,
-                    Err(e) => {
-                        last_err = Some(e.into());
-                        continue;
-                    }
-                };
-                let os_resp = self.request_login(&url, &creds);
-                match os_resp {
-                    Ok(resp) => {
-                        if !login_established(&resp) {
-                            last_err = Some(anyhow::anyhow!(
-                                "login succeeded at {} but no session cookie or CSRF token was returned",
-                                url
-                            ));
-                            continue;
-                        }
-                        self.base_url = base.clone();
-                        self.is_legacy = path.contains("api/login");
-                        self.logged_in = true;
-                        if let Some(token) = extract_csrf(&resp) {
-                            self.csrf = Some(token);
-                        }
-                        self.session_cookie = extract_session_cookie(&resp);
-                        self.persist_session();
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        if err.to_string().contains("HTTP 429") {
-                            return Err(anyhow::anyhow!("login failed at {}: {}", url, err));
-                        }
-                        last_err = Some(anyhow::anyhow!("login failed at {}: {}", url, err));
-                        continue;
-                    }
+        ] {
+            let url = base.join(path).context("building login endpoint")?;
+            let resp = match self.request_login(&url, creds) {
+                Ok(resp) => resp,
+                // Nothing was received, so nothing was accepted or rejected.
+                Err(err) if err.downcast_ref::<LoginUnavailable>().is_some() => {
+                    return Ok(Err(err));
                 }
+                Err(err) => return Err(err),
+            };
+            let status = resp.status();
+            if matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ) {
+                continue;
             }
+            if !status.is_success() {
+                return Err(ControllerFailure {
+                    status: Some(status.as_u16()),
+                    message: if status == StatusCode::TOO_MANY_REQUESTS {
+                        "login failed: HTTP 429; back off before retrying (see AUTHENTICATION_FAILED_LIMIT_REACHED in troubleshooting)".into()
+                    } else {
+                        format!("login failed: HTTP {}; credentials were not retried", status.as_u16())
+                    },
+                }
+                .into());
+            }
+            if !login_established(&resp) {
+                return Err(anyhow!(
+                    "login response did not establish a session; credentials were not retried"
+                ));
+            }
+            self.base_url = base.clone();
+            self.is_legacy = path == "api/login";
+            self.logged_in = true;
+            self.cached_session_unverified = false;
+            self.csrf = extract_csrf(&resp);
+            self.session_cookie = extract_session_cookie(&resp);
+            self.persist_session();
+            return Ok(Ok(()));
         }
-
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("login failed")))
+        Ok(Err(anyhow!("login endpoint unavailable (404/405)")))
     }
 
     fn request_login(
@@ -1072,8 +1265,7 @@ impl LocalClient {
         url: &Url,
         creds: &serde_json::Value,
     ) -> Result<reqwest::blocking::Response> {
-        let resp = self
-            .http
+        self.http
             .post(url.clone())
             .header(ACCEPT, HeaderValue::from_static("application/json"))
             .header(
@@ -1082,45 +1274,13 @@ impl LocalClient {
             )
             .json(creds)
             .send()
-            .context("sending login request")?;
-
-        // Detect HTTP -> HTTPS redirect: the POST body is dropped on redirect (301 becomes GET),
-        // so login appears to succeed but no session cookie is set, causing silent auth failure.
-        if url.scheme() == "http" && resp.url().scheme() == "https" {
-            let https_url = format!(
-                "https://{}{}",
-                url.host_str().unwrap_or("your-controller"),
-                url.port().map(|p| format!(":{p}")).unwrap_or_default()
-            );
-            eprintln!(
-                "Warning: controller at {url} redirected to HTTPS. \
-                 Update your controller URL to avoid authentication failures:\n  \
-                 unifictl login --controller-url \"{https_url}\" ..."
-            );
-            return Err(anyhow::anyhow!(
-                "controller redirected http:// to https:// — re-run login with https://"
-            ));
-        }
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
-            let detail = format_login_error(&body);
-            return Err(anyhow!(
-                "HTTP {} {}",
-                status.as_u16(),
-                if detail.is_empty() {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("login request failed")
-                        .to_string()
+            .map_err(|error| {
+                if error.is_connect() {
+                    LoginUnavailable.into()
                 } else {
-                    detail
+                    anyhow!("login transport failed; credentials were not retried")
                 }
-            ));
-        }
-
-        Ok(resp)
+            })
     }
 
     fn format_error_message(
@@ -1144,14 +1304,8 @@ impl LocalClient {
             // A 429 is rate limiting, NOT an expired session. Re-authenticating
             // here would extend the controller's per-IP login lockout, so this
             // must never be conflated with the 401 "session expired" path.
-            let detail = format_login_error(body);
-            let detail_line = if detail.is_empty() {
-                String::new()
-            } else {
-                format!("\n\nController: {detail}")
-            };
             return format!(
-                "Rate limited (429) at {url_str} - the controller is throttling requests, NOT a session expiry.{detail_line}\n\nWhat to do:\n  • Back off and retry after the rate-limit window; do NOT re-login on a 429 (it extends the per-IP lockout)\n  • Reads on a still-valid session can keep working - verify liveness with:\n      unifictl local health get"
+                "Rate limited (429) at {url_str} - the controller is throttling requests, NOT a session expiry.\n\nWhat to do:\n  • Back off and retry after the rate-limit window; do NOT re-login on a 429 (it extends the per-IP lockout)\n  • Reads on a still-valid session can keep working - verify liveness with:\n      unifictl local health get"
             );
         }
 
@@ -1404,28 +1558,6 @@ fn extract_session_cookie(resp: &reqwest::blocking::Response) -> Option<String> 
     })
 }
 
-fn format_login_error(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|json| {
-            let message = json
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string);
-            let code = json
-                .get("code")
-                .and_then(|c| c.as_str())
-                .map(str::to_string);
-            match (message, code) {
-                (Some(message), Some(code)) => Some(format!("{message} ({code})")),
-                (Some(message), None) => Some(message),
-                (None, Some(code)) => Some(code),
-                (None, None) => None,
-            }
-        })
-        .unwrap_or_else(|| body.trim().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1464,6 +1596,10 @@ mod tests {
     #[test]
     fn falls_back_to_legacy_paths() {
         let server = MockServer::start();
+        let modern_missing = server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(404);
+        });
         let legacy_login = server.mock(|when, then| {
             when.method(POST)
                 .path("/api/login")
@@ -1484,6 +1620,7 @@ mod tests {
         let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", false).unwrap();
         let resp = client.list_sites().unwrap();
 
+        modern_missing.assert();
         legacy_login.assert();
         sites.assert();
         assert_eq!(resp.status, 200);
@@ -1491,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn login_requires_session_artifacts_and_falls_back() {
+    fn login_without_session_artifacts_is_terminal() {
         let server = MockServer::start();
         let incomplete_login = server.mock(|when, then| {
             when.method(POST).path("/api/auth/login").json_body(
@@ -1517,29 +1654,12 @@ mod tests {
         });
 
         let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
-        let resp = client.list_devices().unwrap();
+        let error = client.list_devices().unwrap_err();
 
         incomplete_login.assert();
-        fallback_login.assert();
-        devices.assert();
-        assert_eq!(resp.status, 200);
-    }
-
-    #[test]
-    fn format_login_error_uses_controller_message_and_code() {
-        let msg = format_login_error(
-            r#"{"message":"You've reached the login attempt limit","code":"AUTHENTICATION_FAILED_LIMIT_REACHED"}"#,
-        );
-        assert_eq!(
-            msg,
-            "You've reached the login attempt limit (AUTHENTICATION_FAILED_LIMIT_REACHED)"
-        );
-    }
-
-    #[test]
-    fn format_login_error_falls_back_to_plain_text() {
-        let msg = format_login_error("plain text failure");
-        assert_eq!(msg, "plain text failure");
+        fallback_login.assert_hits(0);
+        devices.assert_hits(0);
+        assert!(error.to_string().contains("did not establish a session"));
     }
 
     #[test]
@@ -1566,6 +1686,7 @@ mod tests {
         legacy.assert_hits(0);
         assert!(err.contains("HTTP 429"));
         assert!(err.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
+        assert!(!err.contains("You've reached the login attempt limit"));
     }
 
     #[test]
@@ -1582,8 +1703,8 @@ mod tests {
         assert!(msg.contains("do NOT re-login"));
         assert!(msg.contains("unifictl local health get"));
         assert!(!msg.contains("Session expired"));
-        // Controller detail surfaced for triage.
-        assert!(msg.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
+        // Body details remain private even when the response is a rate limit.
+        assert!(!msg.contains("You've reached the login attempt limit"));
     }
 
     #[test]
@@ -1646,6 +1767,7 @@ mod tests {
             csrf: Some("stale".into()),
             session_cookie: None,
             created_at: session::now_secs(),
+            trust_profile: Some(session::trust_profile(true, &[])),
         })
         .unwrap();
 
@@ -1692,6 +1814,7 @@ mod tests {
             csrf: Some("abc".into()),
             session_cookie: None,
             created_at: session::now_secs(),
+            trust_profile: Some(session::trust_profile(true, &[])),
         })
         .unwrap();
 
@@ -1736,6 +1859,7 @@ mod tests {
             csrf: Some("evil".into()),
             session_cookie: Some("TOKEN=evil".into()),
             created_at: session::now_secs(),
+            trust_profile: Some(session::trust_profile(true, &[])),
         })
         .unwrap();
 
@@ -2648,5 +2772,406 @@ mod tests {
             result.is_err(),
             "an API failure must propagate, not silently return a short page"
         );
+    }
+    #[test]
+    fn port_fallback_is_off_by_default_and_only_maps_8443_to_443() {
+        let mut client =
+            LocalClient::new("https://example.test:8443/", "u", "p", "default", true).unwrap();
+        let alt = Url::parse("https://example.test:443/").unwrap();
+        assert!(!client.port_fallback);
+        assert!(client.is_fallback_of_configured(&alt));
+        assert!(!client.is_fallback_of_configured(&Url::parse("https://evil.test/").unwrap()));
+        client.base_url = Url::parse("https://example.test:9443/").unwrap();
+        assert!(!client.is_fallback_of_configured(&alt));
+    }
+    #[test]
+    fn cached_port_change_cannot_redirect_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        session::test_set_dir(dir.path());
+        let intended = MockServer::start();
+        let other_port = MockServer::start();
+        session::save(&session::CachedSession {
+            key_url: intended.base_url(),
+            resolved_url: other_port.base_url(),
+            username: "u".into(),
+            site: "default".into(),
+            is_legacy: false,
+            csrf: Some("untrusted-cached-token".into()),
+            session_cookie: None,
+            created_at: session::now_secs(),
+            trust_profile: Some(session::trust_profile(true, &[])),
+        })
+        .unwrap();
+        let login = login_mock(&intended);
+        let device = intended.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device")
+                .header("X-CSRF-Token", "abc123");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let forbidden = other_port.mock(|_, then| {
+            then.status(500);
+        });
+        let mut client = LocalClient::new(&intended.base_url(), "u", "p", "default", true).unwrap();
+        client.list_devices().unwrap();
+        login.assert_hits(1);
+        device.assert_hits(1);
+        forbidden.assert_hits(0);
+    }
+    #[test]
+    fn from_config_enforces_ca_and_target_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::LocalEffectiveConfig {
+            url: "https://controller.invalid/".into(),
+            username: "u".into(),
+            password: "p".into(),
+            site: "default".into(),
+            verify_tls: true,
+            ca_file: None,
+            port_fallback: false,
+        };
+        assert!(LocalClient::from_config(&config).is_ok());
+        config.ca_file = Some(temp.path().join("missing.pem"));
+        assert!(LocalClient::from_config(&config).is_err());
+        let invalid_ca = temp.path().join("invalid.pem");
+        std::fs::write(&invalid_ca, "synthetic-invalid-ca").unwrap();
+        config.ca_file = Some(invalid_ca);
+        assert!(LocalClient::from_config(&config).is_err());
+        config.verify_tls = false;
+        assert!(
+            LocalClient::from_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("requires TLS verification")
+        );
+        config.ca_file = None;
+        config.url = "https://user:secret@controller.invalid/".into();
+        assert!(LocalClient::from_config(&config).is_err());
+        config.url = "https://controller.invalid/".into();
+        config.site = "../other".into();
+        assert!(LocalClient::from_config(&config).is_err());
+    }
+    #[test]
+    fn cached_credentials_cannot_cross_tls_trust_profiles() {
+        for (cached_profile, current_verify) in [
+            (Some(session::trust_profile(true, &[])), false),
+            (Some(session::trust_profile(false, &[])), true),
+            (Some(session::trust_profile(true, b"old-custom-ca")), true),
+            (None, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            session::test_set_dir(dir.path());
+            let server = MockServer::start();
+            session::save(&session::CachedSession {
+                key_url: server.base_url(),
+                resolved_url: server.base_url(),
+                username: "u".into(),
+                site: "default".into(),
+                is_legacy: false,
+                csrf: None,
+                session_cookie: Some("TOKEN=synthetic-user-secret".into()),
+                created_at: session::now_secs(),
+                trust_profile: cached_profile,
+            })
+            .unwrap();
+            let login = server.mock(|when,then| {
+                when.method(POST).path("/api/auth/login")
+                    .json_body(json!({"username":"u","password":"untrusted-project-placeholder","remember":true,"strict":true}));
+                then.status(401);
+            });
+            let leak = server.mock(|when, then| {
+                when.header("Cookie", "TOKEN=synthetic-user-secret");
+                then.status(200).json_body(json!({"data":[]}));
+            });
+            let mut client = LocalClient::new(
+                &server.base_url(),
+                "u",
+                "untrusted-project-placeholder",
+                "default",
+                current_verify,
+            )
+            .unwrap();
+            assert!(client.list_devices().is_err());
+            login.assert_hits(1);
+            leak.assert_hits(0);
+        }
+    }
+    #[test]
+    fn session_trust_profile_changes_with_tls_policy_and_ca_contents() {
+        assert_eq!(
+            session::trust_profile(true, b"ca-a"),
+            session::trust_profile(true, b"ca-a")
+        );
+        assert_ne!(
+            session::trust_profile(true, b"ca-a"),
+            session::trust_profile(false, b"ca-a")
+        );
+        assert_ne!(
+            session::trust_profile(true, b"ca-a"),
+            session::trust_profile(true, b"ca-b")
+        );
+        assert_ne!(
+            session::trust_profile(true, b"ca-a"),
+            session::trust_profile(true, &[])
+        );
+    }
+    #[test]
+    fn persistent_401_blocks_later_operations_without_new_logins() {
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let health = server.mock(|when, then| {
+            when.method(GET).path_contains("stat/health");
+            then.status(401);
+        });
+        let later = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let error = client.list_health().unwrap_err().context("health source");
+        assert_eq!(
+            error.downcast_ref::<ControllerFailure>().unwrap().status,
+            Some(401)
+        );
+        assert!(client.list_devices().is_err());
+        assert!(client.list_sites().is_err());
+        assert!(client.validate_credentials().is_err());
+        login.assert_hits(2);
+        health.assert_hits(2);
+        later.assert_hits(0);
+    }
+    #[test]
+    fn successful_refresh_is_not_reset_by_the_next_operation() {
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let stale = server.mock(|when, then| {
+            when.method(GET)
+                .path_contains("stat/health")
+                .header("X-CSRF-Token", "stale");
+            then.status(401);
+        });
+        let healthy = server.mock(|when, then| {
+            when.method(GET)
+                .path_contains("stat/health")
+                .header("X-CSRF-Token", "abc123");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let expired = server.mock(|when, then| {
+            when.method(GET).path_contains("stat/device");
+            then.status(401);
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        client.logged_in = true;
+        client.csrf = Some("stale".into());
+        client.list_health().unwrap();
+        assert!(client.list_devices().is_err());
+        assert!(client.list_health().is_err());
+        login.assert_hits(1);
+        stale.assert_hits(1);
+        healthy.assert_hits(1);
+        expired.assert_hits(1);
+    }
+    #[test]
+    fn login_denial_is_latched_and_terminal_status_is_typed() {
+        for status in [401, 403, 429, 500] {
+            let server = MockServer::start();
+            let denied = server.mock(|when, then| {
+                when.method(POST).path("/api/auth/login");
+                then.status(status).body("synthetic-private-body");
+            });
+            let later = server.mock(|when, then| {
+                when.path("/proxy/network/api/auth/login");
+                then.status(200).json_body(json!({"data":[]}));
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            for result in [
+                client.list_health(),
+                client.list_devices(),
+                client.validate_credentials(),
+            ] {
+                let error = result.unwrap_err().context("source failed");
+                assert_eq!(
+                    error.downcast_ref::<ControllerFailure>().unwrap().status,
+                    Some(status)
+                );
+                assert!(!format!("{error:#}").contains("synthetic-private-body"));
+            }
+            denied.assert_hits(1);
+            later.assert_hits(0);
+        }
+    }
+
+    #[test]
+    fn cached_session_is_refreshed_before_write_not_by_replaying_write() {
+        let dir = tempfile::tempdir().unwrap();
+        session::test_set_dir(dir.path());
+        let server = MockServer::start();
+        session::save(&session::CachedSession {
+            key_url: server.base_url(),
+            resolved_url: server.base_url(),
+            username: "u".into(),
+            site: "default".into(),
+            is_legacy: false,
+            csrf: Some("stale".into()),
+            session_cookie: None,
+            created_at: session::now_secs(),
+            trust_profile: Some(session::trust_profile(true, &[])),
+        })
+        .unwrap();
+        let stale = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/self/sites")
+                .header("X-CSRF-Token", "stale");
+            then.status(401);
+        });
+        let login = login_mock(&server);
+        let fresh = server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/self/sites")
+                .header("X-CSRF-Token", "abc123");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let old_write = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/api/s/default/cmd/devmgr")
+                .header("X-CSRF-Token", "stale");
+            then.status(401);
+        });
+        let write = server.mock(|when, then| {
+            when.method(POST)
+                .path("/proxy/network/api/s/default/cmd/devmgr")
+                .header("X-CSRF-Token", "abc123");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        client
+            .device_action("00:11:22:33:44:55", "restart")
+            .unwrap();
+        stale.assert_hits(1);
+        login.assert_hits(1);
+        fresh.assert_hits(1);
+        old_write.assert_hits(0);
+        write.assert_hits(1);
+    }
+
+    #[test]
+    fn failed_cached_session_preflight_prevents_write() {
+        for status in [403, 429, 500] {
+            let server = MockServer::start();
+            let preflight = server.mock(|when, then| {
+                when.method(GET);
+                then.status(status);
+            });
+            let write = server.mock(|when, then| {
+                when.method(POST);
+                then.status(200).json_body(json!({"data":[]}));
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            client.logged_in = true;
+            client.cached_session_unverified = true;
+            client.csrf = Some("stale".into());
+            assert!(
+                client
+                    .device_action("00:11:22:33:44:55", "restart")
+                    .is_err()
+            );
+            assert!(preflight.hits() >= 1);
+            write.assert_hits(0);
+        }
+    }
+
+    #[test]
+    fn login_redirect_never_sends_credentials_to_other_origin() {
+        for status in [301, 302, 307, 308] {
+            let target = MockServer::start();
+            let leak = target.mock(|_, then| {
+                then.status(200).header("X-CSRF-Token", "wrong");
+            });
+            let source = MockServer::start();
+            let redirect = source.mock(|when, then| {
+                when.method(POST).path("/api/auth/login");
+                then.status(status).header("Location", target.url("/login"));
+            });
+            let mut client =
+                LocalClient::new(&source.base_url(), "u", "synthetic", "default", true).unwrap();
+            assert!(client.list_sites().is_err());
+            redirect.assert_hits(1);
+            leak.assert_hits(0);
+        }
+    }
+    #[test]
+    fn port_fallback_endpoint_requires_opt_in_and_stops_on_rejection() {
+        for (enabled, primary_status, succeeds) in [
+            (false, 404, false),
+            (true, 404, true),
+            (true, 401, false),
+            (true, 403, false),
+            (true, 429, false),
+            (true, 200, false),
+        ] {
+            let proxy = MockServer::start();
+            let primary = proxy.mock(|when, then| {
+                when.method(POST).header("Host", "controller.invalid:8443");
+                then.status(primary_status).json_body(json!({"ok":true}));
+            });
+            let alternate = proxy.mock(|when, then| {
+                when.method(POST)
+                    .path("/api/auth/login")
+                    .header("Host", "controller.invalid:443");
+                then.status(200).header("X-CSRF-Token", "alternate-token");
+            });
+            let mut client = LocalClient::build(
+                "http://controller.invalid:8443",
+                "u",
+                "synthetic",
+                "default",
+                false,
+                None,
+                enabled,
+            )
+            .unwrap();
+            // A loopback proxy sees the real requested authorities; no DNS or remote endpoint is used.
+            client.http = Client::builder()
+                .proxy(reqwest::Proxy::all(proxy.base_url()).unwrap())
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            assert_eq!(client.ensure_login().is_ok(), succeeds);
+            primary.assert_hits(if primary_status == 404 { 4 } else { 1 });
+            alternate.assert_hits(usize::from(succeeds));
+        }
+    }
+    #[test]
+    fn ambiguous_preflight_response_prevents_write() {
+        for body in [
+            "<html>login</html>",
+            r#"{"data":[],"meta":{"rc":"error"}}"#,
+            r#"{"unexpected":true}"#,
+        ] {
+            let server = MockServer::start();
+            let preflight = server.mock(|when, then| {
+                when.method(GET);
+                then.status(200).body(body);
+            });
+            let write = server.mock(|when, then| {
+                when.method(POST);
+                then.status(200).json_body(json!({"data":[]}));
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            client.logged_in = true;
+            client.cached_session_unverified = true;
+            client.csrf = Some("cached".into());
+            assert!(
+                client
+                    .device_action("00:11:22:33:44:55", "restart")
+                    .is_err()
+            );
+            preflight.assert_hits(1);
+            write.assert_hits(0);
+        }
     }
 }
