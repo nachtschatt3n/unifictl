@@ -1,6 +1,10 @@
 # unifictl examples
 
-Quick command examples for both UniFi Site Manager (cloud, API key) and local UniFi controllers (username/password). Default output is a kubectl-style table; add `-o json` for raw JSON, `-o csv` for CSV export, or `-o raw` for the exact body.
+Quick command examples for both UniFi Site Manager (cloud, API key) and local UniFi controllers (username/password). Default output is a kubectl-style table; add `-o json` for JSON output, `-o csv` for CSV export, or `-o raw` for the current response body.
+
+Pretty tables, fallback JSON, deletion prompts and error messages visibly escape terminal control characters and bidirectional text controls. CSV string cells and headers use a spreadsheet-safe profile: formula-like prefixes (`=`, `+`, `-`, `@`, including leading whitespace) receive an apostrophe, and controls are escaped. Numeric JSON values remain numeric. Use JSON for lossless string values. Non-list CSV responses retain their existing JSON fallback.
+
+JSON and raw output keep their existing array/envelope shapes and apply no additional terminal escaping. The raw renderer prints the current response body unchanged; command-specific filters or limits may already have rewritten it. Redirect these formats to a file or parser when handling untrusted controller data. Watch mode clears the screen and prints update/exit prompts only when Pretty output goes to a terminal; redirected output has no watch decoration.
 
 ## Cloud (Site Manager API v1/EA)
 
@@ -120,6 +124,8 @@ unifictl local dpi get
 unifictl local top-client list --limit 10
 unifictl local top-device list --limit 5
 ```
+
+For device `provision`, `restart`, `adopt`, `upgrade` and client `block`, `unblock`, `reconnect`, an empty `data` array with `meta.rc == "ok"` produces a Pretty acknowledgement such as `✓ provision accepted by controller (rc: ok)`. This confirms controller acceptance, not completion of the operation. Empty list/get results still report `No resources found.` JSON and raw action responses are unchanged.
 
 Static DNS records (Settings → Profiles → DNS Entries):
 ```bash

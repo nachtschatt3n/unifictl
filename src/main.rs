@@ -17,12 +17,14 @@
 mod client;
 mod config;
 mod local;
+mod output;
 mod schema;
 mod session;
 
 use crate::client::{ApiClient, ResponseData};
 use crate::config::{LocalConfig, Scope, resolve, resolve_local, save};
 use crate::local::{LocalClient, list_payload_mut, mac_matches};
+use crate::output::{pretty_json, spreadsheet_safe, terminal_safe};
 use crate::schema::{SchemaRegistry, estimate_tokens, summarize_response};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -31,7 +33,7 @@ use serde_json::json;
 use std::sync::OnceLock;
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
 };
 
@@ -1268,6 +1270,23 @@ struct RenderOpts {
     sort_by: Option<String>,
     filter: Option<String>,
     filter_regex: Option<String>,
+    action: Option<&'static str>,
+}
+
+fn action_name(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Local { command, .. } => match command {
+            LocalCommands::Device(LocalDeviceCommand::Restart { .. }) => Some("restart"),
+            LocalCommands::Device(LocalDeviceCommand::Provision { .. }) => Some("provision"),
+            LocalCommands::Device(LocalDeviceCommand::Adopt { .. }) => Some("adopt"),
+            LocalCommands::Device(LocalDeviceCommand::Upgrade { .. }) => Some("upgrade"),
+            LocalCommands::Client(LocalClientCommand::Block { .. }) => Some("block"),
+            LocalCommands::Client(LocalClientCommand::Unblock { .. }) => Some("unblock"),
+            LocalCommands::Client(LocalClientCommand::Reconnect { .. }) => Some("reconnect"),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn validate_controller_url(url: &str) -> Result<String> {
@@ -1290,7 +1309,17 @@ fn validate_controller_url(url: &str) -> Result<String> {
     Ok(url.trim_end_matches('/').to_string())
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {}", terminal_safe(&format!("{error:#}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().context("reading current directory")?;
     FULL_IDS.get_or_init(|| cli.full_ids);
@@ -1357,6 +1386,7 @@ fn main() -> Result<()> {
         sort_by: cli.sort_by.clone(),
         filter: cli.filter.clone(),
         filter_regex: cli.filter_regex.clone(),
+        action: action_name(&cli.command),
     };
 
     match cli.command {
@@ -1568,7 +1598,7 @@ fn main() -> Result<()> {
                 println!("Validating cloud (Site Manager) credentials...");
                 match client.get("/v1/hosts", &[]) {
                     Ok(_) => println!("Cloud API: ok"),
-                    Err(e) => println!("Cloud API: FAILED ({})", e),
+                    Err(e) => println!("Cloud API: FAILED ({})", terminal_safe(&e.to_string())),
                 }
             }
 
@@ -1585,7 +1615,10 @@ fn main() -> Result<()> {
                     local.list_sites()
                 }) {
                     Ok(_) => println!("Local controller: ok"),
-                    Err(e) => println!("Local controller: FAILED ({})", e),
+                    Err(e) => println!(
+                        "Local controller: FAILED ({})",
+                        terminal_safe(&e.to_string())
+                    ),
                 }
             }
         }
@@ -1731,18 +1764,31 @@ fn handle_local(
                                     adopted_count += 1;
                                     if let Some(name) = device.get("name").and_then(|n| n.as_str())
                                     {
-                                        println!("Adopted: {} ({})", name, mac);
+                                        println!(
+                                            "Adopted: {} ({})",
+                                            terminal_safe(name),
+                                            terminal_safe(mac)
+                                        );
                                     } else {
-                                        println!("Adopted device: {}", mac);
+                                        println!("Adopted device: {}", terminal_safe(mac));
                                     }
                                 }
                                 Err(e) => {
                                     failed_count += 1;
                                     if let Some(name) = device.get("name").and_then(|n| n.as_str())
                                     {
-                                        eprintln!("Failed to adopt {} ({}): {}", name, mac, e);
+                                        eprintln!(
+                                            "Failed to adopt {} ({}): {}",
+                                            terminal_safe(name),
+                                            terminal_safe(mac),
+                                            terminal_safe(&e.to_string())
+                                        );
                                     } else {
-                                        eprintln!("Failed to adopt device {}: {}", mac, e);
+                                        eprintln!(
+                                            "Failed to adopt device {}: {}",
+                                            terminal_safe(mac),
+                                            terminal_safe(&e.to_string())
+                                        );
                                     }
                                 }
                             }
@@ -2981,10 +3027,10 @@ fn handle_local(
                     })
                 {
                     println!("Would delete network:");
-                    println!("{}", serde_json::to_string_pretty(network)?);
+                    println!("{}", pretty_json(network)?);
                     return Ok(());
                 }
-                println!("Would delete network with ID: {}", id);
+                println!("Would delete network with ID: {}", terminal_safe(&id));
                 println!("(Network details not found - may already be deleted)");
                 Ok(())
             } else {
@@ -3099,10 +3145,10 @@ fn handle_local(
                     })
                 {
                     println!("Would delete WLAN:");
-                    println!("{}", serde_json::to_string_pretty(wlan)?);
+                    println!("{}", pretty_json(wlan)?);
                     return Ok(());
                 }
-                println!("Would delete WLAN with ID: {}", id);
+                println!("Would delete WLAN with ID: {}", terminal_safe(&id));
                 println!("(WLAN details not found - may already be deleted)");
                 Ok(())
             } else {
@@ -3225,10 +3271,10 @@ fn handle_local(
                     })
                 {
                     println!("Would delete firewall rule:");
-                    println!("{}", serde_json::to_string_pretty(rule)?);
+                    println!("{}", pretty_json(rule)?);
                     return Ok(());
                 }
-                println!("Would delete firewall rule with ID: {}", id);
+                println!("Would delete firewall rule with ID: {}", terminal_safe(&id));
                 println!("(Firewall rule details not found - may already be deleted)");
                 Ok(())
             } else {
@@ -3326,10 +3372,13 @@ fn handle_local(
                     })
                 {
                     println!("Would delete firewall group:");
-                    println!("{}", serde_json::to_string_pretty(group)?);
+                    println!("{}", pretty_json(group)?);
                     return Ok(());
                 }
-                println!("Would delete firewall group with ID: {}", id);
+                println!(
+                    "Would delete firewall group with ID: {}",
+                    terminal_safe(&id)
+                );
                 println!("(Firewall group details not found - may already be deleted)");
                 Ok(())
             } else {
@@ -3544,10 +3593,10 @@ fn handle_local(
                     })
                 {
                     println!("Would delete policy table:");
-                    println!("{}", serde_json::to_string_pretty(table)?);
+                    println!("{}", pretty_json(table)?);
                     return Ok(());
                 }
-                println!("Would delete policy table with ID: {}", id);
+                println!("Would delete policy table with ID: {}", terminal_safe(&id));
                 println!("(Policy table details not found - may already be deleted)");
                 Ok(())
             } else {
@@ -3662,10 +3711,10 @@ fn handle_local(
                     })
                 {
                     println!("Would delete zone:");
-                    println!("{}", serde_json::to_string_pretty(zone)?);
+                    println!("{}", pretty_json(zone)?);
                     return Ok(());
                 }
-                println!("Would delete zone with ID: {}", id);
+                println!("Would delete zone with ID: {}", terminal_safe(&id));
                 println!("(Zone details not found - may already be deleted)");
                 Ok(())
             } else {
@@ -3780,10 +3829,10 @@ fn handle_local(
                     })
                 {
                     println!("Would delete object:");
-                    println!("{}", serde_json::to_string_pretty(obj)?);
+                    println!("{}", pretty_json(obj)?);
                     return Ok(());
                 }
-                println!("Would delete object with ID: {}", id);
+                println!("Would delete object with ID: {}", terminal_safe(&id));
                 println!("(Object details not found - may already be deleted)");
                 Ok(())
             } else {
@@ -4528,17 +4577,18 @@ where
     F: FnMut() -> Result<ResponseData>,
 {
     if let Some(interval) = watch {
+        let interactive = output == OutputFormat::Pretty && io::stdout().is_terminal();
         let mut first_run = true;
         loop {
             // Clear screen on subsequent runs (not the first)
-            if !first_run && output == OutputFormat::Pretty {
+            if !first_run && interactive {
                 // Clear screen: ESC[2J moves cursor to top, ESC[H moves to home
                 print!("\x1b[2J\x1b[H");
             }
             first_run = false;
 
             // Print timestamp for watch mode
-            if output == OutputFormat::Pretty {
+            if interactive {
                 let now = chrono::Local::now();
                 println!("Updated: {}\n", now.format("%Y-%m-%d %H:%M:%S"));
             }
@@ -4547,7 +4597,7 @@ where
             render_response(resp, output, render_opts, columns)?;
 
             // Print instructions for exiting
-            if output == OutputFormat::Pretty {
+            if interactive {
                 println!("\n(Press Ctrl+C to stop watching)");
             }
 
@@ -4569,14 +4619,16 @@ fn confirm_deletion(
     }
 
     let name_part = if let Some(name) = resource_name {
-        format!(" \"{}\"", name)
+        format!(" \"{}\"", terminal_safe(name))
     } else {
         String::new()
     };
 
     print!(
         "Are you sure you want to delete {}{} (ID: {})? [y/N]: ",
-        resource_type, name_part, resource_id
+        terminal_safe(resource_type),
+        name_part,
+        terminal_safe(resource_id)
     );
     io::stdout().flush()?;
 
@@ -4606,17 +4658,18 @@ fn run_get(
     watch: Option<u64>,
 ) -> Result<()> {
     if let Some(interval) = watch {
+        let interactive = output == OutputFormat::Pretty && io::stdout().is_terminal();
         let mut first_run = true;
         loop {
             // Clear screen on subsequent runs (not the first)
-            if !first_run && output == OutputFormat::Pretty {
+            if !first_run && interactive {
                 // Clear screen: ESC[2J moves cursor to top, ESC[H moves to home
                 print!("\x1b[2J\x1b[H");
             }
             first_run = false;
 
             // Print timestamp for watch mode
-            if output == OutputFormat::Pretty {
+            if interactive {
                 let now = chrono::Local::now();
                 println!("Updated: {}\n", now.format("%Y-%m-%d %H:%M:%S"));
             }
@@ -4625,7 +4678,7 @@ fn run_get(
             render_response(response.clone(), output, render_opts, columns)?;
 
             // Print instructions for exiting
-            if output == OutputFormat::Pretty {
+            if interactive {
                 println!("\n(Press Ctrl+C to stop watching)");
             }
 
@@ -4656,7 +4709,6 @@ fn render_response(
     render_opts: &RenderOpts,
     columns: Option<&[&str]>,
 ) -> Result<()> {
-    let _status = response.status;
     match output {
         OutputFormat::Raw => {
             println!("{}", response.body);
@@ -4670,11 +4722,23 @@ fn render_response(
         }
         OutputFormat::Pretty => {
             if let Some(json) = response.json {
-                if !print_table(&json, columns, render_opts) {
-                    println!("{}", serde_json::to_string_pretty(&json)?);
+                let empty_acknowledgement = json
+                    .get("data")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty);
+                if let Some(action) = render_opts.action.filter(|_| empty_acknowledgement) {
+                    if (200..300).contains(&response.status) && json["meta"]["rc"] == "ok" {
+                        println!("✓ {action} accepted by controller (rc: ok)");
+                    } else {
+                        // Keep errors or incomplete acknowledgements visible; an
+                        // empty action payload is not an empty inventory query.
+                        println!("{}", pretty_json(&json)?);
+                    }
+                } else if !print_table(&json, columns, render_opts) {
+                    println!("{}", pretty_json(&json)?);
                 }
             } else {
-                println!("{}", response.body);
+                println!("{}", terminal_safe(&response.body));
             }
         }
         OutputFormat::Csv => {
@@ -4790,7 +4854,7 @@ fn print_csv(
     let mut wtr = Writer::from_writer(io::stdout());
 
     // Write header
-    wtr.write_record(&csv_columns)?;
+    wtr.write_record(csv_columns.iter().map(|column| spreadsheet_safe(column)))?;
 
     // Filter rows if needed
     let needle = render_opts.filter.as_ref().map(|f| f.to_ascii_lowercase());
@@ -4800,7 +4864,10 @@ fn print_csv(
         match RegexBuilder::new(pattern).case_insensitive(true).build() {
             Ok(re) => Some(re),
             Err(e) => {
-                eprintln!("Warning: Invalid regex pattern '{}': {}", pattern, e);
+                eprintln!(
+                    "{}",
+                    terminal_safe(&format!("Warning: Invalid regex pattern '{pattern}': {e}"))
+                );
                 None
             }
         }
@@ -4869,7 +4936,10 @@ fn print_csv(
             let mut record = Vec::new();
             for col in &csv_columns {
                 let value = map.get(col).unwrap_or(&serde_json::Value::Null);
-                record.push(value_to_str(value));
+                record.push(match value {
+                    serde_json::Value::String(value) => spreadsheet_safe(value),
+                    other => terminal_safe(&value_to_str(other)),
+                });
             }
             wtr.write_record(&record)?;
         }
@@ -5122,7 +5192,7 @@ fn print_table(
         return false;
     }
 
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    let mut widths: Vec<usize> = columns.iter().map(|c| terminal_safe(c).len()).collect();
     let mut table: Vec<Vec<String>> = Vec::new();
     let needle = render_opts.filter.as_ref().map(|f| f.to_ascii_lowercase());
 
@@ -5134,7 +5204,10 @@ fn print_table(
         {
             Ok(re) => Some(re),
             Err(e) => {
-                eprintln!("Warning: Invalid regex pattern '{}': {}", pattern, e);
+                eprintln!(
+                    "{}",
+                    terminal_safe(&format!("Warning: Invalid regex pattern '{pattern}': {e}"))
+                );
                 None
             }
         }
@@ -5148,8 +5221,11 @@ fn print_table(
             for col in columns.iter() {
                 let value = map.get(col).unwrap_or(&serde_json::Value::Null);
                 let mut rendered = value_to_str(value);
-                if col == "id" && !*FULL_IDS.get().unwrap_or(&false) && rendered.len() > 12 {
-                    rendered = format!("{}…", &rendered[..12]);
+                if col == "id"
+                    && !*FULL_IDS.get().unwrap_or(&false)
+                    && rendered.chars().count() > 12
+                {
+                    rendered = format!("{}…", rendered.chars().take(12).collect::<String>());
                 }
                 out_row.push(rendered);
             }
@@ -5173,6 +5249,9 @@ fn print_table(
 
             if !matches {
                 continue;
+            }
+            for cell in &mut out_row {
+                *cell = terminal_safe(cell);
             }
             for (idx, cell) in out_row.iter().enumerate() {
                 widths[idx] = widths[idx].max(cell.len());
@@ -5217,7 +5296,7 @@ fn print_table(
         if i > 0 {
             print!("  ");
         }
-        print_padded(col, widths[i]);
+        print_padded(&terminal_safe(col), widths[i]);
     }
     println!();
     // Separator
