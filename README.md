@@ -477,7 +477,27 @@ Omitting `--password` causes an interactive prompt with hidden input — this is
 
 **File permissions**: `config.yaml` holds the controller password and API key, so `unifictl` creates and rewrites it owner-only (mode `0600`, the same way it writes `session.json`) and keeps the user config directory at `0700`. A config file left world-readable by an older release is tightened to `0600` the first time it is read, with a one-line notice on stderr. This applies on Unix (Linux/macOS); on Windows the file inherits the directory's ACL as before.
 
-**Note**: TLS verification is disabled by default for self-signed certificates. Use `--verify-tls` if your controller has a valid certificate.
+### How local controller TLS protects the login
+
+For local commands, `unifictl` on your laptop or monitoring host connects to the HTTPS endpoint serving **UniFi Network** (for example, a Dream Machine, CloudKey or self-hosted server). That endpoint presents its server certificate during the TLS handshake. The CLI checks it before sending the controller password when verification is enabled. This login requires no client certificate and no certificate changes on the managed access points or switches.
+
+Suppose a monitoring job connects to `unifi.office.example`. A stale or incorrect DNS record can point that name at a different server. HTTPS can encrypt a connection to either server. Certificate verification determines whether the peer can authenticate for the name the job actually requested.
+
+```mermaid
+flowchart TD
+    A["Monitoring job connects to https://unifi.office.example"] --> B["Server at the resolved address presents its certificate"]
+    B --> C{"Verification enabled?"}
+    C -->|Yes| D{"Certificate valid, trusted and valid for unifi.office.example?"}
+    D -->|Yes| E["Proceed with login over authenticated HTTPS"]
+    D -->|No| F["TLS handshake fails before the password is sent"]
+    C -->|No| G["HTTPS can connect even with the wrong certificate"]
+    G --> H["If DNS points to the wrong server, that server can receive the password"]
+```
+
+**Version behavior.** In v5.7.0, configuring a controller with `unifictl login` without `--verify-tls` saves `verify_tls: false`. [PR #5](https://github.com/nachtschatt3n/unifictl/pull/5) proposes these migration rules:
+
+- An explicit `verify_tls: false` keeps verification off after the upgrade. To enable it, configure that controller again with `unifictl login --verify-tls`.
+- If the setting is absent, verification becomes the default. Check the job's configured hostname and certificate trust before upgrading. An invalid certificate will stop the next connection before login. The proposed `--insecure` flag explicitly opts out during migration.
 
 ## Troubleshooting
 
@@ -521,7 +541,7 @@ In testing on a current UDM Pro, restarting `ulp-go` cleared `AUTHENTICATION_FAI
 
 **Port 8443 connectivity**: The tool automatically preserves port `:8443` for local controllers
 
-**Certificate errors**: Use the default (no `--verify-tls`) for self-signed certs
+**Certificate errors**: Use a controller URL whose hostname matches the certificate and check that the certificate is current. For a private CA, obtain its public certificate from your administrator and configure trust on the machine running the CLI. See [how local controller TLS protects the login](#how-local-controller-tls-protects-the-login).
 
 **Site parameter**: Commands default to configured site; override with `--site <NAME>`
 
