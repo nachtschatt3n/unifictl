@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, HeaderValue, USER_AGENT};
 use reqwest::{Method, Url};
@@ -28,17 +28,58 @@ pub struct ResponseData {
     pub json: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiClient {
     base_url: Url,
     http: Client,
     api_key: String,
 }
 
+/// Encode one externally supplied identifier before composing an API route.
+pub(crate) fn id_segment(id: &str) -> Result<String> {
+    if id.is_empty()
+        || matches!(id, "." | "..")
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-._:".contains(&c))
+    {
+        bail!("invalid API path segment");
+    }
+    Ok(id.replace(':', "%3A"))
+}
+
 impl ApiClient {
-    pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
+    pub fn new(base_url: &str, api_key: &str, allow_http_mock: bool) -> Result<Self> {
         let parsed = Url::parse(base_url).context("parsing base URL")?;
+        let loopback = match parsed.host() {
+            Some(url_host) => match url_host.to_string().as_str() {
+                "localhost" => true,
+                host => host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback()),
+            },
+            None => false,
+        };
+        if parsed.host().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!(
+                "cloud URL requires a host and may not include credentials, a query or a fragment"
+            );
+        }
+        if parsed.scheme() != "https" && !(parsed.scheme() == "http" && allow_http_mock && loopback)
+        {
+            bail!("use HTTPS for the cloud API; for a loopback mock, pass --allow-http-mock");
+        }
         let http = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
             .user_agent(HeaderValue::from_static("unifictl/0.1"))
             .build()
             .context("building HTTP client")?;
@@ -70,7 +111,15 @@ impl ApiClient {
         query: &[(&str, String)],
         body: Option<&T>,
     ) -> Result<ResponseData> {
-        let normalized = path.trim_start_matches('/');
+        let normalized = path
+            .strip_prefix('/')
+            .context("expected absolute API path")?;
+        for part in normalized.split('/') {
+            let decoded = part.replace("%3A", ":");
+            if id_segment(&decoded)? != part {
+                bail!("invalid API path segment");
+            }
+        }
         let url = self
             .base_url
             .join(normalized)
@@ -93,8 +142,13 @@ impl ApiClient {
 
         let response = request
             .send()
-            .and_then(|r| r.error_for_status())
-            .context("sending request")?;
+            .map_err(|_| anyhow::anyhow!("cloud request failed (connection, TLS, or timeout)"))?;
+        if !response.status().is_success() {
+            bail!(
+                "cloud request rejected (HTTP {})",
+                response.status().as_u16()
+            );
+        }
 
         let status = response.status().as_u16();
         let text = response.text().context("reading response body")?;
@@ -124,7 +178,7 @@ mod tests {
             then.status(200).json_body(json!({"ok": true, "items": []}));
         });
 
-        let client = ApiClient::new(&server.base_url(), "test-key").unwrap();
+        let client = ApiClient::new(&server.base_url(), "test-key", true).unwrap();
         let response = client.get("/v1/hosts", &[]).unwrap();
 
         mock.assert();
@@ -142,7 +196,7 @@ mod tests {
             then.status(200).body(r#"{"result": "ok"}"#);
         });
 
-        let client = ApiClient::new(&server.base_url(), "abc").unwrap();
+        let client = ApiClient::new(&server.base_url(), "abc", true).unwrap();
         let response = client
             .post_json(
                 "/ea/isp-metrics/5m/query",
@@ -153,5 +207,31 @@ mod tests {
 
         mock.assert();
         assert_eq!(response.json.unwrap()["result"], "ok");
+    }
+
+    #[test]
+    fn loopback_http_is_explicit_and_cloud_credentials_stay_on_origin() {
+        let origin = MockServer::start();
+        let destination = MockServer::start();
+        assert!(ApiClient::new(&origin.base_url(), "test-key", false).is_err());
+        assert!(ApiClient::new("http://example.invalid", "test-key", true).is_err());
+        assert!(ApiClient::new("https://user@example.invalid", "test-key", false).is_err());
+        let redirect = origin.mock(|when, then| {
+            when.method(GET).path("/v1/hosts");
+            then.status(302)
+                .header("location", destination.url("/next"));
+        });
+        let other = destination.mock(|when, then| {
+            when.path("/next");
+            then.status(200);
+        });
+        let api = ApiClient::new(&origin.base_url(), "test-key", true).unwrap();
+        assert!(api.get("/v1/hosts", &[]).is_err());
+        redirect.assert();
+        other.assert_hits(0);
+        for id in ["", ".", "..", "a/b", "a?b", "%2f"] {
+            assert!(id_segment(id).is_err());
+        }
+        assert_eq!(id_segment("aabbcc:42").unwrap(), "aabbcc%3A42");
     }
 }

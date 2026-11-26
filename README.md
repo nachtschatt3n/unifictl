@@ -559,3 +559,5 @@ Built by [Mathias Uhl](https://github.com/nachtschatt3n)
 **[⬆ Back to Top](#unifictl)**
 
 </div>
+
+Site Manager uses HTTPS. For a local test server, pass a synthetic API key and explicitly enable HTTP with `--base-url http://127.0.0.1:8080 --allow-http-mock`. Host IDs such as `001122aabbcc:42` can be passed directly to `cloud host get`.
