@@ -93,7 +93,7 @@ Inventory and health:
 unifictl local site list
 unifictl local device list
 unifictl local device list --unadopted       # Show only pending/unadopted devices
-unifictl local device adopt-all             # Adopt all unadopted devices at once
+unifictl local device adopt-all --yes             # Adopt all unadopted devices at once
 unifictl local device get <MAC> [--ports] [--config]  # device stats/config
 unifictl local device restart <MAC>          # Restart device (reboots — ~1-2 min network blip)
 unifictl local device provision <MAC>        # Force-provision (reload config, no reboot; clears DNS cache)
@@ -308,7 +308,7 @@ Device management workflows:
 unifictl local device list --unadopted
 
 # Adopt all unadopted devices at once
-unifictl local device adopt-all
+unifictl local device adopt-all --yes
 
 # Adopt a specific device
 unifictl local device adopt <MAC>
@@ -383,3 +383,24 @@ unifictl local network list -o json | jq -r '.data[] | select(.name | contains("
     unifictl local network delete "$network_id" --dry-run
   done
 ```
+
+## Explicit adoption and completeness
+
+```bash
+# Preview first; --dry-run performs inventory reads only.
+unifictl local device adopt-all --dry-run -o json
+unifictl local device adopt-all --yes -o json
+
+# Existing JSON/Raw shapes remain the default.
+unifictl local client active --limit 30 -o json
+unifictl local client active --limit 30 -o raw
+
+# Opt into collection metadata; unknown totals stay explicitly unknown.
+unifictl local client active --limit 30 --with-metadata -o json
+unifictl local event list --limit 3000 --with-metadata -o json
+```
+
+Inspect each adoption outcome and the process exit code. An accepted request is
+not confirmation that adoption finished. A stopped batch leaves later targets
+`not_attempted`; reconcile controller state before any retry. For inventories,
+check `inventory_complete` separately from `requested_range_complete`.
