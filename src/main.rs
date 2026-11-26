@@ -59,6 +59,10 @@ struct Cli {
     )]
     base_url: Option<String>,
 
+    /// Allow plaintext HTTP to a loopback cloud mock for this invocation
+    #[arg(long, global = true)]
+    allow_http_mock: bool,
+
     #[arg(
         long,
         short = 'o',
@@ -1346,7 +1350,7 @@ fn main() -> Result<()> {
     }
 
     let effective = resolve(&cwd, cli.api_key.clone(), cli.base_url.clone())?;
-    let client = ApiClient::new(&effective.base_url, &effective.api_key)?;
+    let client = ApiClient::new(&effective.base_url, &effective.api_key, cli.allow_http_mock)?;
     let render_opts = RenderOpts {
         columns_override: cli.columns.as_ref().map(|c| {
             c.split(',')
@@ -1381,7 +1385,7 @@ fn main() -> Result<()> {
                 )?,
                 HostCommand::Get { id } => run_get(
                     &client,
-                    &format!("/v1/hosts/{id}"),
+                    &format!("/v1/hosts/{}", client::id_segment(&id)?),
                     vec![],
                     cli.output,
                     &render_opts,
@@ -1451,7 +1455,7 @@ fn main() -> Result<()> {
                     }
                     run_get(
                         &client,
-                        &format!("/v1/devices/{id}"),
+                        &format!("/v1/devices/{}", client::id_segment(&id)?),
                         query,
                         cli.output,
                         &render_opts,
@@ -1495,7 +1499,7 @@ fn main() -> Result<()> {
                     }
                     run_get(
                         &client,
-                        &format!("/ea/isp-metrics/{metric_type}"),
+                        &format!("/ea/isp-metrics/{}", client::id_segment(&metric_type)?),
                         query,
                         cli.output,
                         &render_opts,
@@ -1513,7 +1517,10 @@ fn main() -> Result<()> {
                     })?;
                     run_post(
                         &client,
-                        &format!("/ea/isp-metrics/{metric_type}/query"),
+                        &format!(
+                            "/ea/isp-metrics/{}/query",
+                            client::id_segment(&metric_type)?
+                        ),
                         vec![],
                         payload,
                         cli.output,
@@ -1534,7 +1541,7 @@ fn main() -> Result<()> {
                 )?,
                 SdwanCommand::Get { id } => run_get(
                     &client,
-                    &format!("/ea/sd-wan-configs/{id}"),
+                    &format!("/ea/sd-wan-configs/{}", client::id_segment(&id)?),
                     vec![],
                     cli.output,
                     &render_opts,
@@ -1543,7 +1550,7 @@ fn main() -> Result<()> {
                 )?,
                 SdwanCommand::Status { id } => run_get(
                     &client,
-                    &format!("/ea/sd-wan-configs/{id}/status"),
+                    &format!("/ea/sd-wan-configs/{}/status", client::id_segment(&id)?),
                     vec![],
                     cli.output,
                     &render_opts,
