@@ -539,4 +539,29 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn existing_yaml_config_round_trips_through_the_maintained_parser() {
+        let input = r##"# Existing dotfile, with aliases and quoted scalars
+api_key: &shared "key: #example"
+base_url: null
+local:
+  url: 'https://controller.example:8443'
+  username: *shared
+  password: 'p@: #,{}''x'
+  site: ""
+  verify_tls: true
+"##;
+        let cfg: Config = serde_yaml::from_str(input).unwrap();
+        let local = cfg.local.as_ref().unwrap();
+        assert_eq!(local.username, cfg.api_key);
+        assert_eq!(cfg.api_key.as_deref(), Some("key: #example"));
+        assert_eq!(local.password.as_deref(), Some("p@: #,{}'x"));
+        assert_eq!(local.site.as_deref(), Some(""));
+        assert_eq!(cfg.base_url, None);
+        let saved = serde_yaml::to_string(&cfg).unwrap();
+        assert_eq!(serde_yaml::from_str::<Config>(&saved).unwrap(), cfg);
+        let empty: Config = serde_yaml::from_str("api_key: # empty field\n").unwrap();
+        assert_eq!(empty.api_key, None);
+    }
 }

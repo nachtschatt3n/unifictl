@@ -3991,7 +3991,7 @@ fn handle_correlate_command(
             let mut correlated = json!({
                 "correlation_type": "client",
                 "mac": mac,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Timestamp::now().to_string(),
             });
 
             // Get client details
@@ -4064,7 +4064,7 @@ fn handle_correlate_command(
             let mut correlated = json!({
                 "correlation_type": "device",
                 "mac": mac,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Timestamp::now().to_string(),
             });
 
             // Get device details
@@ -4139,7 +4139,7 @@ fn handle_diagnose_command(
         DiagnoseCommand::Network { site: _ } => {
             let mut diagnostics = json!({
                 "diagnostic_type": "network",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Timestamp::now().to_string(),
                 "checks": [],
             });
 
@@ -4217,7 +4217,7 @@ fn handle_diagnose_command(
         DiagnoseCommand::Wifi { site: _ } => {
             let mut diagnostics = json!({
                 "diagnostic_type": "wifi",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Timestamp::now().to_string(),
             });
 
             // WiFi connectivity check
@@ -4281,7 +4281,7 @@ fn handle_diagnose_command(
                 let clients = client.list_clients()?;
                 let mut diagnostics = json!({
                     "diagnostic_type": "client_overview",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "timestamp": jiff::Timestamp::now().to_string(),
                 });
 
                 if let Some(ref json) = clients.json
@@ -4539,8 +4539,8 @@ where
 
             // Print timestamp for watch mode
             if output == OutputFormat::Pretty {
-                let now = chrono::Local::now();
-                println!("Updated: {}\n", now.format("%Y-%m-%d %H:%M:%S"));
+                let now = jiff::Zoned::now();
+                println!("Updated: {}\n", now.strftime("%Y-%m-%d %H:%M:%S"));
             }
 
             let resp = fetch()?;
@@ -4617,8 +4617,8 @@ fn run_get(
 
             // Print timestamp for watch mode
             if output == OutputFormat::Pretty {
-                let now = chrono::Local::now();
-                println!("Updated: {}\n", now.format("%Y-%m-%d %H:%M:%S"));
+                let now = jiff::Zoned::now();
+                println!("Updated: {}\n", now.strftime("%Y-%m-%d %H:%M:%S"));
             }
 
             let response = client.get(path, &query)?;
@@ -4905,7 +4905,7 @@ fn print_llm(json: &serde_json::Value) -> Result<()> {
     let mut llm_output = json!({
         "llm_metadata": {
             "version": "1.0",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": jiff::Timestamp::now().to_string(),
             "estimated_tokens": total_tokens,
             "data_type": data_type,
             "item_count": item_count,

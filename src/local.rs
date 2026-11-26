@@ -1430,6 +1430,7 @@ fn format_login_error(body: &str) -> String {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
+    use reqwest::Method;
     use serde_json::json;
     use std::collections::HashSet;
 
@@ -1563,7 +1564,7 @@ mod tests {
         let err = client.list_sites().unwrap_err().to_string();
 
         limited.assert();
-        legacy.assert_hits(0);
+        legacy.assert_calls(0);
         assert!(err.contains("HTTP 429"));
         assert!(err.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
     }
@@ -1626,8 +1627,8 @@ mod tests {
         let mut c2 = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
         c2.list_devices().unwrap();
 
-        login.assert_hits(1);
-        devices.assert_hits(2);
+        login.assert_calls(1);
+        devices.assert_calls(2);
     }
 
     #[test]
@@ -1671,9 +1672,9 @@ mod tests {
         let mut c = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
         let resp = c.list_devices().unwrap();
 
-        stale.assert_hits(1);
-        login.assert_hits(1); // exactly one re-auth
-        fresh.assert_hits(1);
+        stale.assert_calls(1);
+        login.assert_calls(1); // exactly one re-auth
+        fresh.assert_calls(1);
         assert_eq!(resp.status, 200);
     }
 
@@ -1697,7 +1698,7 @@ mod tests {
 
         // Every candidate device URL is rate limited (no Retry-After header).
         let devices = server.mock(|when, then| {
-            when.method(GET).path_contains("stat/device");
+            when.method(GET).path_includes("stat/device");
             then.status(429).json_body(json!({
                 "message": "You've reached the login attempt limit",
                 "code": "AUTHENTICATION_FAILED_LIMIT_REACHED"
@@ -1713,8 +1714,8 @@ mod tests {
         let mut c = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
         let err = c.list_devices().unwrap_err().to_string();
 
-        login.assert_hits(0); // a 429 must NEVER trigger a re-login
-        assert!(devices.hits() >= 1);
+        login.assert_calls(0); // a 429 must NEVER trigger a re-login
+        assert!(devices.calls() >= 1);
         assert!(err.contains("Rate limited (429)"));
         assert!(!err.contains("Session expired"));
     }
@@ -1757,8 +1758,8 @@ mod tests {
 
         // The tampered host is ignored: we log in fresh against the configured
         // controller and never send the "evil" token to attacker.example.
-        login.assert_hits(1);
-        devices.assert_hits(1);
+        login.assert_calls(1);
+        devices.assert_calls(1);
         assert_eq!(resp.status, 200);
     }
 
