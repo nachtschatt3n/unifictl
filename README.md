@@ -332,16 +332,58 @@ counts, controller-reported total when available, truncation, filtering, and
 `inventory_complete` (`complete`, `incomplete`, or `unknown`). `observed_count`
 counts available matching rows before the CLI limit. A fulfilled requested limit
 is not proof of a complete inventory. Without a controller-reported total,
-completeness remains unknown even for a valid empty list. `--with-metadata` is
-JSON-only; raw response output is not extended.
+completeness remains unknown even for a valid empty list. LLM output includes this
+metadata automatically and distinguishes collection truncation from display
+sampling. `--with-metadata` accepts JSON or LLM output; raw response output is not
+extended. Controller-supplied `_unifictl` fields cannot supply trusted metadata.
+Compatibility note for LLM consumers: `llm_metadata.truncation_applied` is now
+`null` rather than `false` when collection truncation metadata is unavailable.
+`false` means no truncation was recorded; inventory completeness may still be
+`unknown`. `sampling_applied` separately describes display sampling.
 
 Event pagination keeps a stable page size after the first page, fails explicitly
 on missing record arrays, repeated records or changing reported totals, and
 retains the existing safety cap. These checks do not provide snapshot isolation
-while the controller's events change. Other aggregate, correlation and time-series
-commands do not yet use this collection metadata contract. `--watch` rejects zero;
-choose a polling interval appropriate to controller limits and use supervisor
-backoff and missing-sample alerts. A successful fetch is not a health diagnosis.
+while the controller's events change. Known collection endpoints require a bare
+array or an object with a `data` array. Invalid JSON, an invalid collection shape,
+or an explicit `meta.rc` failure exits nonzero; a valid empty array remains valid.
+A read-only candidate that serves an HTML UI page is skipped in favor of the
+next known route on the same controller origin; HTML is never returned as
+successful API data. This fallback does not replay mutations or login requests.
+Settings and aggregate endpoints may still return objects. These are response
+contracts, not a guarantee that the controller returned every record.
+
+`diagnose` reports failed collections explicitly instead of inventing empty or
+healthy data. Network diagnosis uses one health snapshot and exits nonzero for
+failed or unknown subsystem checks, including missing WAN status. This is a
+conservative policy: an optional or unconfigured subsystem (for example VPN)
+reporting `unknown` also causes a nonzero exit. It does not prove an outage.
+No subsystem allow-list has been validated against a live controller; inspect
+individual checks before using the aggregate exit status for alerts. Device,
+WiFi and client collection success alone does not establish healthy service.
+Requested correlation sources must succeed; `--include-events` examines at most 50 recent
+events and returns at most 20 matching records, not the client's entire history.
+Optional metadata reports source collection and keeps inventory coverage unknown.
+The command-specific `--site` applies to every source of these aggregate commands.
+
+`time-series events` preserves its 50-event default and applies an explicit limit
+to both JSON and CSV, paging beyond the controller's first response. A malformed
+later page fails before exporting results. The JSON export supports optional
+collection metadata; CSV keeps its existing columns (metadata is emitted to
+stderr when requested with `-o json --with-metadata`). Modern message/category
+fields map to the legacy CSV columns. Timestamp values pass through unchanged;
+numeric units are not inferred. Time-series commands select output using
+`--format csv|json`; `-o llm` does not produce the general LLM envelope. For events,
+`--with-metadata` (or `-o llm`) enables collection metadata in JSON or the CSV
+stderr sidecar. Traffic/WiFi exports retain their existing JSON/CSV contract:
+`--with-metadata` and `-o llm` do not add collection metadata or an LLM envelope.
+Their inventory coverage remains unknown and is not encoded in these exports.
+Traffic/WiFi CSV requires an array-shaped series rather than silently emitting a
+header for an unsupported aggregate object.
+
+`--watch` rejects zero; choose a polling interval appropriate to controller limits
+and use supervisor backoff and missing-sample alerts. A successful fetch is not a
+health diagnosis. These safeguards do not replace live controller/version testing.
 
 ## Command Reference
 

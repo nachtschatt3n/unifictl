@@ -84,6 +84,39 @@ fn is_read_operation(method: &Method, path: &str) -> bool {
             ))
 }
 
+/// Only named collection endpoints have this contract. Settings, aggregates,
+/// and mutation responses may legitimately be objects without a `data` array.
+fn expects_collection(method: &Method, path: &str) -> bool {
+    (*method == Method::GET
+        && matches!(
+            path,
+            "self/sites"
+                | "stat/device"
+                | "stat/sta"
+                | "clients/active"
+                | "clients/history"
+                | "list/alarm"
+                | "stat/health"
+                | "rest/networkconf"
+                | "static-dns"
+                | "rest/wlanconf"
+                | "rest/portconf"
+                | "rest/firewallrule"
+                | "rest/firewallgroup"
+                | "rest/routing"
+                | "firewall/zone"
+                | "object-oriented-network-configs"
+        ))
+        || (*method == Method::POST
+            && matches!(
+                path,
+                "system-log/all"
+                    | "system-log/critical"
+                    | "system-log/device-alert"
+                    | "system-log/admin-activity"
+            ))
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 struct WriteFailure {
@@ -296,9 +329,13 @@ impl LocalClient {
     pub fn device_stats(&mut self, mac: &str) -> Result<ResponseData> {
         let mut resp = self.list_devices()?;
         if let Some(mut json) = resp.json.clone()
-            && let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut())
+            && let Some(arr) = list_payload_mut(&mut json)
         {
-            arr.retain(|item| item.get("mac").and_then(|m| m.as_str()) == Some(mac));
+            arr.retain(|item| {
+                item.get("mac")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(|value| mac_matches(value, mac))
+            });
             resp.body = serde_json::to_string(&json).unwrap_or(resp.body);
             resp.json = Some(json);
         }
@@ -551,7 +588,7 @@ impl LocalClient {
     pub fn vpn_health(&mut self) -> Result<ResponseData> {
         let mut resp = self.list_health()?;
         if let Some(mut json) = resp.json.clone() {
-            if let Some(arr) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+            if let Some(arr) = list_payload_mut(&mut json) {
                 arr.retain(|item| {
                     item.get("subsystem")
                         .and_then(|v| v.as_str())
@@ -565,6 +602,7 @@ impl LocalClient {
         Ok(resp)
     }
 
+    #[cfg(test)]
     pub fn list_events(&mut self) -> Result<ResponseData> {
         // Legacy `stat/event` is gone on modern UniFi OS. The general event feed
         // now lives at `/proxy/network/v2/api/site/{site}/system-log/all` (POST,
@@ -588,7 +626,21 @@ impl LocalClient {
     /// met or the controller runs out of records, then report — via
     /// [`PagedFetch`] — whether anything was left behind.
     pub fn list_events_paged(&mut self, limit: usize) -> Result<(ResponseData, PagedFetch)> {
+        self.collect_event_pages(limit, false)
+    }
+
+    /// Preserve the controller's first-page JSON envelope for legacy exports.
+    pub fn export_events_paged(&mut self, limit: usize) -> Result<(ResponseData, PagedFetch)> {
+        self.collect_event_pages(limit, true)
+    }
+
+    fn collect_event_pages(
+        &mut self,
+        limit: usize,
+        preserve_shape: bool,
+    ) -> Result<(ResponseData, PagedFetch)> {
         let mut collected: Vec<serde_json::Value> = Vec::new();
+        let mut first_shape = None;
         let mut seen = std::collections::HashSet::new();
         let mut total_available: Option<usize> = None;
         let mut page_size = limit.clamp(1, SYSTEM_LOG_MAX_PAGE_SIZE);
@@ -629,6 +681,9 @@ impl LocalClient {
                 total_available = Some(total);
             }
             let page_items = collection_payload(json)?;
+            if preserve_shape && first_shape.is_none() {
+                first_shape = Some(json.clone());
+            }
             let got = page_items.len();
             for item in page_items {
                 let identity = item.get("_id").or_else(|| item.get("id"));
@@ -671,13 +726,23 @@ impl LocalClient {
         collected.truncate(limit);
         let returned = collected.len();
 
-        let mut json = resp.json.clone().unwrap_or_else(|| serde_json::json!({}));
-        if !json.is_object() {
-            json = serde_json::json!({});
+        let mut json = first_shape
+            .or_else(|| resp.json.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if preserve_shape && json.is_array() {
+            json = serde_json::Value::Array(collected);
+        } else {
+            if !json.is_object() {
+                json = serde_json::json!({});
+            }
+            json["data"] = serde_json::Value::Array(collected);
+            if !preserve_shape || json.get("page_number").is_some() {
+                json["page_number"] = serde_json::json!(0);
+            }
+            if !preserve_shape || json.get("page_size").is_some() {
+                json["page_size"] = serde_json::json!(returned);
+            }
         }
-        json["data"] = serde_json::Value::Array(collected);
-        json["page_number"] = serde_json::json!(0);
-        json["page_size"] = serde_json::json!(returned);
         resp.body = serde_json::to_string(&json).unwrap_or_else(|_| resp.body.clone());
         resp.json = Some(json);
 
@@ -989,6 +1054,11 @@ impl LocalClient {
         let mut last_err: Option<anyhow::Error> = None;
 
         for url in urls {
+            if url.origin() != self.base_url.origin() {
+                return Err(anyhow!(
+                    "read candidate changed the configured controller origin"
+                ));
+            }
             let mut resp = send_once(
                 self.build_request(&method, &url, query, body),
                 &self.csrf,
@@ -1039,13 +1109,41 @@ impl LocalClient {
                     let status = status.as_u16();
                     let text = res.text().context("reading response body")?;
 
-                    // Validate that the response is actually JSON, not HTML
-                    // If parsing fails and response looks like HTML, try next URL
-                    let json = serde_json::from_str(&text).ok();
-                    if json.is_none() && text.trim_start().starts_with("<!doctype") {
-                        last_err = Some(anyhow!("received HTML instead of JSON at {}", url));
+                    // Some controller generations serve the UI at an unsupported
+                    // API route. Only this read-only loop may try the next known
+                    // same-origin candidate; HTML is never a successful result.
+                    let trimmed = text.trim_start();
+                    if ["<!doctype html", "<html"].iter().any(|prefix| {
+                        trimmed
+                            .get(..prefix.len())
+                            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+                    }) {
+                        last_err = Some(anyhow!(
+                            "controller returned an HTML page instead of API JSON; response body omitted"
+                        ));
                         continue;
                     }
+                    let mut value: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|_| anyhow!("invalid controller JSON response"))?;
+                    if !value.is_object() && !value.is_array() {
+                        return Err(anyhow!("invalid controller JSON response"));
+                    }
+                    if let Some(rc) = value.get("meta").and_then(|meta| meta.get("rc"))
+                        && rc.as_str() != Some("ok")
+                    {
+                        return Err(anyhow!(
+                            "controller reported an application error; response body omitted"
+                        ));
+                    }
+                    if expects_collection(&method, path) {
+                        collection_payload(&value)?;
+                    }
+                    // Locally generated metadata is never sourced from a controller.
+                    // Keep the original response body for the lossless raw format.
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("_unifictl");
+                    }
+                    let json = Some(value);
 
                     return Ok(ResponseData {
                         status,
@@ -3141,5 +3239,252 @@ mod tests {
         login.assert();
         fresh.assert();
         write.assert();
+    }
+    #[test]
+    fn collection_contract_is_explicit_and_method_specific() {
+        for path in [
+            "self/sites",
+            "stat/device",
+            "stat/sta",
+            "clients/active",
+            "clients/history",
+            "list/alarm",
+            "stat/health",
+            "rest/networkconf",
+            "static-dns",
+            "rest/wlanconf",
+            "rest/portconf",
+            "rest/firewallrule",
+            "rest/firewallgroup",
+            "rest/routing",
+            "firewall/zone",
+            "object-oriented-network-configs",
+        ] {
+            assert!(expects_collection(&Method::GET, path), "{path}");
+            for method in [Method::POST, Method::PUT, Method::DELETE] {
+                assert!(!expects_collection(&method, path), "{method} {path}");
+            }
+        }
+        for path in [
+            "system-log/all",
+            "system-log/critical",
+            "system-log/device-alert",
+            "system-log/admin-activity",
+        ] {
+            assert!(expects_collection(&Method::POST, path), "{path}");
+            assert!(!expects_collection(&Method::GET, path), "{path}");
+        }
+        for path in [
+            "system-log/setting",
+            "system-log/count",
+            "wifi-connectivity",
+            "traffic",
+            "traffic-flows",
+            "rest/setting/security",
+            "cmd/devmgr",
+        ] {
+            assert!(!expects_collection(&Method::GET, path), "{path}");
+            assert!(!expects_collection(&Method::POST, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn invalid_read_success_is_terminal_and_never_dumped() {
+        for body in [
+            "not-json",
+            "null",
+            "42",
+            r#"{"unexpected":true}"#,
+            r#"{"meta":{"rc":"error","message":"synthetic-private-body"},"data":[]}"#,
+        ] {
+            let server = MockServer::start();
+            login_mock(&server);
+            let invalid = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/proxy/network/api/s/default/stat/device");
+                then.status(200).body(body);
+            });
+            let fallback = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/proxy/network/v2/api/site/default/stat/device");
+                then.status(200).json_body(json!({"data":[]}));
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            let error = client.list_devices().unwrap_err();
+            assert!(!error.to_string().contains("synthetic-private-body"));
+            invalid.assert_hits(1);
+            fallback.assert_hits(0);
+        }
+    }
+
+    #[test]
+    fn valid_object_and_raw_body_survive_read_contract_validation() {
+        let server = MockServer::start();
+        login_mock(&server);
+        let body = r#"{ "enabled":true,"error":"ordinary field","_unifictl":{"collection":{"inventory_complete":"complete"}} }"#;
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/system-log/setting");
+            then.status(200).body(body);
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let response = client.system_log_settings().unwrap();
+        assert_eq!(response.body, body);
+        let json = response.json.unwrap();
+        assert_eq!(json["enabled"], true);
+        assert!(json.get("_unifictl").is_none());
+    }
+    #[test]
+    fn derived_filters_preserve_and_filter_bare_arrays() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/auth/login");
+            then.status(200)
+                .header("X-CSRF-Token", "synthetic")
+                .json_body(json!({"ok":true}));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/device");
+            then.status(200)
+                .json_body(json!([{"mac":"AA:BB:CC:DD:EE:FF"},{"mac":"00:11:22:33:44:55"}]));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/proxy/network/api/s/default/stat/health");
+            then.status(200)
+                .json_body(json!([{"subsystem":"vpn"},{"subsystem":"wan"}]));
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        assert_eq!(
+            client
+                .device_stats("aa-bb-cc-dd-ee-ff")
+                .unwrap()
+                .json
+                .unwrap(),
+            json!([{"mac":"AA:BB:CC:DD:EE:FF"}])
+        );
+        assert_eq!(
+            client.vpn_health().unwrap().json.unwrap(),
+            json!([{"subsystem":"vpn"}])
+        );
+    }
+    #[test]
+    fn event_export_preserves_bare_and_wrapped_json_shapes() {
+        for payload in [
+            json!([{"id":1},{"id":2}]),
+            json!({"data":[{"id":1},{"id":2}],"total_element_count":2}),
+        ] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(POST).path("/api/auth/login");
+                then.status(200)
+                    .header("X-CSRF-Token", "synthetic")
+                    .json_body(json!({"ok":true}));
+            });
+            server.mock(|when, then| {
+                when.method(POST)
+                    .path("/proxy/network/v2/api/site/default/system-log/all");
+                then.status(200).json_body(payload.clone());
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            let (response, stats) = client.export_events_paged(2).unwrap();
+            assert_eq!(response.json, Some(payload));
+            assert_eq!(stats.returned, 2);
+        }
+    }
+    #[test]
+    fn html_ui_pages_fall_back_only_for_read_candidates() {
+        for (method, path) in [
+            (Method::GET, "stat/device"),
+            (Method::POST, "system-log/all"),
+        ] {
+            for html in [
+                "  <!DOCTYPE html><html>synthetic-private-ui</html>",
+                "<html>synthetic-private-ui</html>",
+            ] {
+                let server = MockServer::start();
+                let login = login_mock(&server);
+                let primary = server.mock(|when, then| {
+                    when.path(format!("/proxy/network/api/s/default/{path}"));
+                    then.status(200).body(html);
+                });
+                let fallback = server.mock(|when, then| {
+                    when.path(format!("/proxy/network/v2/api/site/default/{path}"));
+                    then.status(200).json_body(json!({"data":[]}));
+                });
+                let mut client =
+                    LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+                let response = client
+                    .request::<(), serde_json::Value>(
+                        method.clone(),
+                        true,
+                        false,
+                        path,
+                        None,
+                        Some(&json!({})),
+                    )
+                    .unwrap();
+                assert_eq!(response.json, Some(json!({"data":[]})));
+                assert!(!response.body.contains("synthetic-private-ui"));
+                login.assert_hits(1);
+                primary.assert_hits(1);
+                fallback.assert_hits(1);
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_html_read_candidates_fail_without_auth_refresh_or_body_disclosure() {
+        let server = MockServer::start();
+        let login = login_mock(&server);
+        let pages = server.mock(|when, then| {
+            when.method(GET).path_contains("stat/device");
+            then.status(200)
+                .body("<!doctype html><html>synthetic-private-ui</html>");
+        });
+        let mut client = LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+        let error = client.list_devices().unwrap_err().to_string();
+        assert!(error.contains("HTML page"));
+        assert!(!error.contains("synthetic-private-ui"));
+        login.assert_hits(1);
+        pages.assert_hits(4);
+    }
+
+    #[test]
+    fn html_mutation_response_is_unknown_and_never_replayed() {
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            let server = MockServer::start();
+            let login = login_mock(&server);
+            let primary = server.mock(|when, then| {
+                when.path("/proxy/network/api/s/default/rest/networkconf");
+                then.status(200)
+                    .body("<!doctype html><html>synthetic-private-ui</html>");
+            });
+            let fallback = server.mock(|when, then| {
+                when.path("/proxy/network/v2/api/site/default/rest/networkconf");
+                then.status(200).json_body(json!({"ok":true}));
+            });
+            let mut client =
+                LocalClient::new(&server.base_url(), "u", "p", "default", true).unwrap();
+            let error = client
+                .request::<(), serde_json::Value>(
+                    method,
+                    true,
+                    false,
+                    "rest/networkconf",
+                    None,
+                    Some(&json!({})),
+                )
+                .unwrap_err();
+            assert!(write_outcome_unknown(&error));
+            assert!(should_stop_batch(&error));
+            assert!(!error.to_string().contains("synthetic-private-ui"));
+            login.assert_hits(1);
+            primary.assert_hits(1);
+            fallback.assert_hits(0);
+        }
     }
 }

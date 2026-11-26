@@ -404,3 +404,35 @@ Inspect each adoption outcome and the process exit code. An accepted request is
 not confirmation that adoption finished. A stopped batch leaves later targets
 `not_attempted`; reconcile controller state before any retry. For inventories,
 check `inventory_complete` separately from `requested_range_complete`.
+
+
+## Monitoring collection failures and export coverage
+
+```bash
+# Diagnose checks and the process exit status together; missing WAN is unknown.
+unifictl local diagnose network --site default -o json
+unifictl local diagnose wifi --with-metadata -o json
+
+# Requested events are a bounded recent sample; failures exit nonzero.
+unifictl local correlate client 00:11:22:33:44:55 --include-events --with-metadata -o json
+
+# Explicit limits apply to both formats, including limits above one page.
+unifictl local time-series events --limit 200 --format json --with-metadata -o json
+unifictl local time-series events --limit 200 --format csv
+
+# LLM output carries unknown/incomplete inventory coverage without another flag.
+unifictl local client active --limit 30 -o llm
+```
+
+Default JSON and raw output do not add a completeness envelope. Optional
+`_unifictl` metadata describes collection coverage; it is not a health assessment.
+Read stderr and the exit status when a diagnostic or export reports partial data.
+Event timestamp values retain their source representation and units.
+
+
+Monitoring compatibility limits: `diagnose network` exits nonzero for unknown
+optional/unconfigured subsystems as well as failures; inspect the individual
+checks before alerting. Traffic/WiFi time-series retain their `--format csv|json`
+exports and do not implement `--with-metadata` or the general `-o llm` envelope.
+In general LLM output, `truncation_applied: null` means unknown collection coverage;
+it must not be interpreted as proof of an untruncated result.
