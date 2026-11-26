@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use anyhow::{Context, Result};
+use crate::diagnostics;
+use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, HeaderValue, USER_AGENT};
 use reqwest::{Method, Url};
@@ -40,6 +41,9 @@ impl ApiClient {
         let parsed = Url::parse(base_url).context("parsing base URL")?;
         let http = Client::builder()
             .user_agent(HeaderValue::from_static("unifictl/0.1"))
+            // Error bodies are bounded in bytes below; also bound a stalled
+            // peer while reading them (and the rest of the request).
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("building HTTP client")?;
 
@@ -74,7 +78,7 @@ impl ApiClient {
         let url = self
             .base_url
             .join(normalized)
-            .with_context(|| format!("joining path `{}` to base URL", path))?;
+            .context("joining request path to base URL")?;
 
         let mut request = self
             .http
@@ -93,11 +97,32 @@ impl ApiClient {
 
         let response = request
             .send()
-            .and_then(|r| r.error_for_status())
-            .context("sending request")?;
+            .map_err(|error| anyhow!(diagnostics::transport_error(&error)))?;
 
         let status = response.status().as_u16();
-        let text = response.text().context("reading response body")?;
+        if !(200..300).contains(&status) {
+            let details = diagnostics::response_details(
+                response,
+                false,
+                &[
+                    &self.api_key,
+                    self.base_url.username(),
+                    self.base_url.password().unwrap_or(""),
+                ],
+                body.and_then(|value| serde_json::to_value(value).ok()),
+            );
+            return Err(anyhow!(
+                "HTTP {status}{}",
+                if details.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {details}")
+                }
+            ));
+        }
+        let text = response
+            .text()
+            .map_err(|error| anyhow!(diagnostics::transport_error(&error)))?;
         let json = serde_json::from_str(&text).ok();
 
         Ok(ResponseData {

@@ -383,3 +383,15 @@ unifictl local network list -o json | jq -r '.data[] | select(.name | contains("
     unifictl local network delete "$network_id" --dry-run
   done
 ```
+
+## Validation-error diagnostics
+
+For local and cloud HTTP 400/409/422 responses, the CLI includes a short sanitized JSON `message`/`code` (including legacy `meta.msg`) in its error, capped at 200 characters. It strips terminal and bidirectional controls and redacts known credentials, echoed secret values and sensitive-looking fields. Other statuses do not expose body details by default. Login responses and HTTP 401/403/429 never expose their bodies, including in debug mode.
+
+For a difficult validation failure, explicitly enable `UNIFICTL_DEBUG=1`. The additional sanitized JSON diagnostics go only to stderr, with a sensitivity reminder; the entire debug stream is capped at 8192 bytes per process, including compatibility attempts. Values under case-insensitive secret-looking keys such as `password`, `x_passphrase`, `token`, `secret` and `key` are redacted recursively. URLs/query fragments and known credential/session/request-secret echoes are also removed. Redaction is conservative and can hide useful text; debug output can still contain sensitive non-credential data and should be reviewed before sharing.
+
+```bash
+UNIFICTL_DEBUG=1 unifictl local network list -o json > networks.json
+```
+
+Only complete JSON objects/arrays of at most 8192 input bytes are eligible. Oversized, malformed, scalar or unreadable bodies are omitted entirely, rather than printing a raw or truncated prefix. Successful JSON and raw response shapes are unchanged; this switch adds no successful-response logging. Validation failure messages also go to stderr rather than stdout.

@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::client::ResponseData;
-use crate::session;
+use crate::{diagnostics, session};
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, COOKIE, HeaderValue, SET_COOKIE, USER_AGENT};
@@ -933,21 +933,41 @@ impl LocalClient {
                 Ok(res) => {
                     let status = res.status();
                     if !status.is_success() {
-                        let body = res.text().unwrap_or_default();
-                        let msg =
-                            Self::format_error_message(&method, path, status, &body, url.as_str());
-                        last_err = Some(anyhow!(msg));
+                        let details = diagnostics::response_details(
+                            res,
+                            false,
+                            &[
+                                &self.username,
+                                &self.password,
+                                self.base_url.username(),
+                                self.base_url.password().unwrap_or(""),
+                                self.csrf.as_deref().unwrap_or(""),
+                                self.session_cookie.as_deref().unwrap_or(""),
+                            ],
+                            body.and_then(|value| serde_json::to_value(value).ok()),
+                        );
+                        let msg = Self::format_error_message(&method, path, status, &details);
+                        // A later compatibility-route 404/405 must not hide a
+                        // useful validation/authentication error already seen.
+                        if !matches!(status.as_u16(), 404 | 405) || last_err.is_none() {
+                            last_err = Some(anyhow!(msg));
+                        }
                         continue;
                     }
 
                     let status = status.as_u16();
-                    let text = res.text().context("reading response body")?;
+                    let text = res
+                        .text()
+                        .map_err(|error| anyhow!(diagnostics::transport_error(&error)))?;
 
                     // Validate that the response is actually JSON, not HTML
                     // If parsing fails and response looks like HTML, try next URL
                     let json = serde_json::from_str(&text).ok();
                     if json.is_none() && text.trim_start().starts_with("<!doctype") {
-                        last_err = Some(anyhow!("received HTML instead of JSON at {}", url));
+                        last_err = Some(anyhow!(
+                            "received HTML instead of JSON at {}",
+                            diagnostics::endpoint(&url)
+                        ));
                         continue;
                     }
 
@@ -962,15 +982,11 @@ impl LocalClient {
                     // a timeout/connection error is not an expired session and
                     // must never trigger a re-login.
                     let msg = if err.is_timeout() {
-                        format!(
-                            "Network timeout talking to the controller at {url} — not an authentication problem; the session was not re-authenticated"
-                        )
+                        "Network timeout talking to the controller — not an authentication problem; the session was not re-authenticated".to_string()
                     } else if err.is_connect() {
-                        format!(
-                            "Connection error reaching the controller at {url} — not an authentication problem; the session was not re-authenticated"
-                        )
+                        "Connection error reaching the controller — not an authentication problem; the session was not re-authenticated".to_string()
                     } else {
-                        format!("{err} at {url}")
+                        diagnostics::transport_error(&err).to_string()
                     };
                     last_err = Some(anyhow!(msg));
                     continue;
@@ -1039,7 +1055,7 @@ impl LocalClient {
                         if !login_established(&resp) {
                             last_err = Some(anyhow::anyhow!(
                                 "login succeeded at {} but no session cookie or CSRF token was returned",
-                                url
+                                diagnostics::endpoint(&url)
                             ));
                             continue;
                         }
@@ -1055,9 +1071,17 @@ impl LocalClient {
                     }
                     Err(err) => {
                         if err.to_string().contains("HTTP 429") {
-                            return Err(anyhow::anyhow!("login failed at {}: {}", url, err));
+                            return Err(anyhow::anyhow!(
+                                "login failed at {}: {}",
+                                diagnostics::endpoint(&url),
+                                err
+                            ));
                         }
-                        last_err = Some(anyhow::anyhow!("login failed at {}: {}", url, err));
+                        last_err = Some(anyhow::anyhow!(
+                            "login failed at {}: {}",
+                            diagnostics::endpoint(&url),
+                            err
+                        ));
                         continue;
                     }
                 }
@@ -1082,7 +1106,7 @@ impl LocalClient {
             )
             .json(creds)
             .send()
-            .context("sending login request")?;
+            .map_err(|error| anyhow!(diagnostics::transport_error(&error)))?;
 
         // Detect HTTP -> HTTPS redirect: the POST body is dropped on redirect (301 becomes GET),
         // so login appears to succeed but no session cookie is set, causing silent auth failure.
@@ -1092,8 +1116,9 @@ impl LocalClient {
                 url.host_str().unwrap_or("your-controller"),
                 url.port().map(|p| format!(":{p}")).unwrap_or_default()
             );
+            let origin = diagnostics::endpoint(url);
             eprintln!(
-                "Warning: controller at {url} redirected to HTTPS. \
+                "Warning: controller at {origin} redirected to HTTPS. \
                  Update your controller URL to avoid authentication failures:\n  \
                  unifictl login --controller-url \"{https_url}\" ..."
             );
@@ -1104,20 +1129,9 @@ impl LocalClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
-            let detail = format_login_error(&body);
-            return Err(anyhow!(
-                "HTTP {} {}",
-                status.as_u16(),
-                if detail.is_empty() {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("login request failed")
-                        .to_string()
-                } else {
-                    detail
-                }
-            ));
+            // Login bodies are always suppressed, including in debug mode.
+            let _ = diagnostics::response_details(resp, true, &[], None);
+            return Err(anyhow!("HTTP {} login request failed", status.as_u16()));
         }
 
         Ok(resp)
@@ -1127,60 +1141,32 @@ impl LocalClient {
         method: &Method,
         path: &str,
         status: StatusCode,
-        body: &str,
-        url: impl AsRef<str>,
+        details: &str,
     ) -> String {
         let operation = Self::infer_operation(method, path);
-        let url_str = url.as_ref();
-
         if status == StatusCode::UNAUTHORIZED {
-            return format!(
-                "Authentication failed (401) at {}\n\nPossible causes:\n  • Session expired - credentials may need to be refreshed\n  • Invalid username or password\n  • Controller requires re-authentication\n\nTry:\n  unifictl validate --local-only",
-                url_str
-            );
+            return "Authentication failed (401)\n\nPossible causes:\n  • Session expired - credentials may need to be refreshed\n  • Invalid username or password\n  • Controller requires re-authentication\n\nTry:\n  unifictl validate --local-only".into();
         }
-
+        if status == StatusCode::FORBIDDEN {
+            return "Permission denied (403); check controller permissions".into();
+        }
         if status == StatusCode::TOO_MANY_REQUESTS {
-            // A 429 is rate limiting, NOT an expired session. Re-authenticating
-            // here would extend the controller's per-IP login lockout, so this
-            // must never be conflated with the 401 "session expired" path.
-            let detail = format_login_error(body);
-            let detail_line = if detail.is_empty() {
-                String::new()
-            } else {
-                format!("\n\nController: {detail}")
-            };
+            return "Rate limited (429) - the controller is throttling requests, NOT a session expiry.\n\nWhat to do:\n  • Back off and retry after the rate-limit window; do NOT re-login on a 429 (it extends the per-IP lockout)\n  • Reads on a still-valid session can keep working - verify liveness with:\n      unifictl local health get".into();
+        }
+        let detail = if matches!(status.as_u16(), 400 | 409 | 422) && !details.is_empty() {
+            format!("\n\nController: {details}")
+        } else {
+            String::new()
+        };
+        if status == StatusCode::BAD_REQUEST {
             return format!(
-                "Rate limited (429) at {url_str} - the controller is throttling requests, NOT a session expiry.{detail_line}\n\nWhat to do:\n  • Back off and retry after the rate-limit window; do NOT re-login on a 429 (it extends the per-IP lockout)\n  • Reads on a still-valid session can keep working - verify liveness with:\n      unifictl local health get"
+                "Failed to {operation}: HTTP 400{detail}{}",
+                Self::get_operation_guidance(path, operation)
             );
         }
-
-        if status == StatusCode::BAD_REQUEST {
-            let mut msg = format!("Failed to {}: HTTP 400", operation);
-
-            // Try to parse error message from JSON response
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-                if let Some(err_msg) = json
-                    .get("meta")
-                    .and_then(|m| m.get("msg"))
-                    .and_then(|m| m.as_str())
-                {
-                    msg.push_str(&format!("\n\nError: {}", err_msg));
-                } else if let Some(err_msg) = json.get("error").and_then(|e| e.as_str()) {
-                    msg.push_str(&format!("\n\nError: {}", err_msg));
-                }
-            }
-
-            // Add context-specific guidance
-            msg.push_str(Self::get_operation_guidance(path, operation));
-
-            return msg;
-        }
-
         if status == StatusCode::NOT_FOUND {
             return format!(
-                "Resource not found (404) at {}\n\nPossible causes:\n  • The {} does not exist\n  • Invalid ID or identifier\n  • Resource was deleted\n\nTry:\n  unifictl local {} -o json",
-                url_str,
+                "Resource not found (404)\n\nPossible causes:\n  • The {} does not exist\n  • Invalid ID or identifier\n  • Resource was deleted\n\nTry:\n  unifictl local {} -o json",
                 operation
                     .replace("create", "resource")
                     .replace("update", "resource")
@@ -1188,26 +1174,13 @@ impl LocalClient {
                 Self::get_list_command(path)
             );
         }
-
         if status == StatusCode::CONFLICT {
             return format!(
-                "Conflict (409) at {}\n\nPossible causes:\n  • Resource already exists\n  • Conflicting configuration\n  • Duplicate name or identifier\n\nTry:\n  unifictl local {} -o json",
-                url_str,
+                "Conflict (409){detail}\n\nPossible causes:\n  • Resource already exists\n  • Conflicting configuration\n  • Duplicate name or identifier\n\nTry:\n  unifictl local {} -o json",
                 Self::get_list_command(path)
             );
         }
-
-        // Generic error with body
-        format!(
-            "HTTP {} at {}\n\nResponse: {}",
-            status,
-            url_str,
-            if body.len() > 200 {
-                format!("{}...", &body[..200])
-            } else {
-                body.to_string()
-            }
-        )
+        format!("HTTP {status}{detail}")
     }
 
     fn infer_operation(method: &Method, _path: &str) -> &'static str {
@@ -1404,28 +1377,6 @@ fn extract_session_cookie(resp: &reqwest::blocking::Response) -> Option<String> 
     })
 }
 
-fn format_login_error(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|json| {
-            let message = json
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string);
-            let code = json
-                .get("code")
-                .and_then(|c| c.as_str())
-                .map(str::to_string);
-            match (message, code) {
-                (Some(message), Some(code)) => Some(format!("{message} ({code})")),
-                (Some(message), None) => Some(message),
-                (None, Some(code)) => Some(code),
-                (None, None) => None,
-            }
-        })
-        .unwrap_or_else(|| body.trim().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1526,23 +1477,6 @@ mod tests {
     }
 
     #[test]
-    fn format_login_error_uses_controller_message_and_code() {
-        let msg = format_login_error(
-            r#"{"message":"You've reached the login attempt limit","code":"AUTHENTICATION_FAILED_LIMIT_REACHED"}"#,
-        );
-        assert_eq!(
-            msg,
-            "You've reached the login attempt limit (AUTHENTICATION_FAILED_LIMIT_REACHED)"
-        );
-    }
-
-    #[test]
-    fn format_login_error_falls_back_to_plain_text() {
-        let msg = format_login_error("plain text failure");
-        assert_eq!(msg, "plain text failure");
-    }
-
-    #[test]
     fn login_stops_on_rate_limit_instead_of_falling_back() {
         let server = MockServer::start();
         let limited = server.mock(|when, then| {
@@ -1565,7 +1499,7 @@ mod tests {
         limited.assert();
         legacy.assert_hits(0);
         assert!(err.contains("HTTP 429"));
-        assert!(err.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
+        assert!(!err.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
     }
 
     #[test]
@@ -1575,15 +1509,14 @@ mod tests {
             "stat/device",
             StatusCode::TOO_MANY_REQUESTS,
             r#"{"message":"You've reached the login attempt limit","code":"AUTHENTICATION_FAILED_LIMIT_REACHED"}"#,
-            "https://controller.test/proxy/network/api/s/default/stat/device",
         );
         // Must be classified as rate limiting, never as an expired session.
         assert!(msg.contains("Rate limited (429)"));
         assert!(msg.contains("do NOT re-login"));
         assert!(msg.contains("unifictl local health get"));
         assert!(!msg.contains("Session expired"));
-        // Controller detail surfaced for triage.
-        assert!(msg.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
+        // Authentication and rate-limit response bodies are always suppressed.
+        assert!(!msg.contains("AUTHENTICATION_FAILED_LIMIT_REACHED"));
     }
 
     #[test]
@@ -1593,7 +1526,6 @@ mod tests {
             "stat/device",
             StatusCode::UNAUTHORIZED,
             "",
-            "https://controller.test/proxy/network/api/s/default/stat/device",
         );
         assert!(msg.contains("Authentication failed (401)"));
         assert!(msg.contains("Session expired"));
@@ -1897,7 +1829,6 @@ mod tests {
             "rest/networkconf",
             StatusCode::UNAUTHORIZED,
             "",
-            "https://example.com/api",
         );
         assert!(msg.contains("Authentication failed"));
         assert!(msg.contains("Possible causes"));
@@ -1908,8 +1839,7 @@ mod tests {
             &Method::POST,
             "rest/networkconf",
             StatusCode::BAD_REQUEST,
-            r#"{"meta":{"msg":"VLAN already in use"}}"#,
-            "https://example.com/api",
+            "VLAN already in use",
         );
         assert!(msg.contains("Failed to create"));
         assert!(msg.contains("VLAN already in use"));
@@ -1921,7 +1851,6 @@ mod tests {
             "rest/networkconf",
             StatusCode::NOT_FOUND,
             "",
-            "https://example.com/api",
         );
         assert!(msg.contains("Resource not found"));
         assert!(msg.contains("Possible causes"));
@@ -1932,8 +1861,7 @@ mod tests {
             &Method::POST,
             "firewall/zone",
             StatusCode::BAD_REQUEST,
-            r#"{"meta":{"msg":"Invalid zone configuration"}}"#,
-            "https://example.com/api",
+            "Invalid zone configuration",
         );
         assert!(msg.contains("zone operations"));
         assert!(msg.contains("unifictl local zone list"));
@@ -1943,8 +1871,7 @@ mod tests {
             &Method::POST,
             "object-oriented-network-configs",
             StatusCode::BAD_REQUEST,
-            r#"{"meta":{"msg":"Invalid object type"}}"#,
-            "https://example.com/api",
+            "Invalid object type",
         );
         assert!(msg.contains("object operations"));
         assert!(msg.contains("unifictl local object list"));
@@ -1955,7 +1882,6 @@ mod tests {
             "rest/wlanconf",
             StatusCode::CONFLICT,
             "",
-            "https://example.com/api",
         );
         assert!(msg.contains("Conflict"));
         assert!(msg.contains("Resource already exists"));
